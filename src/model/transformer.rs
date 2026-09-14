@@ -379,7 +379,8 @@ impl<B: AutodiffBackend> LoopedTransformer<B> {
 }
 
 /// Key-padding mask `[B, T]` (`true` = pad, blocked from attention).
-/// Byte 0 is reserved as PAD/EOS; task alphabets are printable ASCII.
+/// Bytes 0x00 (PAD) and 0x01 (EOS) are reserved; task alphabets never
+/// contain them, so pad positions are unambiguous.
 /// `lens.lower_equal(pos)` is true exactly on pads (`len <= pos`); position
 /// 0 stays open so a fully-padded row never softmaxes over an empty set
 /// (NaN would poison shared-weight gradients).
@@ -419,6 +420,35 @@ pub fn lm_loss<B: Backend>(
     let m = tok_mask.reshape([b * t]);
     let ce = (nll * m.clone()).sum().div(m.sum().clamp_min(1.0));
     ce + ponder.mul_scalar(ponder_weight)
+}
+
+/// Split CE into answer-byte vs EOS-byte means (diagnostic only: aggregate
+/// CE hides the split — EOS slots learn in minutes, answer slots carry the
+/// actual task signal). Returns `(ce_answer, ce_eos)` as host floats.
+pub fn ce_split<B: Backend>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    tok_mask: Tensor<B, 2>,
+) -> (f32, f32) {
+    let [b, t, v] = logits.dims();
+    let n = b * t;
+    let logp = burn::tensor::activation::log_softmax(logits.reshape([n, v]), 1);
+    let nll = logp
+        .gather(1, targets.clone().reshape([n, 1]))
+        .reshape([n])
+        .mul_scalar(-1.0);
+    let m = tok_mask.reshape([n]);
+    let is_eos = targets
+        .reshape([n])
+        .equal_elem(crate::harness::EOS as i64)
+        .float();
+    let w_eos = m.clone() * is_eos;
+    let w_ans = m - w_eos.clone();
+    let ce_ans = (nll.clone() * w_ans.clone())
+        .sum()
+        .div(w_ans.sum().clamp_min(1.0));
+    let ce_eos = (nll * w_eos.clone()).sum().div(w_eos.sum().clamp_min(1.0));
+    (scalar_of(&ce_ans), scalar_of(&ce_eos))
 }
 
 fn scalar_of<B: Backend>(t: &Tensor<B, 1>) -> f32 {

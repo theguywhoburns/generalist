@@ -21,7 +21,7 @@ use burn::{
 };
 
 use crate::{
-    harness::{Record as MetricRecord, collate},
+    harness::Record as MetricRecord,
     model::{LoopedConfig, LoopedTransformer, StopMode, lm_loss},
     optim::{NewtonMuon, NewtonMuonConfig, PrecondInput, merge_grads, precondition_grads, split_grads},
     tasks::{HarnessRng, Instance},
@@ -58,6 +58,12 @@ pub struct TrainConfig {
     /// within this many seconds (catches hangs no panic hook can see).
     #[config(default = 900)]
     pub stuck_timeout_secs: u64,
+    /// Scheduled-sampling thresholds: free-running target inputs K =
+    /// number of entries with answer-CE below them. Default [1.0]: once
+    /// answer error dips below 1.0, the first target input per row comes
+    /// from the model's own argmax; more entries grow K progressively.
+    #[config(default = "vec![1.0]")]
+    pub free_schedule: Vec<f64>,
     #[config(default = "\"checkpoints\".to_string()")]
     pub ckpt_dir: String,
 }
@@ -67,6 +73,9 @@ pub struct StepInfo {
     pub ponder: f32,
     pub steps_used: usize,
     pub mean_halt: f32,
+    /// CE on answer bytes (the task signal) vs EOS bytes (stop signal).
+    pub ce_answer: f32,
+    pub ce_eos: f32,
 }
 
 pub struct Trainer<B: AutodiffBackend> {
@@ -80,6 +89,8 @@ pub struct Trainer<B: AutodiffBackend> {
     lr_muon: LearningRate,
     lr_adamw: LearningRate,
     device: B::Device,
+    /// Current scheduled-sampling depth (see `free_schedule`).
+    pub free_k: usize,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
@@ -114,7 +125,13 @@ impl<B: AutodiffBackend> Trainer<B> {
             lr_muon: train.lr_muon,
             lr_adamw: train.lr_adamw,
             device: device.clone(),
+            free_k: 0,
         }
+    }
+
+    /// Advance the free-running schedule from mean answer-CE.
+    pub fn update_free_schedule(&mut self, ce_answer: f32, schedule: &[f64]) {
+        self.free_k = schedule.iter().filter(|t| (ce_answer as f64) < **t).count();
     }
 
     /// Sample a batch with replacement from the pool (deterministic in rng).
@@ -147,9 +164,57 @@ impl<B: AutodiffBackend> Trainer<B> {
         &mut self,
         batch: &[&Instance],
         scale: f64,
+        free_k: usize,
     ) -> (StepInfo, GradientsParams) {
-        let owned: Vec<Instance> = batch.iter().map(|i| (*i).clone()).collect();
-        let col = collate(&owned, &self.device);
+        let base_seqs: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|inst| {
+                let mut s = inst.prompt.clone();
+                s.extend_from_slice(&inst.target);
+                s.push(crate::harness::EOS);
+                s
+            })
+            .collect();
+        let prompt_lens: Vec<usize> = batch.iter().map(|inst| inst.prompt.len()).collect();
+        // Scheduled sampling: proposal pass on the inner backend (no tape),
+        // then the first K target inputs come from the model's own argmax
+        // instead of the teacher. Everything is still scored vs truth, so
+        // the model learns to continue from its own outputs. K=0 (default)
+        // is pure teacher forcing.
+        let seqs = if free_k == 0 {
+            base_seqs
+        } else {
+            let probe: crate::harness::Collated<B> = crate::harness::collate_seqs(
+                base_seqs.clone(),
+                prompt_lens.clone(),
+                &self.device,
+            );
+            let tokens_inner = probe.tokens.clone().inner();
+            let lens = probe.lengths.clone();
+            let valid = self.model.valid();
+            let logits = valid.forward(tokens_inner, &self.config, StopMode::Act, &lens).logits;
+            let [b2, t2, _] = logits.dims();
+            let pred = int_vec(
+                &logits
+                    .argmax(2)
+                    .reshape([b2 * t2])
+                    .into_data(),
+            );
+            base_seqs
+                .into_iter()
+                .enumerate()
+                .map(|(r, mut s)| {
+                    let pl = prompt_lens[r];
+                    let target_len = lens[r] - pl;
+                    for j in 0..free_k.min(target_len) {
+                        let p = pl + j;
+                        s[p] = pred[r * t2 + p.min(s.len() - 1)] as u8;
+                    }
+                    s
+                })
+                .collect()
+        };
+        let col = crate::harness::collate_seqs(seqs, prompt_lens, &self.device);
         let t = col.lengths.iter().max().copied().unwrap_or(0);
         assert!(
             t <= self.config.max_seq_len,
@@ -159,6 +224,11 @@ impl<B: AutodiffBackend> Trainer<B> {
         let (out, stats) = self
             .model
             .forward_act_with_stats(col.tokens, &self.config, &col.lengths);
+        let (ce_answer, ce_eos) = crate::model::ce_split(
+            out.logits.clone(),
+            col.targets.clone(),
+            col.loss_mask.clone(),
+        );
         let loss = lm_loss(
             out.logits,
             col.targets,
@@ -171,6 +241,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             ponder: scalar_of(&out.ponder),
             steps_used: out.steps_used,
             mean_halt: out.mean_halt,
+            ce_answer,
+            ce_eos,
         };
         let scaled = loss.mul_scalar(scale);
         let grads = scaled.backward();
@@ -196,7 +268,8 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     pub fn train_step(&mut self, batch: &[&Instance]) -> StepInfo {
-        let (info, grads) = self.forward_backward(batch, 1.0);
+        let fk = self.free_k;
+        let (info, grads) = self.forward_backward(batch, 1.0, fk);
         self.optimizer_step(grads);
         info
     }
@@ -256,7 +329,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let mut flat = Vec::with_capacity(g * tmax);
             for row in ids.iter() {
                 for i in 0..tmax {
-                    flat.push(if i < row.len() { row[i] } else { crate::harness::EOS as i64 });
+                    flat.push(if i < row.len() { row[i] } else { crate::harness::PAD as i64 });
                 }
             }
             let tokens = Tensor::<B::InnerBackend, 2, Int>::from_data(
@@ -418,14 +491,18 @@ pub fn run_stage<B: AutodiffBackend>(
         let specs = trainer.model.grad_specs();
         let mut acc_grads = None;
         let (mut loss_sum, mut ponder_sum, mut halt_sum) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut ans_sum, mut eos_sum) = (0.0f32, 0.0f32);
         let mut steps_sum = 0usize;
         for _ in 0..accum {
             let micro =
                 Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, run.train.batch_size);
-            let (info, grads) = trainer.forward_backward(&micro, scale);
+            let fk = trainer.free_k;
+            let (info, grads) = trainer.forward_backward(&micro, scale, fk);
             loss_sum += info.loss;
             ponder_sum += info.ponder;
             halt_sum += info.mean_halt;
+            ans_sum += info.ce_answer;
+            eos_sum += info.ce_eos;
             steps_sum += info.steps_used;
             acc_grads = Some(match acc_grads {
                 None => grads,
@@ -439,12 +516,16 @@ pub fn run_stage<B: AutodiffBackend>(
             ponder: ponder_sum / n,
             steps_used: steps_sum / accum,
             mean_halt: halt_sum / n,
+            ce_answer: ans_sum / n,
+            ce_eos: eos_sum / n,
         };
+        trainer.update_free_schedule(info.ce_answer, &run.train.free_schedule);
         watchdog.ping_step(step);
         if step % run.train.log_every == 0 {
             println!(
-                "step {step:>5} loss {:.4} ponder {:.2} loops {} halt {:.2}",
-                info.loss, info.ponder, info.steps_used, info.mean_halt
+                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {}",
+                info.loss, info.ce_answer, info.ce_eos,
+                info.ponder, info.steps_used, info.mean_halt, trainer.free_k
             );
         }
         if step % run.train.ckpt_every == 0 {
@@ -497,9 +578,13 @@ fn scalar_of<B: Backend>(t: &Tensor<B, 1>) -> f32 {
 
 /// Backend-agnostic Int readback (NdArray uses i64, CUDA uses i32).
 fn int_scalar(data: &TensorData) -> i64 {
+    int_vec(data).into_iter().next().unwrap_or(-1)
+}
+
+fn int_vec(data: &TensorData) -> Vec<i64> {
     match data.dtype {
-        burn::tensor::DType::I64 => data.as_slice::<i64>().unwrap()[0],
-        burn::tensor::DType::I32 => data.as_slice::<i32>().unwrap()[0] as i64,
+        burn::tensor::DType::I64 => data.as_slice::<i64>().unwrap().to_vec(),
+        burn::tensor::DType::I32 => data.as_slice::<i32>().unwrap().iter().map(|v| *v as i64).collect(),
         d => panic!("unexpected int dtype {d:?}"),
     }
 }
@@ -643,6 +728,41 @@ mod tests {
             // Tight band: window span small relative to pool range.
             assert!(*lens.last().unwrap() - lens[0] <= 200);
         }
+    }
+
+    #[test]
+    fn free_schedule_mapping() {
+        let mut trainer = tiny_trainer();
+        let sched = [1.0, 0.5, 0.2];
+        trainer.update_free_schedule(1.5, &sched);
+        assert_eq!(trainer.free_k, 0);
+        trainer.update_free_schedule(0.9, &sched);
+        assert_eq!(trainer.free_k, 1);
+        trainer.update_free_schedule(0.4, &sched);
+        assert_eq!(trainer.free_k, 2);
+        trainer.update_free_schedule(0.1, &sched);
+        assert_eq!(trainer.free_k, 3);
+    }
+
+    #[test]
+    fn free_running_step_stays_finite() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 8,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let mut trainer = tiny_trainer();
+        trainer.free_k = 2;
+        let mut rng = HarnessRng::new(5);
+        let batch = Trainer::<TestBackend>::sample_batch(&mut rng, &pool, 4);
+        // Exercises the proposal pass + patched inputs end to end.
+        let before_free = trainer.free_k;
+        let info = trainer.train_step(&batch);
+        assert!(info.loss.is_finite());
+        assert_eq!(before_free, 2);
     }
 
     #[test]

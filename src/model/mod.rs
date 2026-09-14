@@ -10,4 +10,4 @@ pub use block::LoopedBlock;
 pub use config::{LoopedConfig, StopMode};
 pub use halting::HaltingHead;
 pub use mlp::SwiGluMlp;
-pub use transformer::{LoopOutput, LoopedTransformer, StepStats, lm_loss, pad_mask};
+pub use transformer::{LoopOutput, LoopedTransformer, StepStats, ce_split, lm_loss, pad_mask};
