@@ -229,16 +229,13 @@ impl<B: Backend> LoopedTransformer<B> {
                 halt_step = halt_step + (w * still_f.clone()).mul_scalar(s as f64);
             }
 
+            // Break check every 2nd loop (+final): the host sync stalls the
+            // pipeline, and the break only skips halted tail iterations.
+            // Ponder/stats accounting is unaffected.
             let running: Tensor<B, 1> = (still_f * keep_f.clone()).sum();
-            // Host sync per iteration stalls the GPU pipeline; the break only
-            // skips already-halted tail iterations, so check every 2nd loop
-            // (plus the final one, which always runs the check below via
-            // steps_used). Ponder/stats accounting is unaffected.
-            if s == max || s % 2 == 0 {
-                if scalar_of(&running) == 0.0 {
-                    steps_used = s;
-                    break;
-                }
+            if (s == max || s % 2 == 0) && scalar_of(&running) == 0.0 {
+                steps_used = s;
+                break;
             }
         }
 
