@@ -31,14 +31,19 @@ use burn::{
 use super::newton_muon::{NewtonMuon, PrecondInput};
 
 /// Split into (muon_2d_grads, rest). Missing ids are skipped.
+/// Ids are processed in sorted order so fused-kernel graphs are identical
+/// across steps (HashMap/HashSet iteration order is nondeterministic and
+/// would defeat the fusion cache).
 pub fn split_grads<B: AutodiffBackend>(
     muon_ids: &HashSet<ParamId>,
     mut grads: GradientsParams,
 ) -> (GradientsParams, GradientsParams) {
     let mut muon = GradientsParams::new();
-    for id in muon_ids {
-        if let Some(g) = grads.remove::<B::InnerBackend, 2>(*id) {
-            muon.register::<B::InnerBackend, 2>(*id, g);
+    let mut ids: Vec<ParamId> = muon_ids.iter().copied().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(g) = grads.remove::<B::InnerBackend, 2>(id) {
+            muon.register::<B::InnerBackend, 2>(id, g);
         }
     }
     (muon, grads)
@@ -51,9 +56,12 @@ pub fn precondition_grads<B: AutodiffBackend>(
     mut grads: GradientsParams,
 ) -> (GradientsParams, GradientsParams) {
     let mut out: GradientsParams = GradientsParams::new();
-    for (id, role) in roles {
-        if let Some(g) = grads.remove::<B::InnerBackend, 2>(*id) {
-            out.register::<B::InnerBackend, 2>(*id, precond.precondition(*role, g));
+    let mut ids: Vec<ParamId> = roles.keys().copied().collect();
+    ids.sort();
+    for id in ids {
+        let role = roles[&id];
+        if let Some(g) = grads.remove::<B::InnerBackend, 2>(id) {
+            out.register::<B::InnerBackend, 2>(id, precond.precondition(role, g));
         }
     }
     (out, grads)

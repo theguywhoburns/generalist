@@ -98,10 +98,13 @@ fn bool_eye<B: Backend>(d: usize, device: &B::Device) -> Tensor<B, 2, burn::tens
 }
 
 /// Running input-second-moment state for one input dim.
+/// The inverse is diagonal by construction; stored as a vector and applied
+/// by broadcast multiply (exact same math as a dense diag-matrix matmul,
+/// minus the GEMM + launches).
 pub struct PrecondGroup<B: Backend> {
     pub dim: usize,
     cov: Tensor<B, 2>,
-    inv: Tensor<B, 2>,
+    inv_diag: Tensor<B, 1>,
     accum: Tensor<B, 2>,
     count: f64,
 }
@@ -109,15 +112,12 @@ pub struct PrecondGroup<B: Backend> {
 impl<B: Backend> PrecondGroup<B> {
     pub fn new(dim: usize, init_diag: f64, device: &B::Device) -> Self {
         let eye = bool_eye(dim, device);
-        let diag_mat = Tensor::ones([dim, dim], device).mul_scalar(init_diag);
-        let zeros = Tensor::zeros([dim, dim], device);
+        let zeros = Tensor::<B, 2>::zeros([dim, dim], device);
+        let diag_mat = Tensor::<B, 2>::ones([dim, dim], device).mul_scalar(init_diag);
         Self {
             dim,
-            cov: zeros.clone().mask_where(eye.clone(), diag_mat),
-            inv: zeros.clone().mask_where(
-                eye,
-                Tensor::ones([dim, dim], device).mul_scalar(1.0 / init_diag),
-            ),
+            cov: zeros.clone().mask_where(eye, diag_mat),
+            inv_diag: Tensor::<B, 1>::ones([dim], device).mul_scalar(1.0 / init_diag),
             accum: zeros,
             count: 0.0,
         }
@@ -149,16 +149,16 @@ impl<B: Backend> PrecondGroup<B> {
             .sum_dim(1);
         let mean_diag = scalar_of(&diag.clone().sum().div_scalar(d as f64));
         let ridge = mean_diag * ridge_mult as f32 + eps as f32;
-        let inv_diag = diag.add_scalar(ridge as f64).powf_scalar(-1.0);
-        self.inv = zeros.mask_where(eye, inv_diag.repeat_dim(1, d));
+        self.inv_diag = diag.reshape([d]).add_scalar(ridge as f64).powf_scalar(-1.0);
 
         self.accum = Tensor::zeros([d, d], &device);
         self.count = 0.0;
     }
 
-    /// Right-preconditioner in Burn layout: `G <- inv @ G`.
+    /// Right-preconditioner in Burn layout: `G <- inv @ G`, with diagonal
+    /// `inv` applied as a broadcast row-scale (identical result, no GEMM).
     pub fn precondition(&self, grad: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.inv.clone().matmul(grad)
+        grad * self.inv_diag.clone().unsqueeze_dim::<2>(1)
     }
 }
 

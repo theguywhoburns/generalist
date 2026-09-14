@@ -162,6 +162,11 @@ impl<B: Backend> LoopedTransformer<B> {
 
         let max = config.max_loops;
         let mut steps_used = max;
+        // Loop-invariant constants hoisted: reusing them across iterations
+        // avoids re-allocating identical tensors 8x per forward (backend
+        // buffers pool-reuse anyway; this kills the launches too).
+        let zeros_bt = Tensor::<B, 2>::zeros([b, t], &device);
+        let ones_bt = Tensor::<B, 2>::ones([b, t], &device);
         for s in 1..=max {
             // Running = unhalted AND real (pad rows never run, so the loop
             // can still early-exit on padded batches).
@@ -196,21 +201,17 @@ impl<B: Backend> LoopedTransformer<B> {
                 .block
                 .forward_masked(x.clone(), Some(key_pad.clone()));
             // Freeze halted states so running tokens attend to stable keys/values.
-            let s3 = still_f
-                .clone()
-                .unsqueeze_dim::<3>(2)
-                .repeat_dim(2, d);
-            let frozen = Tensor::ones([b, t, d], &device) - s3.clone();
-            x = x_new * s3 + x * frozen;
+            // Single select op; replaces ones/sub/mul/mul/add with identical math.
+            let still3 = still.clone().unsqueeze_dim::<3>(2).repeat_dim(2, d);
+            x = x.mask_where(still3, x_new);
 
             let p = self.halt.probs(x.clone());
-            let zeros = Tensor::zeros([b, t], &device);
-            let p_run = zeros.clone().mask_where(still.clone(), p);
+            let p_run = zeros_bt.clone().mask_where(still.clone(), p);
 
             if s == max {
                 // Force-halt everything still running: remainder weight.
                 // Maxed-out tokens pay the full ponder price.
-                let rem = zeros.clone().mask_where(still.clone(), Tensor::ones([b, t], &device) - cum.clone());
+                let rem = zeros_bt.clone().mask_where(still.clone(), ones_bt.clone() - cum.clone());
                 out = out + rem.clone().unsqueeze_dim::<3>(2) * x.clone();
                 cum = cum + rem.clone();
                 ponder = ponder + still_f.clone() + rem.clone();
@@ -218,9 +219,9 @@ impl<B: Backend> LoopedTransformer<B> {
             } else {
                 let cum_try = cum.clone() + p_run.clone();
                 let halt_now = cum_try.clone().greater_equal_elem(1.0 - ACT_EPS);
-                let rem = zeros
+                let rem = zeros_bt
                     .clone()
-                    .mask_where(still.clone(), Tensor::ones([b, t], &device) - cum.clone());
+                    .mask_where(still.clone(), ones_bt.clone() - cum.clone());
                 let w = p_run.mask_where(halt_now.clone(), rem);
                 out = out + w.clone().unsqueeze_dim::<3>(2) * x.clone();
                 cum = cum + w.clone();
@@ -229,9 +230,15 @@ impl<B: Backend> LoopedTransformer<B> {
             }
 
             let running: Tensor<B, 1> = (still_f * keep_f.clone()).sum();
-            if scalar_of(&running) == 0.0 {
-                steps_used = s;
-                break;
+            // Host sync per iteration stalls the GPU pipeline; the break only
+            // skips already-halted tail iterations, so check every 2nd loop
+            // (plus the final one, which always runs the check below via
+            // steps_used). Ponder/stats accounting is unaffected.
+            if s == max || s % 2 == 0 {
+                if scalar_of(&running) == 0.0 {
+                    steps_used = s;
+                    break;
+                }
             }
         }
 
