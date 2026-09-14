@@ -378,6 +378,48 @@ impl<B: AutodiffBackend> LoopedTransformer<B> {
     }
 }
 
+/// Scored-position window `[B, Ts, V]` of a `[B, T, V]` logits tensor, plus
+/// matching target/mask columns, where `Ts = hi - lo` spans the earliest
+/// first-scored to the latest last-scored position across rows.
+///
+/// Training CE then runs on `[B, Ts, V]` instead of `[B, T, V]`: with
+/// `vocab == d_model` the logits and their CE intermediates are the largest
+/// training activations (~60% of the tape at T=512), and byte-LM masks score
+/// only the target tail, so Ts is typically a small fraction of T. Bounds
+/// come from one host readback of the B×T mask (cheap next to the GEMM it
+/// avoids); gradients flow through the `slice` op to the full logits.
+/// # Panics
+/// Panics if the mask scores no positions (nothing to train on).
+fn scored_slice<B: Backend>(
+    logits: Tensor<B, 3>,
+    targets: &Tensor<B, 2, Int>,
+    mask: &Tensor<B, 2>,
+) -> (Tensor<B, 3>, Tensor<B, 2, Int>, Tensor<B, 2>) {
+    let [b, _t, v] = logits.dims();
+    let (lo, hi) = scored_bounds(&mask.clone().into_data());
+    let logits = logits.slice([0..b, lo..hi, 0..v]);
+    let targets = targets.clone().slice([0..b, lo..hi]);
+    let mask = mask.clone().slice([0..b, lo..hi]);
+    (logits, targets, mask)
+}
+
+/// Host scan of a `[B, T]` mask for (min first-scored, max last-scored).
+fn scored_bounds(data: &TensorData) -> (usize, usize) {
+    let slice = data.as_slice::<f32>().unwrap();
+    let [b, t] = [data.shape[0], data.shape[1]];
+    let (mut lo, mut hi) = (t, 0);
+    for row in slice.chunks_exact(t).take(b) {
+        for (c, w) in row.iter().enumerate() {
+            if *w > 0.0 {
+                lo = lo.min(c);
+                hi = hi.max(c + 1);
+            }
+        }
+    }
+    assert!(hi > lo, "loss mask scores no positions");
+    (lo, hi)
+}
+
 /// Key-padding mask `[B, T]` (`true` = pad, blocked from attention).
 /// Bytes 0x00 (PAD) and 0x01 (EOS) are reserved; task alphabets never
 /// contain them, so pad positions are unambiguous.
@@ -410,14 +452,16 @@ pub fn lm_loss<B: Backend>(
     ponder: Tensor<B, 1>,
     ponder_weight: f64,
 ) -> Tensor<B, 1> {
-    let [b, t, v] = logits.dims();
-    let n = b * t;
+    let v = logits.dims()[2];
+    let (logits, targets, tok_mask) = scored_slice(logits, &targets, &tok_mask);
+    let [b, ts, _] = logits.dims();
+    let n = b * ts;
     let logp = burn::tensor::activation::log_softmax(logits.reshape([n, v]), 1);
     let nll = logp
         .gather(1, targets.reshape([n, 1]))
         .reshape([n])
         .mul_scalar(-1.0);
-    let m = tok_mask.reshape([b * t]);
+    let m = tok_mask.reshape([b * ts]);
     let ce = (nll * m.clone()).sum().div(m.sum().clamp_min(1.0));
     ce + ponder.mul_scalar(ponder_weight)
 }
@@ -430,8 +474,10 @@ pub fn ce_split<B: Backend>(
     targets: Tensor<B, 2, Int>,
     tok_mask: Tensor<B, 2>,
 ) -> (f32, f32) {
-    let [b, t, v] = logits.dims();
-    let n = b * t;
+    let v = logits.dims()[2];
+    let (logits, targets, tok_mask) = scored_slice(logits, &targets, &tok_mask);
+    let [b, ts, _] = logits.dims();
+    let n = b * ts;
     let logp = burn::tensor::activation::log_softmax(logits.reshape([n, v]), 1);
     let nll = logp
         .gather(1, targets.clone().reshape([n, 1]))

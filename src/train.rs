@@ -78,6 +78,21 @@ pub struct StepInfo {
     pub ce_eos: f32,
 }
 
+/// Activation budget for one training micro-batch, as max `batch × padded_T`.
+/// The banded sampler hops length bands (bucket edges 64..512); at a fixed
+/// batch size the top band quadruples the autodiff tape (logits are the
+/// largest activation: `vocab == d_model` here), which OOMs small GPUs
+/// (RTX 3050 4GB) after pool fragmentation from earlier bands + eval.
+/// Long-band windows are trimmed so the tape size stays band-independent
+/// (T=512 trains at batch 8, T≤256 at the configured batch). Mean-reduced
+/// CE keeps merged micro-grads a mean of micro-means either way.
+const MICRO_BT_BUDGET: usize = 4096;
+
+/// Same budget for eval decode chunks (B×T per fused forward). Eval prompts
+/// bucket to 512 while training bands sit near 64, so a fixed row count that
+/// fits a training band OOMs on an eval chunk of long prompts.
+const EVAL_BT_BUDGET: usize = 8192;
+
 pub struct Trainer<B: AutodiffBackend> {
     pub model: LoopedTransformer<B>,
     muon: OptimizerAdaptor<Muon<B::InnerBackend>, LoopedTransformer<B>, B>,
@@ -297,8 +312,27 @@ impl<B: AutodiffBackend> Trainer<B> {
         let model = self.model.valid();
         let mut out = Vec::with_capacity(instances.len());
         for group in instances.chunks(chunk.max(1)) {
-            out.extend(self.decode_chunk(&model, group, max_new));
+            // Cap the sub-chunk by B×T, not row count alone: rows can decode
+            // up to `max_seq_len` (prompt + max_new, frozen at the cap), so
+            // budget with the padded worst case and never re-chunk mid-decode.
+            let worst_row = group
+                .iter()
+                .map(|i| i.prompt_ids().len())
+                .max()
+                .unwrap_or(1)
+                .saturating_add(max_new)
+                .min(self.config.max_seq_len)
+                .max(1);
+            let t_worst = crate::harness::bucket_len(worst_row);
+            let sub = (EVAL_BT_BUDGET / t_worst).clamp(1, group.len());
+            for sub_group in group.chunks(sub) {
+                out.extend(self.decode_chunk(&model, sub_group, max_new));
+            }
         }
+        // Decode allocates a fresh shape family per chunk and per growing
+        // decode step; the backend buffer pool retains them all. Hand them
+        // back before training resumes (no-op on backends without pooling).
+        B::memory_cleanup(&self.device);
         out
     }
 
@@ -494,10 +528,19 @@ pub fn run_stage<B: AutodiffBackend>(
         let (mut ans_sum, mut eos_sum) = (0.0f32, 0.0f32);
         let mut steps_sum = 0usize;
         for _ in 0..accum {
-            let micro =
+            let window =
                 Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, run.train.batch_size);
+            // B×T budget: trim the banded window (drop longest rows, they sit
+            // at the window's end) so padded T never inflates the tape.
+            let t_raw = window
+                .iter()
+                .map(|i| i.prompt.len() + i.target.len() + 1)
+                .max()
+                .unwrap_or(1);
+            let t_pad = crate::harness::bucket_len(t_raw);
+            let micro = &window[..(MICRO_BT_BUDGET / t_pad).clamp(1, window.len())];
             let fk = trainer.free_k;
-            let (info, grads) = trainer.forward_backward(&micro, scale, fk);
+            let (info, grads) = trainer.forward_backward(micro, scale, fk);
             loss_sum += info.loss;
             ponder_sum += info.ponder;
             halt_sum += info.mean_halt;
@@ -510,6 +553,13 @@ pub fn run_stage<B: AutodiffBackend>(
             });
         }
         trainer.optimizer_step(acc_grads.expect("at least one micro-batch"));
+        // Hand the backend buffer pool back after every optimizer step.
+        // Band hopping (64..512 padded T) + free-running proposal passes make
+        // the pool's high-water mark the SUM of all shape families seen; on
+        // small GPUs that ratchet alone OOMs the next new shape. Re-allocing
+        // the working set each step costs a few ms of cudaMalloc against
+        // ~second-scale steps. No-op on backends without pooling.
+        B::memory_cleanup(device);
         let n = accum as f32;
         let info = StepInfo {
             loss: loss_sum / n,
