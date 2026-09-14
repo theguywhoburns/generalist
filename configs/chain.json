@@ -1,0 +1,9 @@
+{
+  "experiments": [
+    {
+      "name": "s0-parity",
+      "manifest": "configs/scale-probe.json",
+      "init_from": null
+    }
+  ]
+}

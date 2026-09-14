@@ -1,0 +1,48 @@
+{
+  "model": {
+    "vocab_size": 256,
+    "d_model": 256,
+    "n_heads": 4,
+    "head_dim": 64,
+    "ffn_hidden": 768,
+    "max_loops": 8,
+    "ponder_weight": 0.001,
+    "halt_bias_init": -3.0,
+    "conv_tol": 0.001,
+    "conv_patience": 2,
+    "max_seq_len": 512
+  },
+  "optim": {
+    "precond_ewma": 0.95,
+    "refresh_every": 32,
+    "ridge_mult": 0.2,
+    "eps": 1e-8,
+    "init_diag": 0.001,
+    "ns_steps": 5
+  },
+  "train": {
+    "lr_muon": 0.002,
+    "lr_adamw": 0.0003,
+    "batch_size": 8,
+    "steps": 25,
+    "log_every": 5,
+    "eval_every": 100,
+    "eval_max_new": 4,
+    "seed": 0,
+    "ckpt_dir": "checkpoints-profile",
+    "ckpt_every": 100,
+    "stuck_timeout_secs": 300
+  },
+  "experiment": {
+    "tasks": ["parity"],
+    "tracks": ["A", "B"],
+    "per_cell": 32,
+    "seeds": [0],
+    "protocol": {
+      "k_set": [0, 1, 2, 3, 5, 8],
+      "k0_rate": 0.15,
+      "corrupt_rate": 0.05,
+      "seps": ["->", ":", "=", "|"]
+    }
+  }
+}
