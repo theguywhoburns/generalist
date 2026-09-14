@@ -31,7 +31,8 @@
     "eval_max_new": 64,
     "seed": 0,
     "ckpt_dir": "checkpoints",
-    "stuck_timeout_secs": 900
+    "stuck_timeout_secs": 900,
+    "accum_steps": 1
   },
   "experiment": {
     "tasks": ["parity", "dyck1", "subst-fst", "periodic", "copy-rev-rep", "scan-tiny"],

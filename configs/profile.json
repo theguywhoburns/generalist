@@ -31,7 +31,8 @@
     "seed": 0,
     "ckpt_dir": "checkpoints-profile",
     "ckpt_every": 100,
-    "stuck_timeout_secs": 300
+    "stuck_timeout_secs": 300,
+    "accum_steps": 1
   },
   "experiment": {
     "tasks": ["parity"],

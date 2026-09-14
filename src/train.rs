@@ -23,7 +23,7 @@ use burn::{
 use crate::{
     harness::{Record as MetricRecord, collate},
     model::{LoopedConfig, LoopedTransformer, StopMode, lm_loss},
-    optim::{NewtonMuon, NewtonMuonConfig, PrecondInput, precondition_grads, split_grads},
+    optim::{NewtonMuon, NewtonMuonConfig, PrecondInput, merge_grads, precondition_grads, split_grads},
     tasks::{HarnessRng, Instance},
 };
 
@@ -49,6 +49,11 @@ pub struct TrainConfig {
     pub eval_max_new: usize,
     #[config(default = 0)]
     pub seed: u64,
+    /// Micro-batches per optimizer step (effective batch =
+    /// `batch_size` x `accum_steps`). Each micro loss is scaled by
+    /// 1/accum_steps before backward, so merged grads equal full-batch grads.
+    #[config(default = 1)]
+    pub accum_steps: usize,
     /// Whole-process stall watchdog: kill the run if no step completes
     /// within this many seconds (catches hangs no panic hook can see).
     #[config(default = 900)]
@@ -135,7 +140,14 @@ impl<B: AutodiffBackend> Trainer<B> {
         sorted_pool[start..start + n].iter().collect()
     }
 
-    pub fn train_step(&mut self, batch: &[&Instance]) -> StepInfo {
+    /// Forward + loss + backward for one micro-batch. `scale` multiplies the
+    /// loss before backward (1/accum_steps for mean-equivalent accumulation).
+    /// Reports unscaled loss/ponder for logging.
+    pub fn forward_backward(
+        &mut self,
+        batch: &[&Instance],
+        scale: f64,
+    ) -> (StepInfo, GradientsParams) {
         let owned: Vec<Instance> = batch.iter().map(|i| (*i).clone()).collect();
         let col = collate(&owned, &self.device);
         let t = col.lengths.iter().max().copied().unwrap_or(0);
@@ -154,14 +166,24 @@ impl<B: AutodiffBackend> Trainer<B> {
             out.ponder.clone(),
             self.config.ponder_weight,
         );
-        let loss_val = scalar_of(&loss);
-        let ponder_val = scalar_of(&out.ponder);
-        let steps_used = out.steps_used;
-        let mean_halt = out.mean_halt;
-
-        let grads = loss.backward();
+        let info = StepInfo {
+            loss: scalar_of(&loss),
+            ponder: scalar_of(&out.ponder),
+            steps_used: out.steps_used,
+            mean_halt: out.mean_halt,
+        };
+        let scaled = loss.mul_scalar(scale);
+        let grads = scaled.backward();
         let grads = GradientsParams::from_grads(grads, &self.model);
-        let (muon_grads, adamw_grads) = split_grads::<B>(&self.muon_ids, grads);        self.precond.observe_stats(&stats);
+        self.precond.observe_stats(&stats);
+        (info, grads)
+    }
+
+    /// Consume raw grads through split + Newton-Muon precondition + both
+    /// adaptor steps. Refreshes the preconditioner inverses once per call
+    /// (i.e. once per optimizer step, not per micro-batch).
+    pub fn optimizer_step(&mut self, grads: GradientsParams) {
+        let (muon_grads, adamw_grads) = split_grads::<B>(&self.muon_ids, grads);
         self.precond.maybe_refresh();
         let (muon_grads, leftover) =
             precondition_grads::<B>(&self.precond, &self.roles, muon_grads);
@@ -171,8 +193,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         self.model = self.muon.step(self.lr_muon, model, muon_grads);
         let model = self.model.clone();
         self.model = self.adamw.step(self.lr_adamw, model, adamw_grads);
+    }
 
-        StepInfo { loss: loss_val, ponder: ponder_val, steps_used, mean_halt }
+    pub fn train_step(&mut self, batch: &[&Instance]) -> StepInfo {
+        let (info, grads) = self.forward_backward(batch, 1.0);
+        self.optimizer_step(grads);
+        info
     }
 
     /// Greedy decode to EOS: exact-match, copy flag, loop stats per instance.
@@ -181,43 +207,102 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// by `backward()` — un-backwarded eval graphs pile up (~80MB/instance
     /// at 1M scale) and OOM both RAM and VRAM.
     pub fn evaluate(&self, instances: &[Instance], max_new: usize) -> Vec<MetricRecord> {
+        self.evaluate_batched(instances, max_new, 8)
+    }
+
+    /// Batched greedy decode with per-row EOS masking. Rows decode in lockstep
+    /// (one fused forward per step for the whole chunk instead of one per
+    /// instance); finished rows freeze while the rest continue. Per-row
+    /// accuracy/copy are exact; steps/halt use batch means (cells average
+    /// them anyway).
+    pub fn evaluate_batched(
+        &self,
+        instances: &[Instance],
+        max_new: usize,
+        chunk: usize,
+    ) -> Vec<MetricRecord> {
         let model = self.model.valid();
-        instances
-            .iter()
-            .map(|inst| {
-                let mut ids = inst.prompt_ids();
-                let mut steps_sum = 0usize;
-                let mut halt_sum = 0.0f32;
-                let mut n_decode = 0usize;
-                let mut out_bytes: Vec<u8> = vec![];
-                loop {
-                    let t = ids.len();
-                    if t >= self.config.max_seq_len {
-                        break;
-                    }
-                    // Bucket the physical length: decode grows t by 1 per
-                    // step, which would recompile fused kernels every step.
-                    let tb = crate::harness::bucket_len(t);
-                    let mut padded = ids.clone();
-                    padded.resize(tb, crate::harness::EOS as i64);
-                    let tokens = Tensor::<B::InnerBackend, 2, Int>::from_data(
-                        TensorData::new(padded, [1, tb]),
-                        &self.device,
-                    );
-                    let out = model.forward(tokens, &self.config, StopMode::Act, &[t]);
-                    steps_sum += out.steps_used;
-                    halt_sum += out.mean_halt;
-                    n_decode += 1;
-                    let v = self.config.vocab_size;
-                    let next = out.logits.slice([0..1, t - 1..t, 0..v]).reshape([v]).argmax(0);
-                    let next_id = int_scalar(&next.into_data());
-                    if next_id == crate::harness::EOS as i64 || out_bytes.len() >= max_new {
-                        break;
-                    }
-                    ids.push(next_id);
-                    out_bytes.push(next_id as u8);
+        let mut out = Vec::with_capacity(instances.len());
+        for group in instances.chunks(chunk.max(1)) {
+            out.extend(self.decode_chunk(&model, group, max_new));
+        }
+        out
+    }
+
+    fn decode_chunk(
+        &self,
+        model: &LoopedTransformer<B::InnerBackend>,
+        group: &[Instance],
+        max_new: usize,
+    ) -> Vec<MetricRecord> {
+        let g = group.len();
+        let mut ids: Vec<Vec<i64>> = group.iter().map(|i| i.prompt_ids()).collect();
+        let mut out_bytes: Vec<Vec<u8>> = vec![vec![]; g];
+        let mut active = vec![true; g];
+        let mut steps_sum = 0usize;
+        let mut halt_sum = 0.0f32;
+        let mut n_decode = 0usize;
+        for _ in 0..max_new {
+            for (i, row) in ids.iter().enumerate() {
+                if active[i] && row.len() >= self.config.max_seq_len {
+                    active[i] = false;
                 }
-                let text = String::from_utf8_lossy(&out_bytes);
+            }
+            if !active.iter().any(|a| *a) {
+                break;
+            }
+            let lens: Vec<usize> = ids.iter().map(|r| r.len()).collect();
+            let tmax = crate::harness::bucket_len(*lens.iter().max().unwrap_or(&1));
+            let mut flat = Vec::with_capacity(g * tmax);
+            for row in ids.iter() {
+                for i in 0..tmax {
+                    flat.push(if i < row.len() { row[i] } else { crate::harness::EOS as i64 });
+                }
+            }
+            let tokens = Tensor::<B::InnerBackend, 2, Int>::from_data(
+                TensorData::new(flat, [g, tmax]),
+                &self.device,
+            );
+            let res = model.forward(tokens, &self.config, StopMode::Act, &lens);
+            steps_sum += res.steps_used;
+            halt_sum += res.mean_halt;
+            n_decode += 1;
+            let v = self.config.vocab_size;
+            let mut next_ids = vec![0i64; g];
+            let mut got_eos = vec![false; g];
+            for (i, row) in ids.iter().enumerate() {
+                if !active[i] {
+                    continue;
+                }
+                let t = row.len();
+                let next = res.logits.clone().slice([i..i + 1, t - 1..t, 0..v]).reshape([v]).argmax(0);
+                let next_id = int_scalar(&next.into_data());
+                if next_id == crate::harness::EOS as i64 {
+                    got_eos[i] = true;
+                } else {
+                    next_ids[i] = next_id;
+                }
+            }
+            for i in 0..g {
+                if !active[i] {
+                    continue;
+                }
+                if got_eos[i] {
+                    active[i] = false;
+                } else {
+                    ids[i].push(next_ids[i]);
+                    out_bytes[i].push(next_ids[i] as u8);
+                    if out_bytes[i].len() >= max_new {
+                        active[i] = false;
+                    }
+                }
+            }
+        }
+        group
+            .iter()
+            .zip(out_bytes.iter())
+            .map(|(inst, gbytes)| {
+                let text = String::from_utf8_lossy(gbytes);
                 let expected = String::from_utf8_lossy(&inst.target);
                 MetricRecord {
                     task: inst.info.task.to_string(),
@@ -326,9 +411,35 @@ pub fn run_stage<B: AutodiffBackend>(
     trainer.save_checkpoint(Path::new(&last_ckpt));
 
     for step in 0..run.train.steps {
-        let batch =
-            Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, run.train.batch_size);
-        let info = trainer.train_step(&batch);
+        // Gradient accumulation: `accum` micro-batches of 1/accum-scaled
+        // losses merge into one mean-equivalent grad for a single step.
+        let accum = run.train.accum_steps.max(1);
+        let scale = 1.0 / accum as f64;
+        let specs = trainer.model.grad_specs();
+        let mut acc_grads = None;
+        let (mut loss_sum, mut ponder_sum, mut halt_sum) = (0.0f32, 0.0f32, 0.0f32);
+        let mut steps_sum = 0usize;
+        for _ in 0..accum {
+            let micro =
+                Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, run.train.batch_size);
+            let (info, grads) = trainer.forward_backward(&micro, scale);
+            loss_sum += info.loss;
+            ponder_sum += info.ponder;
+            halt_sum += info.mean_halt;
+            steps_sum += info.steps_used;
+            acc_grads = Some(match acc_grads {
+                None => grads,
+                Some(a) => merge_grads::<B>(&specs, a, grads),
+            });
+        }
+        trainer.optimizer_step(acc_grads.expect("at least one micro-batch"));
+        let n = accum as f32;
+        let info = StepInfo {
+            loss: loss_sum / n,
+            ponder: ponder_sum / n,
+            steps_used: steps_sum / accum,
+            mean_halt: halt_sum / n,
+        };
         watchdog.ping_step(step);
         if step % run.train.log_every == 0 {
             println!(
@@ -444,6 +555,14 @@ mod tests {
         let eval_set: Vec<Instance> = pool.iter().take(4).cloned().collect();
         let records = trainer.evaluate(&eval_set, 8);
         assert_eq!(records.len(), 4);
+        // Chunk size must not change verdicts on this set.
+        let records2 = trainer.evaluate_batched(&eval_set, 8, 2);
+        assert_eq!(records2.len(), 4);
+        for (a, b) in records.iter().zip(records2.iter()) {
+            assert_eq!(a.correct, b.correct);
+            assert_eq!(a.task, b.task);
+            assert_eq!(a.k, b.k);
+        }
     }
 
     #[test]
@@ -478,22 +597,8 @@ mod tests {
         // all but the halt grads, so this is the tripwire for that bug class
         // (pad_mask values are pinned in model tests too).
         let mut gp = GradientsParams::from_grads(loss.backward(), &trainer.model);
-        let named: Vec<(&str, burn::module::ParamId, usize)> = vec![
-            ("embed", trainer.model.embed.weight.id, 2),
-            ("q", trainer.model.block.attn.q.weight.id, 2),
-            ("k", trainer.model.block.attn.k.weight.id, 2),
-            ("v", trainer.model.block.attn.v.weight.id, 2),
-            ("o", trainer.model.block.attn.o.weight.id, 2),
-            ("gate", trainer.model.block.mlp.gate.weight.id, 2),
-            ("up", trainer.model.block.mlp.up.weight.id, 2),
-            ("down", trainer.model.block.mlp.down.weight.id, 2),
-            ("norm1", trainer.model.block.norm1.gamma.id, 1),
-            ("norm2", trainer.model.block.norm2.gamma.id, 1),
-            ("norm_f", trainer.model.norm_f.gamma.id, 1),
-            ("halt_w", trainer.model.halt.head.weight.id, 2),
-            ("halt_b", trainer.model.halt.head.bias.as_ref().unwrap().id, 1),
-            ("head", trainer.model.head.weight.id, 2),
-        ];
+        let named = trainer.model.grad_specs();
+        assert_eq!(named.len(), 14);
         let mut zero = vec![];
         for (name, id, rank) in &named {
             let n: f32 = match rank {

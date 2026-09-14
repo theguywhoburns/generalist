@@ -1,16 +1,16 @@
 {
   "model": {
     "vocab_size": 256,
-    "d_model": 32,
-    "n_heads": 2,
-    "head_dim": 16,
-    "ffn_hidden": 64,
-    "max_loops": 4,
+    "d_model": 256,
+    "n_heads": 4,
+    "head_dim": 64,
+    "ffn_hidden": 768,
+    "max_loops": 8,
     "ponder_weight": 0.001,
     "halt_bias_init": -3.0,
     "conv_tol": 0.001,
     "conv_patience": 2,
-    "max_seq_len": 256
+    "max_seq_len": 512
   },
   "optim": {
     "precond_ewma": 0.95,
@@ -22,22 +22,22 @@
   },
   "train": {
     "lr_muon": 0.002,
-    "lr_adamw": 0.001,
-    "batch_size": 8,
-    "steps": 60,
+    "lr_adamw": 0.0003,
+    "batch_size": 32,
+    "steps": 30,
     "log_every": 10,
-    "eval_every": 30,
+    "eval_every": 100,
     "ckpt_every": 500,
     "eval_max_new": 8,
     "seed": 0,
-    "ckpt_dir": "checkpoints-smoke-tiny",
+    "ckpt_dir": "checkpoints-probe-32",
     "stuck_timeout_secs": 900,
     "accum_steps": 1
   },
   "experiment": {
     "tasks": ["parity"],
     "tracks": ["A", "B"],
-    "per_cell": 32,
+    "per_cell": 64,
     "seeds": [0],
     "protocol": {
       "k_set": [0, 1, 2, 3, 5, 8],

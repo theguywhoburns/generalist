@@ -66,3 +66,39 @@ pub fn precondition_grads<B: AutodiffBackend>(
     }
     (out, grads)
 }
+
+/// Merge `next` into `acc` (elementwise add per param in `specs`).
+/// Gradient accumulation across micro-batches: both partitions are linear
+/// in the loss (mean-reduced CE + ponder), so summed micro-grads of
+/// 1/accum-scaled losses equal the full-batch grad.
+pub fn merge_grads<B: AutodiffBackend>(
+    specs: &[(&'static str, ParamId, usize)],
+    mut acc: GradientsParams,
+    mut next: GradientsParams,
+) -> GradientsParams {
+    for (_, id, rank) in specs {
+        match rank {
+            2 => {
+                let a = acc.remove::<B::InnerBackend, 2>(*id);
+                let b = next.remove::<B::InnerBackend, 2>(*id);
+                match (a, b) {
+                    (Some(a), Some(b)) => acc.register::<B::InnerBackend, 2>(*id, a + b),
+                    (Some(a), None) => acc.register::<B::InnerBackend, 2>(*id, a),
+                    (None, Some(b)) => acc.register::<B::InnerBackend, 2>(*id, b),
+                    (None, None) => {}
+                }
+            }
+            _ => {
+                let a = acc.remove::<B::InnerBackend, 1>(*id);
+                let b = next.remove::<B::InnerBackend, 1>(*id);
+                match (a, b) {
+                    (Some(a), Some(b)) => acc.register::<B::InnerBackend, 1>(*id, a + b),
+                    (Some(a), None) => acc.register::<B::InnerBackend, 1>(*id, a),
+                    (None, Some(b)) => acc.register::<B::InnerBackend, 1>(*id, b),
+                    (None, None) => {}
+                }
+            }
+        }
+    }
+    acc
+}

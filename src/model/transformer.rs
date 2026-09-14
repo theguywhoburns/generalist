@@ -316,6 +316,27 @@ impl<B: Backend> LoopedTransformer<B> {
         .collect()
     }
 
+    /// Every float param with name and rank: the canonical id set for grad
+    /// partitioning, accumulation merging, and coverage tests.
+    pub fn grad_specs(&self) -> Vec<(&'static str, ParamId, usize)> {
+        vec![
+            ("embed", self.embed.weight.id, 2),
+            ("q", self.block.attn.q.weight.id, 2),
+            ("k", self.block.attn.k.weight.id, 2),
+            ("v", self.block.attn.v.weight.id, 2),
+            ("o", self.block.attn.o.weight.id, 2),
+            ("gate", self.block.mlp.gate.weight.id, 2),
+            ("up", self.block.mlp.up.weight.id, 2),
+            ("down", self.block.mlp.down.weight.id, 2),
+            ("norm1", self.block.norm1.gamma.id, 1),
+            ("norm2", self.block.norm2.gamma.id, 1),
+            ("norm_f", self.norm_f.gamma.id, 1),
+            ("halt_w", self.halt.head.weight.id, 2),
+            ("halt_b", self.halt.head.bias.as_ref().unwrap().id, 1),
+            ("head", self.head.weight.id, 2),
+        ]
+    }
+
     /// Newton-Muon input group per hidden matrix.
     pub fn precond_roles(&self) -> HashMap<ParamId, PrecondInput> {
         [
