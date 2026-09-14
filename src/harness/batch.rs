@@ -10,6 +10,21 @@ use crate::tasks::Instance;
 
 pub const EOS: u8 = 0;
 
+/// Padded-length buckets. Every batch/decoded sequence is padded to a bucket
+/// edge so fused-JIT shapes take only a handful of values per run: without
+/// this, each unique T recompiles the whole fused graph (~13ms/load, 92% of
+/// CUDA API time in the profile). Lengths stay exact; masks stay correct.
+pub const BUCKET_EDGES: &[usize] = &[64, 128, 256, 512];
+
+pub fn bucket_len(n: usize) -> usize {
+    for edge in BUCKET_EDGES {
+        if *edge >= n {
+            return *edge;
+        }
+    }
+    panic!("sequence length exceeds top bucket");
+}
+
 pub struct Collated<B: Backend> {
     /// `[B, T]` padded with EOS(0).
     pub tokens: Tensor<B, 2, Int>,
@@ -33,7 +48,8 @@ pub fn collate<B: Backend>(instances: &[Instance], device: &B::Device) -> Collat
             s
         })
         .collect();
-    let t = seqs.iter().map(|s| s.len()).max().unwrap_or(1);
+    let t_raw = seqs.iter().map(|s| s.len()).max().unwrap_or(1);
+    let t = bucket_len(t_raw);
     let b = seqs.len();
 
     let mut tok = Vec::with_capacity(b * t);
@@ -80,7 +96,8 @@ mod tests {
             &[inst(b"ab->", b"cd"), inst(b"abc->", b"d")],
             &device,
         );
-        assert_eq!(batch.tokens.dims(), [2, 7]);
+        // Bucketed to edge 64; real lengths recorded exactly.
+        assert_eq!(batch.tokens.dims(), [2, 64]);
         assert_eq!(batch.lengths, vec![7, 7]);
         let m = batch
             .loss_mask
@@ -88,9 +105,17 @@ mod tests {
             .as_slice::<f32>()
             .unwrap()
             .to_vec();
-        // Row 0: prompt "ab->" (4) masked, "cd"+EOS scored.
-        assert_eq!(&m[..7], &[0., 0., 0., 0., 1., 1., 1.]);
-        // Row 1: prompt "abc->" (5) masked, "d"+EOS scored.
-        assert_eq!(&m[7..], &[0., 0., 0., 0., 0., 1., 1.]);
+        // Row 0: prompt "ab->" (4) masked, "cd"+EOS scored, rest pad.
+        assert_eq!(&m[..8], &[0., 0., 0., 0., 1., 1., 1., 0.]);
+        // Row 1 starts at offset 64: prompt "abc->" (5) masked, "d"+EOS scored.
+        assert_eq!(&m[64..72], &[0., 0., 0., 0., 0., 1., 1., 0.]);
+    }
+
+    #[test]
+    fn bucket_edges_canonicalize() {
+        assert_eq!(bucket_len(1), 64);
+        assert_eq!(bucket_len(64), 64);
+        assert_eq!(bucket_len(65), 128);
+        assert_eq!(bucket_len(512), 512);
     }
 }

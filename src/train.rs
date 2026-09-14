@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use burn::{
     config::Config,
-    module::{Module, ParamId},
+    module::{AutodiffModule, Module, ParamId},
     optim::{
         AdamW, AdamWConfig, GradientsParams, LearningRate, Muon, Optimizer,
         adaptor::OptimizerAdaptor,
@@ -176,7 +176,12 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     /// Greedy decode to EOS: exact-match, copy flag, loop stats per instance.
+    /// Decodes on the inner (inference) backend: eval forwards must not
+    /// register nodes on the global autodiff tape, which is reclaimed only
+    /// by `backward()` — un-backwarded eval graphs pile up (~80MB/instance
+    /// at 1M scale) and OOM both RAM and VRAM.
     pub fn evaluate(&self, instances: &[Instance], max_new: usize) -> Vec<MetricRecord> {
+        let model = self.model.valid();
         instances
             .iter()
             .map(|inst| {
@@ -190,11 +195,16 @@ impl<B: AutodiffBackend> Trainer<B> {
                     if t >= self.config.max_seq_len {
                         break;
                     }
-                    let tokens = Tensor::<B, 2, Int>::from_data(
-                        TensorData::new(ids.clone(), [1, t]),
+                    // Bucket the physical length: decode grows t by 1 per
+                    // step, which would recompile fused kernels every step.
+                    let tb = crate::harness::bucket_len(t);
+                    let mut padded = ids.clone();
+                    padded.resize(tb, crate::harness::EOS as i64);
+                    let tokens = Tensor::<B::InnerBackend, 2, Int>::from_data(
+                        TensorData::new(padded, [1, tb]),
                         &self.device,
                     );
-                    let out = self.model.forward(tokens, &self.config, StopMode::Act, &[t]);
+                    let out = model.forward(tokens, &self.config, StopMode::Act, &[t]);
                     steps_sum += out.steps_used;
                     halt_sum += out.mean_halt;
                     n_decode += 1;

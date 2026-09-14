@@ -9,7 +9,7 @@ pub mod experiment;
 pub mod metrics;
 pub mod run;
 
-pub use batch::{Collated, EOS, collate};
+pub use batch::{BUCKET_EDGES, Collated, EOS, bucket_len, collate};
 pub use experiment::{Experiment, generate};
 pub use run::{ExperimentPlan, PlannedExperiment, RunConfig};
 pub use metrics::{Jsonl, Record, summarize};
