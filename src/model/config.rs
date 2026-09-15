@@ -42,6 +42,10 @@ pub struct LoopedConfig {
     pub conv_patience: usize,
     #[config(default = 512)]
     pub max_seq_len: usize,
+    /// Stacked distinct blocks looped as one unit (1 = headline config).
+    /// 2 blocks ≈ 1.84M params; the comparison axis for width-vs-depth.
+    #[config(default = 1)]
+    pub n_blocks: usize,
 }
 
 impl LoopedConfig {
@@ -66,12 +70,11 @@ impl LoopedConfig {
         let v = self.vocab_size;
         let h = self.ffn_hidden;
         let embed = v * d;
-        let attn = 4 * d * d; // unfused Q, K, V, O
-        let mlp = 3 * d * h; // SwiGLU gate, up, down
-        let norms = 3 * d; // norm1, norm2, norm_f
+        let block = 4 * d * d + 3 * d * h + 2 * d; // attn + mlp + 2 norms
+        let norms = d; // norm_f
         let halt = d + 1; // halting head
         let head = v * d; // untied LM head
-        embed + attn + mlp + norms + halt + head
+        embed + self.n_blocks * block + norms + halt + head
     }
 
     /// Residual branch scale `1 / sqrt(2 * max_loops)`.
@@ -88,5 +91,12 @@ mod tests {
     fn option_a_is_1m_class() {
         let cfg = LoopedConfig::base_1m();
         assert_eq!(cfg.param_count(), 984_065);
+    }
+
+    #[test]
+    fn two_blocks_is_18m_class() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        assert_eq!(cfg.param_count(), 1_836_545);
+        assert_eq!(cfg.param_count(), 984_065 + 852_480);
     }
 }

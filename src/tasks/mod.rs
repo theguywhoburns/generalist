@@ -17,6 +17,26 @@ pub mod scan;
 pub use demo::{DemoProtocol, InstanceInfo};
 pub use rng::HarnessRng;
 
+/// Per-task demo-output policy enforced by [`demo::DemoProtocol::build`].
+///
+/// Copying demos must never score, but binary and large output spaces need
+/// different treatment:
+/// - [`DemoPolicy::ExcludeAnswer`] resamples any demo whose output exactly
+///   equals the query target, so verbatim copying scores ~0%.
+/// - [`DemoPolicy::Balanced`] (binary outputs only) instead forces demo
+///   outputs to cover each class equally per instance. Rationale: for binary
+///   outputs pure exclusion would make all demos uniform-opposite (every demo
+///   shows the opposite of the answer), enabling a trivial flip-the-demos
+///   shortcut. Balanced demos hold EVERY non-inductive strategy at exactly
+///   chance (copy-random, copy-nearest, majority vote, flip-majority all sit
+///   at 50%) while true induction scores 100%, so absolute accuracy
+///   separates cleanly.
+#[derive(Debug, Clone)]
+pub enum DemoPolicy {
+    ExcludeAnswer,
+    Balanced { classes: Vec<String> },
+}
+
 /// Track A: rule seen in training, held-out instances.
 /// Track B: rule never seen, defined only by prompt demos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,6 +87,15 @@ pub trait Rule: Send + Sync {
     /// Judge a (query input, model output) pair.
     fn verify(&self, input: &str, output: &str) -> bool;
 
+    /// Demo-output policy this rule's instances must satisfy. Default is
+    /// [`DemoPolicy::ExcludeAnswer`]; only binary-output rules override this
+    /// (parity). Mirrors [`Task::demo_policy`]: `build` only sees `&dyn Rule`,
+    /// so the rule carries the policy to the enforcement point while the task
+    /// declares the canonical per-task config. Both must agree.
+    fn demo_policy(&self) -> DemoPolicy {
+        DemoPolicy::ExcludeAnswer
+    }
+
     /// Produce a wrong output for the ~5% corrupted-demo instances.
     /// Default: flip one character to a different ASCII symbol.
     fn corrupt(&self, rng: &mut HarnessRng, output: &str) -> String {
@@ -92,6 +121,14 @@ pub trait Task: Send + Sync {
     fn name(&self) -> &'static str;
     fn stage(&self) -> u8;
     fn sample_rule(&self, rng: &mut HarnessRng, track: Track) -> Box<dyn Rule>;
+    /// Canonical per-task demo-output policy. Default is
+    /// [`DemoPolicy::ExcludeAnswer`]; only parity overrides this (binary
+    /// outputs need [`DemoPolicy::Balanced`], see its docs). The sampled
+    /// rules mirror this via [`Rule::demo_policy`], which is what `build`
+    /// enforces.
+    fn demo_policy(&self) -> DemoPolicy {
+        DemoPolicy::ExcludeAnswer
+    }
 }
 
 /// Central registry. One line per task in [`TaskRegistry::builtin`].
@@ -143,6 +180,49 @@ mod tests {
         assert_eq!(r.len(), 6);
         for name in ["parity", "dyck1", "subst-fst", "periodic", "copy-rev-rep", "scan-tiny"] {
             assert!(r.get(name).is_some(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn demo_policy_table() {
+        // Per-task demo-output policy: parity is Balanced (binary outputs),
+        // every other task is ExcludeAnswer (large output spaces).
+        let r = TaskRegistry::builtin();
+        for name in [
+            "dyck1",
+            "subst-fst",
+            "periodic",
+            "copy-rev-rep",
+            "scan-tiny",
+        ] {
+            assert!(
+                matches!(
+                    r.get(name).unwrap().demo_policy(),
+                    DemoPolicy::ExcludeAnswer
+                ),
+                "{name} should be ExcludeAnswer"
+            );
+        }
+        match r.get("parity").unwrap().demo_policy() {
+            DemoPolicy::Balanced { classes } => {
+                assert_eq!(classes, vec!["0".to_string(), "1".to_string()]);
+            }
+            other => panic!("parity should be Balanced, got {other:?}"),
+        }
+        // Sampled rules must mirror their task's policy (build enforces the
+        // rule-level policy).
+        let mut rng = HarnessRng::new(99);
+        for name in r.names() {
+            let task = r.get(name).unwrap();
+            for track in [Track::A, Track::B] {
+                let rule = task.sample_rule(&mut rng, track);
+                let task_balanced = matches!(task.demo_policy(), DemoPolicy::Balanced { .. });
+                let rule_balanced = matches!(rule.demo_policy(), DemoPolicy::Balanced { .. });
+                assert_eq!(
+                    task_balanced, rule_balanced,
+                    "{name} {track:?} task/rule mismatch"
+                );
+            }
         }
     }
 

@@ -1,10 +1,17 @@
 use burn::{
     module::Module,
     nn::{RmsNorm, RmsNormConfig},
-    tensor::{Tensor, backend::Backend},
+    tensor::{Bool, Tensor, backend::Backend},
 };
 
 use super::{attention::MultiHeadAttention, config::LoopedConfig, mlp::SwiGluMlp};
+
+/// Inputs to each matrix group, exposed for Newton-Muon input statistics.
+pub struct BlockInputs<B: Backend> {
+    pub attn_in: Tensor<B, 3>,
+    pub mlp_in: Tensor<B, 3>,
+    pub hidden: Tensor<B, 3>,
+}
 
 /// The single weight-tied block. Instantiated once, applied up to
 /// `max_loops` times. Physical layers: 1. Virtual depth: loop count.
@@ -41,11 +48,33 @@ impl<B: Backend> LoopedBlock<B> {
     pub fn forward_masked(
         &self,
         x: Tensor<B, 3>,
-        key_pad: Option<Tensor<B, 2, burn::tensor::Bool>>,
+        key_pad: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
-        let h = self.norm1.forward(x.clone());
-        let x = x + self.attn.forward_masked(h, key_pad.clone()).mul_scalar(self.scale);
-        let h = self.norm2.forward(x.clone());
-        x + self.mlp.forward(h).mul_scalar(self.scale)
+        self.forward_split(x, key_pad).0
+    }
+
+    /// Forward pass that also returns per-group inputs for statistics.
+    /// Same math as [`Self::forward_masked`], no duplicated computation.
+    pub fn forward_split(
+        &self,
+        x: Tensor<B, 3>,
+        key_pad: Option<Tensor<B, 2, Bool>>,
+    ) -> (Tensor<B, 3>, BlockInputs<B>) {
+        let attn_in = self.norm1.forward(x.clone());
+        let x = x + self
+            .attn
+            .forward_masked(attn_in.clone(), key_pad)
+            .mul_scalar(self.scale);
+        let mlp_in = self.norm2.forward(x.clone());
+        let hidden = self.mlp.hidden(mlp_in.clone());
+        let y = x + self.mlp.down.forward(hidden.clone()).mul_scalar(self.scale);
+        (
+            y,
+            BlockInputs {
+                attn_in,
+                mlp_in,
+                hidden,
+            },
+        )
     }
 }

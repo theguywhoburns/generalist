@@ -72,7 +72,7 @@ pub fn precondition_grads<B: AutodiffBackend>(
 /// in the loss (mean-reduced CE + ponder), so summed micro-grads of
 /// 1/accum-scaled losses equal the full-batch grad.
 pub fn merge_grads<B: AutodiffBackend>(
-    specs: &[(&'static str, ParamId, usize)],
+    specs: &[(String, ParamId, usize)],
     mut acc: GradientsParams,
     mut next: GradientsParams,
 ) -> GradientsParams {

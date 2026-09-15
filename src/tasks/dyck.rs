@@ -186,4 +186,9 @@ mod tests {
         }
         assert!(max_seen >= 4, "track B never exceeded depth 3");
     }
+
+    #[test]
+    fn demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&DyckTask, 303, 200);
+    }
 }

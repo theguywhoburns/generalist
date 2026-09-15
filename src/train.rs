@@ -860,16 +860,16 @@ mod tests {
                 _ => gp.remove::<IB, 1>(*id).unwrap().abs().sum().into_data().as_slice::<f32>().unwrap()[0],
             };
             if n == 0.0 {
-                zero.push(*name);
+                zero.push(name.clone());
             }
         }
         assert!(zero.is_empty(), "params with zero grad: {zero:?}");
         // Weights must actually move after a step.
-        let before = trainer.model.block.attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let before = trainer.model.blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let before_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let refs: Vec<&Instance> = batch.iter().collect();
         trainer.train_step(&refs);
-        let after = trainer.model.block.attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let after = trainer.model.blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let after_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         assert_ne!(before, after, "muon param frozen after a step");
         assert_ne!(before_head, after_head, "adamw param frozen after a step");

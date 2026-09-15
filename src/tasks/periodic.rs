@@ -93,4 +93,9 @@ mod tests {
             assert!(!q.target.is_empty());
         }
     }
+
+    #[test]
+    fn demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&PeriodicTask, 304, 200);
+    }
 }

@@ -2,7 +2,7 @@
 //! protocol"). Applied uniformly to every task: tasks define latent rules,
 //! this module defines how demos ship with each instance.
 
-use super::{Demo, HarnessRng, Instance, Rule, Track};
+use super::{Demo, DemoPolicy, HarnessRng, Instance, Rule, Track};
 
 /// Per-instance metadata for metrics (accuracy-vs-k, copy-rate, leakage).
 #[derive(Debug, Clone)]
@@ -59,6 +59,11 @@ impl Default for DemoProtocol {
 }
 
 impl DemoProtocol {
+    /// Bounded resample tries per demo slot. Large enough that exclusion /
+    /// balancing always succeeds on real tasks (output spaces are far from
+    /// singleton); on exhaustion the last render is kept so build can never
+    /// infinite-loop (same lesson as `sample_k`).
+    const RESAMPLE_TRIES: usize = 32;
     fn sample_k(&self, rng: &mut HarnessRng) -> usize {
         if rng.prob(self.k0_rate) {
             return 0;
@@ -104,6 +109,34 @@ impl DemoProtocol {
         let query = rule.render_query(rng);
         let query_first = rng.prob(0.5) && k > 0;
 
+        // Demo-output policy gate (runs AFTER corruption on the final demos
+        // shipped in the prompt, so the guarantee holds as stated):
+        // - ExcludeAnswer: resample any demo whose output exactly equals the
+        //   query target via fresh regime-correct `render_demo` calls.
+        // - Balanced: repair demo classes to equal per-instance coverage.
+        // All rng use is sequential, so identical seeds give identical
+        // instances. Known interaction (see docs on `DemoPolicy`): if the 5%
+        // corruption produced the target (ExcludeAnswer) or broke class
+        // balance (Balanced), enforcement overwrites that corrupted demo,
+        // microscopically lowering the effective corruption rate in exchange
+        // for a hard anti-copy guarantee. Layout randomization (shuffle,
+        // query-first, separator) only reorders text, never outputs, so it
+        // cannot undermine the guarantee.
+        match rule.demo_policy() {
+            DemoPolicy::ExcludeAnswer => {
+                for demo in demos.iter_mut() {
+                    let mut tries = 0;
+                    while demo.output == query.target && tries < Self::RESAMPLE_TRIES {
+                        *demo = rule.render_demo(rng);
+                        tries += 1;
+                    }
+                }
+            }
+            DemoPolicy::Balanced { classes } => {
+                enforce_balanced(rule, rng, &mut demos, &classes);
+            }
+        }
+
         let mut prompt = String::new();
         let push_pair = |s: &mut String, input: &str, output: Option<&str>| {
             s.push_str(input);
@@ -146,7 +179,97 @@ impl DemoProtocol {
             },
         }
     }
+}
 
+/// Desired per-class demo counts for [`DemoPolicy::Balanced`]: even k splits
+/// evenly; odd k gives one side `ceil(k/2)`, picking the side deterministically
+/// from `rng` so instances alternate which class holds the majority. k <= 1 is
+/// left to the caller (k = 0 is vacuous, k = 1 stays as sampled).
+fn balanced_counts(k: usize, rng: &mut HarnessRng) -> (usize, usize) {
+    let base = k / 2;
+    if k.is_multiple_of(2) {
+        (base, base)
+    } else if rng.below(2) == 0 {
+        (base + 1, base)
+    } else {
+        (base, base + 1)
+    }
+}
+
+/// Repair `demos` in place to exact `classes` coverage. Demos already showing
+/// a still-needed class are kept (positions stay shuffled); over-quota or
+/// non-class demos (e.g. a corrupted output) are resampled via fresh
+/// regime-correct `render_demo` calls until they fill a remaining need.
+/// Bounded tries per slot, keep-last on exhaustion: never loops forever.
+fn enforce_balanced(rule: &dyn Rule, rng: &mut HarnessRng, demos: &mut [Demo], classes: &[String]) {
+    let k = demos.len();
+    if k <= 1 || classes.len() != 2 {
+        return;
+    }
+    let (mut need0, mut need1) = balanced_counts(k, rng);
+    for demo in demos.iter_mut() {
+        if demo.output == classes[0] && need0 > 0 {
+            need0 -= 1;
+            continue;
+        }
+        if demo.output == classes[1] && need1 > 0 {
+            need1 -= 1;
+            continue;
+        }
+        let mut kept: Option<Demo> = None;
+        for _ in 0..DemoProtocol::RESAMPLE_TRIES {
+            let d = rule.render_demo(rng);
+            let wants0 = d.output == classes[0] && need0 > 0;
+            let wants1 = d.output == classes[1] && need1 > 0;
+            if wants0 || wants1 {
+                if wants0 {
+                    need0 -= 1;
+                } else {
+                    need1 -= 1;
+                }
+                *demo = d;
+                kept = None;
+                break;
+            }
+            kept = Some(d);
+        }
+        if let Some(d) = kept {
+            if d.output == classes[0] {
+                need0 = need0.saturating_sub(1);
+            } else if d.output == classes[1] {
+                need1 = need1.saturating_sub(1);
+            }
+            *demo = d;
+        }
+    }
+}
+
+/// Shared anti-copy fuzz: build `n` instances per track with the default
+/// protocol and assert no demo output equals the query target. Task test
+/// modules call this instead of duplicating the loop.
+#[cfg(test)]
+pub(crate) fn fuzz_no_demo_equals_target(task: &dyn super::Task, seed: u64, n: usize) {
+    let proto = DemoProtocol::default();
+    let mut rng = HarnessRng::new(seed);
+    for _ in 0..n {
+        for track in [Track::A, Track::B] {
+            let rule = task.sample_rule(&mut rng, track);
+            let inst = proto.build(task.name(), task.stage(), track, rule.as_ref(), &mut rng);
+            assert!(
+                !inst
+                    .info
+                    .demos
+                    .iter()
+                    .any(|d| d.output == inst.info.expected),
+                "{} {track:?}: a demo copies the query target {:?}",
+                task.name(),
+                inst.info.expected,
+            );
+        }
+    }
+}
+
+impl DemoProtocol {
     /// Copy-rate probe: fraction of model outputs that appear verbatim among
     /// demo outputs. High copy-rate + high accuracy = shortcut, not induction.
     pub fn copy_rate(demos: &[Demo], outputs: &[&str]) -> f64 {
@@ -240,5 +363,132 @@ mod tests {
         ];
         assert!((DemoProtocol::copy_rate(&demos, &["aa", "zz"]) - 0.5).abs() < 1e-9);
         assert_eq!(DemoProtocol::copy_rate(&demos, &[]), 0.0);
+    }
+
+    #[test]
+    fn balanced_counts_shapes() {
+        let mut rng = HarnessRng::new(5);
+        assert_eq!(balanced_counts(8, &mut rng), (4, 4));
+        assert_eq!(balanced_counts(2, &mut rng), (1, 1));
+        assert_eq!(balanced_counts(0, &mut rng), (0, 0));
+        // Odd k: ceil/floor split, majority side varies across draws.
+        let mut saw_first = false;
+        let mut saw_second = false;
+        for _ in 0..20 {
+            let (a, b) = balanced_counts(5, &mut rng);
+            assert_eq!(a + b, 5);
+            assert_eq!(a.abs_diff(b), 1);
+            saw_first |= a == 3;
+            saw_second |= b == 3;
+        }
+        assert!(
+            saw_first && saw_second,
+            "odd-k majority side never alternated"
+        );
+        let (a, b) = balanced_counts(3, &mut rng);
+        assert_eq!(a + b, 3);
+        assert_eq!(a.abs_diff(b), 1);
+    }
+
+    /// Binary-output stub under the DEFAULT (ExcludeAnswer) policy. Demos
+    /// naturally match the target ~50% of the time, so this fuzz only passes
+    /// if enforcement actively strips copies (uses the default protocol with
+    /// corruption on, proving the post-corruption guarantee too).
+    struct BinaryRule;
+    impl Rule for BinaryRule {
+        fn render_demo(&self, rng: &mut HarnessRng) -> Demo {
+            Demo {
+                input: "x".to_string(),
+                output: if rng.prob(0.5) {
+                    "0".to_string()
+                } else {
+                    "1".to_string()
+                },
+            }
+        }
+        fn render_query(&self, rng: &mut HarnessRng) -> Query {
+            Query {
+                input: "y".to_string(),
+                target: if rng.prob(0.5) {
+                    "0".to_string()
+                } else {
+                    "1".to_string()
+                },
+            }
+        }
+        fn verify(&self, _input: &str, output: &str) -> bool {
+            output == "0" || output == "1"
+        }
+    }
+
+    #[test]
+    fn exclusion_strips_copies() {
+        let p = DemoProtocol {
+            k_set: vec![8],
+            k0_rate: 0.0,
+            ..Default::default()
+        };
+        let mut rng = HarnessRng::new(6);
+        for _ in 0..200 {
+            let inst = p.build("t", 0, Track::A, &BinaryRule, &mut rng);
+            assert_eq!(inst.info.demos.len(), 8);
+            assert!(
+                inst.info
+                    .demos
+                    .iter()
+                    .all(|d| d.output != inst.info.expected),
+                "a demo copies the target {:?}",
+                inst.info.expected,
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_terminates_on_singleton_output_space() {
+        // ConstRule can only emit "b" == target: bounded tries must terminate
+        // and keep the last render instead of looping forever.
+        let p = DemoProtocol {
+            k_set: vec![3],
+            k0_rate: 0.0,
+            corrupt_rate: 0.0,
+            ..Default::default()
+        };
+        let mut rng = HarnessRng::new(9);
+        for _ in 0..20 {
+            let inst = p.build("t", 0, Track::A, &ConstRule, &mut rng);
+            assert_eq!(inst.info.demos.len(), 3);
+            assert!(inst.info.demos.iter().all(|d| d.output == "b"));
+        }
+    }
+
+    #[test]
+    fn build_is_deterministic_across_tasks() {
+        use crate::tasks::TaskRegistry;
+        let registry = TaskRegistry::builtin();
+        let proto = DemoProtocol::default();
+        for seed in [7u64, 12345] {
+            for track in [Track::A, Track::B] {
+                for name in registry.names() {
+                    let task = registry.get(name).unwrap();
+                    let mut ra = HarnessRng::new(seed);
+                    let mut rb = HarnessRng::new(seed);
+                    for _ in 0..5 {
+                        let rule_a = task.sample_rule(&mut ra, track);
+                        let rule_b = task.sample_rule(&mut rb, track);
+                        let a =
+                            proto.build(task.name(), task.stage(), track, rule_a.as_ref(), &mut ra);
+                        let b =
+                            proto.build(task.name(), task.stage(), track, rule_b.as_ref(), &mut rb);
+                        assert_eq!(a.prompt, b.prompt, "{name} {track:?}");
+                        assert_eq!(a.target, b.target, "{name} {track:?}");
+                        assert_eq!(a.info.demos.len(), b.info.demos.len(), "{name} {track:?}");
+                        for (da, db) in a.info.demos.iter().zip(b.info.demos.iter()) {
+                            assert_eq!(da.input, db.input, "{name} {track:?}");
+                            assert_eq!(da.output, db.output, "{name} {track:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

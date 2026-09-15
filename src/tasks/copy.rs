@@ -101,4 +101,9 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&CopyTask, 302, 200);
+    }
 }

@@ -50,7 +50,8 @@ fn xtx_sum<B: Backend>(x: Tensor<B, 3>) -> (Tensor<B, 2>, usize) {
 #[derive(Module, Debug)]
 pub struct LoopedTransformer<B: Backend> {
     pub embed: Embedding<B>,
-    pub block: LoopedBlock<B>,
+    /// Stacked distinct blocks, applied in order on every loop iteration.
+    pub blocks: Vec<LoopedBlock<B>>,
     pub norm_f: RmsNorm<B>,
     pub halt: HaltingHead<B>,
     pub head: Linear<B>,
@@ -59,6 +60,7 @@ pub struct LoopedTransformer<B: Backend> {
 impl<B: Backend> LoopedTransformer<B> {
     pub fn new(config: &LoopedConfig, device: &B::Device) -> Self {
         config.assert_valid();
+        assert!(config.n_blocks >= 1, "n_blocks must be >= 1");
         Self {
             embed: EmbeddingConfig::new(config.vocab_size, config.d_model)
                 .with_initializer(burn::module::Initializer::Normal {
@@ -66,13 +68,28 @@ impl<B: Backend> LoopedTransformer<B> {
                     std: 0.02,
                 })
                 .init(device),
-            block: LoopedBlock::new(config, device),
+            blocks: (0..config.n_blocks)
+                .map(|_| LoopedBlock::new(config, device))
+                .collect(),
             norm_f: RmsNormConfig::new(config.d_model).init(device),
             halt: HaltingHead::new(config.d_model, config.halt_bias_init, device),
             head: LinearConfig::new(config.d_model, config.vocab_size)
                 .with_bias(false)
                 .init(device),
         }
+    }
+
+    /// One full pass through the stacked blocks (one loop iteration).
+    fn iterate(
+        &self,
+        x: Tensor<B, 3>,
+        key_pad: &Tensor<B, 2, burn::tensor::Bool>,
+    ) -> Tensor<B, 3> {
+        let mut x = x;
+        for block in &self.blocks {
+            x = block.forward_masked(x, Some(key_pad.clone()));
+        }
+        x
     }
 
     fn logits(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -108,7 +125,7 @@ impl<B: Backend> LoopedTransformer<B> {
         let key_pad = pad_mask(lengths, t, &device);
         let mut x = self.embed.forward(tokens);
         for _ in 0..loops {
-            x = self.block.forward_masked(x, Some(key_pad.clone()));
+            x = self.iterate(x, &key_pad);
         }
         let logits = self.logits(x);
         LoopOutput {
@@ -176,30 +193,28 @@ impl<B: Backend> LoopedTransformer<B> {
                 .bool_and(key_pad.clone().bool_not());
             let still_f = still.clone().float();
 
+            // Block stack, with optional single-pass stats collection.
+            let mut xs = x.clone();
             if collect_stats && let Some(s) = stats.as_mut() {
-                let a_in = self.block.norm1.forward(x.clone());
-                let m_pre = x.clone()
-                    + self
-                        .block
-                        .attn
-                        .forward_masked(a_in.clone(), Some(key_pad.clone()))
-                        .mul_scalar(self.block.scale);
-                let m_in = self.block.norm2.forward(m_pre);
-                let h_down = self.block.mlp.hidden(m_in.clone());
-                let (sum, _) = xtx_sum(a_in * keep_d.clone());
-                s.attn_xtx = s.attn_xtx.clone() + sum;
-                s.attn_n += real_n;
-                let (sum, _) = xtx_sum(m_in * keep_d.clone());
-                s.mlp_xtx = s.mlp_xtx.clone() + sum;
-                s.mlp_n += real_n;
-                let (sum, _) = xtx_sum(h_down * keep_h.clone());
-                s.down_xtx = s.down_xtx.clone() + sum;
-                s.down_n += real_n;
+                for block in &self.blocks {
+                    let (y, inp) = block.forward_split(xs, Some(key_pad.clone()));
+                    let (sum, _) = xtx_sum(inp.attn_in * keep_d.clone());
+                    s.attn_xtx = s.attn_xtx.clone() + sum;
+                    s.attn_n += real_n;
+                    let (sum, _) = xtx_sum(inp.mlp_in * keep_d.clone());
+                    s.mlp_xtx = s.mlp_xtx.clone() + sum;
+                    s.mlp_n += real_n;
+                    let (sum, _) = xtx_sum(inp.hidden * keep_h.clone());
+                    s.down_xtx = s.down_xtx.clone() + sum;
+                    s.down_n += real_n;
+                    xs = y;
+                }
+            } else {
+                for block in &self.blocks {
+                    xs = block.forward_masked(xs, Some(key_pad.clone()));
+                }
             }
-
-            let x_new = self
-                .block
-                .forward_masked(x.clone(), Some(key_pad.clone()));
+            let x_new = xs;
             // Freeze halted states so running tokens attend to stable keys/values.
             // Single select op; replaces ones/sub/mul/mul/add with identical math.
             let still3 = still.clone().unsqueeze_dim::<3>(2).repeat_dim(2, d);
@@ -271,9 +286,7 @@ impl<B: Backend> LoopedTransformer<B> {
         let mut calm = 0usize;
         let mut steps_used = config.max_loops;
         for s in 1..=config.max_loops {
-            let x_new = self
-                .block
-                .forward_masked(x.clone(), Some(key_pad.clone()));
+            let x_new = self.iterate(x.clone(), &key_pad);
             let num = scalar_of(
                 &(x_new.clone() - x.clone())
                     .powf_scalar(2.0)
@@ -303,53 +316,69 @@ impl<B: Backend> LoopedTransformer<B> {
     /// 2D hidden-matrix ids routed to Muon/Newton-Muon. Everything else
     /// (embedding, norms, halt head, LM head) goes to AdamW.
     pub fn muon_ids(&self) -> HashSet<ParamId> {
-        [
-            self.block.attn.q.weight.id,
-            self.block.attn.k.weight.id,
-            self.block.attn.v.weight.id,
-            self.block.attn.o.weight.id,
-            self.block.mlp.gate.weight.id,
-            self.block.mlp.up.weight.id,
-            self.block.mlp.down.weight.id,
-        ]
-        .into_iter()
-        .collect()
+        self.blocks
+            .iter()
+            .flat_map(|b| {
+                [
+                    b.attn.q.weight.id,
+                    b.attn.k.weight.id,
+                    b.attn.v.weight.id,
+                    b.attn.o.weight.id,
+                    b.mlp.gate.weight.id,
+                    b.mlp.up.weight.id,
+                    b.mlp.down.weight.id,
+                ]
+            })
+            .collect()
     }
 
     /// Every float param with name and rank: the canonical id set for grad
     /// partitioning, accumulation merging, and coverage tests.
-    pub fn grad_specs(&self) -> Vec<(&'static str, ParamId, usize)> {
-        vec![
-            ("embed", self.embed.weight.id, 2),
-            ("q", self.block.attn.q.weight.id, 2),
-            ("k", self.block.attn.k.weight.id, 2),
-            ("v", self.block.attn.v.weight.id, 2),
-            ("o", self.block.attn.o.weight.id, 2),
-            ("gate", self.block.mlp.gate.weight.id, 2),
-            ("up", self.block.mlp.up.weight.id, 2),
-            ("down", self.block.mlp.down.weight.id, 2),
-            ("norm1", self.block.norm1.gamma.id, 1),
-            ("norm2", self.block.norm2.gamma.id, 1),
-            ("norm_f", self.norm_f.gamma.id, 1),
-            ("halt_w", self.halt.head.weight.id, 2),
-            ("halt_b", self.halt.head.bias.as_ref().unwrap().id, 1),
-            ("head", self.head.weight.id, 2),
-        ]
+    /// Block params are suffixed per block (`q0`, `q1`, ...).
+    pub fn grad_specs(&self) -> Vec<(String, ParamId, usize)> {
+        let mut specs = vec![("embed".to_string(), self.embed.weight.id, 2)];
+        for (i, b) in self.blocks.iter().enumerate() {
+            specs.extend(
+                [
+                    (format!("q{i}"), b.attn.q.weight.id, 2),
+                    (format!("k{i}"), b.attn.k.weight.id, 2),
+                    (format!("v{i}"), b.attn.v.weight.id, 2),
+                    (format!("o{i}"), b.attn.o.weight.id, 2),
+                    (format!("gate{i}"), b.mlp.gate.weight.id, 2),
+                    (format!("up{i}"), b.mlp.up.weight.id, 2),
+                    (format!("down{i}"), b.mlp.down.weight.id, 2),
+                    (format!("norm1_{i}"), b.norm1.gamma.id, 1),
+                    (format!("norm2_{i}"), b.norm2.gamma.id, 1),
+                ]
+            );
+        }
+        specs.extend(
+            [
+                ("norm_f".to_string(), self.norm_f.gamma.id, 1),
+                ("halt_w".to_string(), self.halt.head.weight.id, 2),
+                ("halt_b".to_string(), self.halt.head.bias.as_ref().unwrap().id, 1),
+                ("head".to_string(), self.head.weight.id, 2),
+            ]
+        );
+        specs
     }
 
     /// Newton-Muon input group per hidden matrix.
     pub fn precond_roles(&self) -> HashMap<ParamId, PrecondInput> {
-        [
-            (self.block.attn.q.weight.id, PrecondInput::AttnIn),
-            (self.block.attn.k.weight.id, PrecondInput::AttnIn),
-            (self.block.attn.v.weight.id, PrecondInput::AttnIn),
-            (self.block.attn.o.weight.id, PrecondInput::AttnIn),
-            (self.block.mlp.gate.weight.id, PrecondInput::MlpIn),
-            (self.block.mlp.up.weight.id, PrecondInput::MlpIn),
-            (self.block.mlp.down.weight.id, PrecondInput::MlpHidden),
-        ]
-        .into_iter()
-        .collect()
+        self.blocks
+            .iter()
+            .flat_map(|b| {
+                [
+                    (b.attn.q.weight.id, PrecondInput::AttnIn),
+                    (b.attn.k.weight.id, PrecondInput::AttnIn),
+                    (b.attn.v.weight.id, PrecondInput::AttnIn),
+                    (b.attn.o.weight.id, PrecondInput::AttnIn),
+                    (b.mlp.gate.weight.id, PrecondInput::MlpIn),
+                    (b.mlp.up.weight.id, PrecondInput::MlpIn),
+                    (b.mlp.down.weight.id, PrecondInput::MlpHidden),
+                ]
+            })
+            .collect()
     }
 }
 

@@ -10,7 +10,8 @@
     "halt_bias_init": -3.0,
     "conv_tol": 0.001,
     "conv_patience": 2,
-    "max_seq_len": 256
+    "max_seq_len": 256,
+    "n_blocks": 1
   },
   "optim": {
     "precond_ewma": 0.95,

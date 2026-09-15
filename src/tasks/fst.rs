@@ -108,4 +108,9 @@ mod tests {
         }
         assert!(a_syms.is_disjoint(&b_syms), "alphabet leak between tracks");
     }
+
+    #[test]
+    fn demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstTask, 301, 200);
+    }
 }

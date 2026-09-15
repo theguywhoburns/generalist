@@ -155,4 +155,9 @@ mod tests {
         assert_eq!(ScanRule::execute("walk").as_deref(), Some("W"));
         assert_eq!(ScanRule::execute("bogus").as_deref(), None);
     }
+
+    #[test]
+    fn demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&ScanTask, 305, 200);
+    }
 }
