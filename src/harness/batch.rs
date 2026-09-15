@@ -67,8 +67,18 @@ pub fn collate_seqs<B: Backend>(
     for (seq, prompt_len) in seqs.iter().zip(prompt_lens.iter()) {
         lengths.push(seq.len());
         for i in 0..t {
+            // Standard shifted causal LM: input[p] = seq[p-1] (input[0] =
+            // PAD), so logits[p] predicts seq[p] from strictly earlier
+            // bytes. Scoring position p against seq[p] with unshifted inputs
+            // leaks the label into its own key set (causal attention sees
+            // key p) and trains index-selection instead of induction.
             let byte = if i < seq.len() { seq[i] } else { PAD };
-            tok.push(byte as i64);
+            let input = if i == 0 || i > seq.len() {
+                PAD
+            } else {
+                seq[i - 1]
+            };
+            tok.push(input as i64);
             tgt.push(byte as i64);
             let scored = i >= *prompt_len && i < seq.len();
             mask.push(if scored { 1.0f32 } else { 0.0f32 });
@@ -132,6 +142,27 @@ mod tests {
         assert_eq!(&m[..8], &[0., 0., 0., 0., 1., 1., 1., 0.]);
         // Row 1 starts at offset 64: prompt "abc->" (5) masked, "d"+EOS scored.
         assert_eq!(&m[64..72], &[0., 0., 0., 0., 0., 1., 1., 0.]);
+    }
+
+    #[test]
+    fn collate_shifts_inputs_for_causal_lm() {
+        // tokens[p] = seq[p-1] (tokens[0] = PAD): no scored position can
+        // attend its own label byte. Targets stay unshifted.
+        use burn::tensor::{DType, TensorData};
+        let device = test_device();
+        let batch = collate::<TestBackend>(&[inst(b"ab", b"cd")], &device);
+        fn ints(data: &TensorData) -> Vec<i64> {
+            match data.dtype {
+                DType::I64 => data.as_slice::<i64>().unwrap().to_vec(),
+                DType::I32 => data.as_slice::<i32>().unwrap().iter().map(|v| *v as i64).collect(),
+                d => panic!("{d:?}"),
+            }
+        }
+        let tok = ints(&batch.tokens.into_data());
+        let tgt = ints(&batch.targets.into_data());
+        // seq = [a b c d EOS]=[97 98 99 100 1]; tokens shifted right by 1.
+        assert_eq!(&tok[..6], &[0, 97, 98, 99, 100, 1]);
+        assert_eq!(&tgt[..6], &[97, 98, 99, 100, 1, 0]);
     }
 
     #[test]

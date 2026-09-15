@@ -508,6 +508,9 @@ mod loss_tests {
     use burn::nn::LinearConfig;
     use burn::optim::GradientsParams;
     use burn::tensor::{Int, Tensor, TensorData};
+    use burn::tensor::backend::AutodiffBackend;
+
+    type IB = <TestBackend as AutodiffBackend>::InnerBackend;
 
     fn grad_norm_of_head(
         b: usize,
@@ -538,7 +541,7 @@ mod loss_tests {
         let ponder = Tensor::<TestBackend, 1>::zeros([1], &device);
         let loss = lm_loss(logits, targets, mask, ponder, 0.0);
         let mut gp = GradientsParams::from_grads(loss.backward(), &lin);
-        let g = gp.remove::<burn::backend::NdArray, 2>(lin.weight.id).unwrap();
+        let g = gp.remove::<IB, 2>(lin.weight.id).unwrap();
         g.abs().sum().into_data().as_slice::<f32>().unwrap()[0]
     }
 
@@ -566,7 +569,7 @@ mod loss_tests {
         let mut gp = GradientsParams::from_grads(loss.backward(), &lin);
         assert_eq!(gp.len(), 1);
         let g = gp
-            .remove::<burn::backend::NdArray, 2>(lin.weight.id)
+            .remove::<IB, 2>(lin.weight.id)
             .unwrap();
         let n: f32 = g.abs().sum().into_data().as_slice::<f32>().unwrap()[0];
         assert!(n > 0.0, "lm_loss CE grad is zero in isolation");
@@ -646,16 +649,56 @@ mod tests {
 
     #[test]
     fn padding_masks_pad_rows() {
+        // DISTINCT token values per position: with identical bytes any
+        // attention pattern yields identical outputs, which would make this
+        // test vacuous (it must discriminate masking, not values).
+        let device = test_device();
         let cfg = tiny_config();
-        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let toks: Tensor<TestBackend, 2, Int> = Tensor::zeros([2, 4], &test_device());
-        let full = model.forward_fixed(toks.clone(), &[4, 4], 2);
-        let padded = model.forward_fixed(toks, &[4, 0], 2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &device);
+        let row: Tensor<TestBackend, 2, Int> = Tensor::from_data(
+            burn::tensor::TensorData::from([[5i64, 6, 7, 8], [5, 6, 7, 8]]),
+            &device,
+        );
+        let full = model.forward_fixed(row.clone(), &[4, 4], 2);
+        let padded = model.forward_fixed(row, &[4, 1], 2);
         let a = full.logits.into_data().as_slice::<f32>().unwrap().to_vec();
         let b = padded.logits.into_data().as_slice::<f32>().unwrap().to_vec();
-        // First row identical, second row differs (pad blocked).
+        // Row 0 identical across runs (no cross-batch leakage, deterministic).
         assert_eq!(&a[..1024], &b[..1024]);
+        // Row 1 differs: full causal context vs pos0-only keys.
         assert_ne!(&a[1024..], &b[1024..]);
+    }
+
+    #[test]
+    fn outputs_invariant_to_pad_bucket() {
+        // Same row evaluated at different bucketed T must give identical
+        // outputs at shared positions (pads contribute exactly nothing).
+        // Train batches hit T=512 while eval sees small T: any dependence
+        // here is a train/eval skew.
+        use burn::tensor::TensorData;
+        let device = test_device();
+        let cfg = LoopedConfig::new()
+            .with_vocab_size(256)
+            .with_d_model(32)
+            .with_n_heads(2)
+            .with_head_dim(16)
+            .with_ffn_hidden(64)
+            .with_max_loops(4)
+            .with_max_seq_len(128);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &device);
+        let row: Vec<i64> = (0..20).map(|i| 5 + (i % 20)).collect();
+        let t64: Vec<i64> = row.iter().cloned().chain(std::iter::repeat(0)).take(64).collect();
+        let t128: Vec<i64> = row.iter().cloned().chain(std::iter::repeat(0)).take(128).collect();
+        let a = Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(t64, [1, 64]), &device);
+        let b = Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(t128, [1, 128]), &device);
+        let oa = model.forward_fixed(a, &[20], 2);
+        let ob = model.forward_fixed(b, &[20], 2);
+        let va = oa.logits.slice([0..1, 0..20, 0..256]).into_data().as_slice::<f32>().unwrap().to_vec();
+        let vb = ob.logits.slice([0..1, 0..20, 0..256]).into_data().as_slice::<f32>().unwrap().to_vec();
+        assert_eq!(va.len(), vb.len());
+        for (x, y) in va.iter().zip(vb.iter()) {
+            assert!((x - y).abs() < 1e-3, "T-bucket dependence: {x} vs {y}");
+        }
     }
 
     #[test]
@@ -672,6 +715,43 @@ mod tests {
                 0., 0., 1., 1.,
             ]
         );
+    }
+
+    #[test]
+    fn slice_selects_exact_values() {
+        // Value-level (not shape-level): scored_slice and decode argmax
+        // both depend on multi-dim slice returning the right elements.
+        use burn::tensor::TensorData;
+        let device = test_device();
+        // [2, 4, 8] with value = 100*b + 10*t + v.
+        let flat: Vec<f32> = (0..2)
+            .flat_map(|b| {
+                (0..4).flat_map(move |t| (0..8).map(move |v| (100 * b + 10 * t + v) as f32))
+            })
+            .collect();
+        let x =
+            Tensor::<TestBackend, 3>::from_data(TensorData::new(flat, [2, 4, 8]), &device);
+        let s = x.slice([0..2, 1..3, 2..5]);
+        assert_eq!(s.dims(), [2, 2, 3]);
+        let v = s.into_data().as_slice::<f32>().unwrap().to_vec();
+        let mut expected = vec![];
+        for b in 0..2 {
+            for t in 1..3 {
+                for vv in 2..5 {
+                    expected.push((100 * b + 10 * t + vv) as f32);
+                }
+            }
+        }
+        assert_eq!(v, expected);
+        // Single-row single-position slice as used in greedy decode.
+        let x2 = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new((0..2 * 4 * 8).map(|i| i as f32).collect::<Vec<_>>(), [2, 4, 8]),
+            &device,
+        );
+        let one = x2.slice([1..2, 3..4, 0..8]).reshape([8]);
+        let got = one.into_data().as_slice::<f32>().unwrap().to_vec();
+        let exp: Vec<f32> = (0..8).map(|i| (32 + 24 + i) as f32).collect();
+        assert_eq!(got, exp);
     }
 
     #[test]
