@@ -32,8 +32,10 @@
     "seed": 0,
     "ckpt_dir": "checkpoints-probe-32",
     "stuck_timeout_secs": 900,
+    "eval_start_step": 0,
     "accum_steps": 1,
-    "free_schedule": [1.0, 0.5, 0.2]
+    "free_schedule": [1.0, 0.5, 0.2],
+    "ponder_warmup_steps": 0
   },
   "experiment": {
     "tasks": ["parity"],

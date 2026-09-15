@@ -95,6 +95,32 @@ mod tests {
         let cfg = RunConfig::load_json(&path).unwrap();
         assert_eq!(cfg.model.param_count(), 984_065);
         assert_eq!(cfg.experiment.tasks.len(), 6);
+        // Ponder-warmup key must be present in checked-in manifests (0 = off).
+        assert_eq!(cfg.train.ponder_warmup_steps, 0);
+    }
+
+    #[test]
+    fn all_checked_in_manifests_load() {
+        // Every RunConfig manifest must parse and carry the warmup key.
+        for name in [
+            "stage0-smoke.json",
+            "smoke-tiny.json",
+            "probe-16.json",
+            "probe-32.json",
+            "profile.json",
+            "scale-probe.json",
+            "resume-s0.json",
+        ] {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs").join(name);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("ponder_warmup_steps"),
+                "{name} missing ponder_warmup_steps key"
+            );
+            let cfg = RunConfig::load_json(&path).unwrap();
+            let _ = cfg.train.ponder_warmup_steps;
+        }
     }
 
     #[test]

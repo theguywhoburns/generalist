@@ -58,6 +58,10 @@ pub struct TrainConfig {
     /// within this many seconds (catches hangs no panic hook can see).
     #[config(default = 900)]
     pub stuck_timeout_secs: u64,
+    /// First step at which eval runs; `(step - start) % eval_every` after.
+    /// Set high (e.g. >= total steps) to isolate training memory from eval.
+    #[config(default = 0)]
+    pub eval_start_step: usize,
     /// Scheduled-sampling thresholds: free-running target inputs K =
     /// number of entries with answer-CE below them. Default [1.0]: once
     /// answer error dips below 1.0, the first target input per row comes
@@ -66,6 +70,11 @@ pub struct TrainConfig {
     pub free_schedule: Vec<f64>,
     #[config(default = "\"checkpoints\".to_string()")]
     pub ckpt_dir: String,
+    /// Ponder warmup: effective ponder weight ramps linearly 0 -> base
+    /// over this many steps (0 = off/legacy: full weight from step 0).
+    /// Applies to the ponder term only, never the CE term.
+    #[config(default = 0)]
+    pub ponder_warmup_steps: usize,
 }
 
 pub struct StepInfo {
@@ -86,12 +95,23 @@ pub struct StepInfo {
 /// Long-band windows are trimmed so the tape size stays band-independent
 /// (T=512 trains at batch 8, T≤256 at the configured batch). Mean-reduced
 /// CE keeps merged micro-grads a mean of micro-means either way.
-const MICRO_BT_BUDGET: usize = 4096;
+const MICRO_BT_BUDGET: usize = 2048;
 
 /// Same budget for eval decode chunks (B×T per fused forward). Eval prompts
 /// bucket to 512 while training bands sit near 64, so a fixed row count that
 /// fits a training band OOMs on an eval chunk of long prompts.
 const EVAL_BT_BUDGET: usize = 8192;
+
+/// Effective ponder weight under linear warmup: ramps 0 -> `base` over
+/// `warmup_steps` steps (`warmup_steps == 0` = off/legacy: full `base`).
+/// Pure function (testable). Applies to the ponder term only, never CE.
+pub fn ponder_warmup_weight(base: f64, step: usize, warmup_steps: usize) -> f64 {
+    if warmup_steps == 0 {
+        return base;
+    }
+    let frac = (step as f64 / warmup_steps as f64).clamp(0.0, 1.0);
+    base * frac
+}
 
 pub struct Trainer<B: AutodiffBackend> {
     pub model: LoopedTransformer<B>,
@@ -147,6 +167,11 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// Advance the free-running schedule from mean answer-CE.
     pub fn update_free_schedule(&mut self, ce_answer: f32, schedule: &[f64]) {
         self.free_k = schedule.iter().filter(|t| (ce_answer as f64) < **t).count();
+    }
+
+    /// Override the effective ponder weight (warmup ramp). CE term untouched.
+    pub fn set_ponder_weight(&mut self, w: f64) {
+        self.config.ponder_weight = w;
     }
 
     /// Sample a batch with replacement from the pool (deterministic in rng).
@@ -472,6 +497,22 @@ pub struct StageOutcome {
     pub log_path: String,
 }
 
+/// VRAM used (MiB) via `nvidia-smi`. None on CPU-only machines or any
+/// failure (missing binary, parse error): logging must never break those.
+fn vram_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    lines.next()?; // header row
+    lines.next()?.split_whitespace().next()?.parse().ok()
+}
+
 /// Run one manifest end to end: pool -> train loop -> evals -> checkpoints.
 /// Shared by single-manifest runs and curriculum stages. `init_from` chains
 /// onto a previous stage's checkpoint (optimizer states restart fresh).
@@ -514,6 +555,9 @@ pub fn run_stage<B: AutodiffBackend>(
     let mut trainer = Trainer::<B>::new(&run.model, &nm, &train_cfg, device, init_from);
     let mut rng = HarnessRng::new(run.train.seed ^ 0x9E37_79B9_7F4A_7C15);
     let watchdog = crate::fail_fast::Watchdog::spawn(run.train.stuck_timeout_secs);
+    // Ponder warmup base: ramped per step via the setter below.
+    let base_ponder = run.model.ponder_weight;
+    let warmup_steps = run.train.ponder_warmup_steps;
 
     let log_path = format!("{}/run.jsonl", run.train.ckpt_dir);
     let mut log = String::new();
@@ -522,6 +566,9 @@ pub fn run_stage<B: AutodiffBackend>(
     trainer.save_checkpoint(Path::new(&last_ckpt));
 
     for step in 0..run.train.steps {
+        // Ponder warmup: effective weight ramps 0 -> base over
+        // `warmup_steps`. CE term untouched (ramp only scales ponder).
+        trainer.set_ponder_weight(ponder_warmup_weight(base_ponder, step, warmup_steps));
         // Gradient accumulation: `accum` micro-batches of 1/accum-scaled
         // losses merge into one mean-equivalent grad for a single step.
         let accum = run.train.accum_steps.max(1);
@@ -557,13 +604,11 @@ pub fn run_stage<B: AutodiffBackend>(
             });
         }
         trainer.optimizer_step(acc_grads.expect("at least one micro-batch"));
-        // Hand the backend buffer pool back after every optimizer step.
-        // Band hopping (64..512 padded T) + free-running proposal passes make
-        // the pool's high-water mark the SUM of all shape families seen; on
-        // small GPUs that ratchet alone OOMs the next new shape. Re-allocing
-        // the working set each step costs a few ms of cudaMalloc against
-        // ~second-scale steps. No-op on backends without pooling.
-        B::memory_cleanup(device);
+        // NOTE: no per-step pool release here. With bucketed shapes the pool
+        // reuses stably across steps; releasing every step caused 1<->3GB
+        // sawtooth churn (free everything, re-alloc from driver, fragment).
+        // The pool is still handed back after eval below, where decode
+        // allocates its own shape families.
         let n = accum as f32;
         let info = StepInfo {
             loss: loss_sum / n,
@@ -576,8 +621,12 @@ pub fn run_stage<B: AutodiffBackend>(
         trainer.update_free_schedule(info.ce_answer, &run.train.free_schedule);
         watchdog.ping_step(step);
         if step % run.train.log_every == 0 {
+            let vram = match vram_mb() {
+                Some(mb) => format!("vram {mb}MB"),
+                None => "vram n/a".to_string(),
+            };
             println!(
-                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {}",
+                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {} {vram}",
                 info.loss, info.ce_answer, info.ce_eos,
                 info.ponder, info.steps_used, info.mean_halt, trainer.free_k
             );
@@ -586,7 +635,10 @@ pub fn run_stage<B: AutodiffBackend>(
             last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, step);
             trainer.save_checkpoint(Path::new(&last_ckpt));
         }
-        if step % run.train.eval_every == 0 {
+        if step > 0
+            && step >= run.train.eval_start_step
+            && (step - run.train.eval_start_step).is_multiple_of(run.train.eval_every)
+        {
             // Own split plus retained splits from earlier stages (forgetting).
             let mut evals: Vec<(&str, &Vec<Instance>)> = vec![("self", &eval_set)];
             for (name, pool) in eval_extra {
@@ -604,12 +656,16 @@ pub fn run_stage<B: AutodiffBackend>(
                 }
                 for ((task, track), rs) in &cells {
                     let s = summarize(rs);
+                    let vram = match vram_mb() {
+                        Some(mb) => format!("vram {mb}MB"),
+                        None => "vram n/a".to_string(),
+                    };
                     println!(
-                        "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} (n={})",
+                        "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} (n={}) {vram}",
                         s.accuracy, s.copy_rate, s.mean_halt, s.n
                     );
                     watchdog.ping_step(step);
-                    for r in rs.iter().take(1) {
+                    for r in rs.iter() {
                         let mut line = r.to_json();
                         line.pop(); // trailing `}`; append eval context
                         log.push_str(&format!("{line},\"eval\":\"{label}\",\"step\":{step}}}\n"));
@@ -621,6 +677,31 @@ pub fn run_stage<B: AutodiffBackend>(
     // Always snapshot the end of the stage for chaining.
     last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, run.train.steps);
     trainer.save_checkpoint(Path::new(&last_ckpt));
+    // Final eval, always (independent of the eval_every cadence): one
+    // authoritative read per run, tagged "final".
+    {
+        let records = trainer.evaluate(&eval_set, run.train.eval_max_new);
+        let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
+            std::collections::BTreeMap::new();
+        for r in records {
+            cells
+                .entry((r.task.clone(), format!("{:?}", r.track)))
+                .or_default()
+                .push(r);
+        }
+        for ((task, track), rs) in &cells {
+            let s = summarize(rs);
+            println!(
+                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} (n={})",
+                s.accuracy, s.copy_rate, s.mean_halt, s.n
+            );
+            for r in rs.iter() {
+                let mut line = r.to_json();
+                line.pop();
+                log.push_str(&format!("{line},\"eval\":\"final\"}}\n"));
+            }
+        }
+    }
     std::fs::write(&log_path, log).expect("write log");
     println!("wrote {log_path}; last ckpt {last_ckpt}");
     StageOutcome { last_ckpt, log_path }
@@ -895,5 +976,25 @@ mod tests {
             &test_device(),
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ponder_warmup_ramps_linearly() {
+        let base = 0.001;
+        let n = 100;
+        // Off/legacy: full weight regardless of step.
+        assert_eq!(ponder_warmup_weight(base, 0, 0), base);
+        assert_eq!(ponder_warmup_weight(base, 57, 0), base);
+        // Ramp: 0 at step 0, full at/after N, midpoint ~half.
+        assert_eq!(ponder_warmup_weight(base, 0, n), 0.0);
+        assert!((ponder_warmup_weight(base, 50, n) - base * 0.5).abs() < 1e-12);
+        assert!((ponder_warmup_weight(base, n, n) - base).abs() < 1e-12);
+        assert_eq!(ponder_warmup_weight(base, n + 10, n), base);
+        // Setter threads through to the loss term (train_step keeps working).
+        let mut trainer = tiny_trainer();
+        trainer.set_ponder_weight(0.0);
+        assert_eq!(trainer.config.ponder_weight, 0.0);
+        trainer.set_ponder_weight(base);
+        assert_eq!(trainer.config.ponder_weight, base);
     }
 }
