@@ -9,7 +9,6 @@ use burn::{
 use super::{
     block::LoopedBlock,
     config::{LoopedConfig, StopMode},
-    halting::HaltingHead,
 };
 use crate::optim::PrecondInput;
 
@@ -21,10 +20,13 @@ pub struct LoopOutput<B: Backend> {
     pub logits: Tensor<B, 3>,
     /// Mean Graves ponder `mean(N_t + R_t)` over tokens (in-graph for Act).
     pub ponder: Tensor<B, 1>,
-    /// Loop iterations actually executed.
+    /// Block applications actually executed (summed over blocks).
     pub steps_used: usize,
     /// Host-side mean halt step, for logging.
     pub mean_halt: f32,
+    /// Host-side mean halt steps per block: where the compute happened.
+    /// `mean_halt` is the sum over blocks of these entries.
+    pub block_halts: Vec<f32>,
 }
 
 /// Sufficient statistics for the Newton-Muon input covariances, summed over
@@ -51,9 +53,9 @@ fn xtx_sum<B: Backend>(x: Tensor<B, 3>) -> (Tensor<B, 2>, usize) {
 pub struct LoopedTransformer<B: Backend> {
     pub embed: Embedding<B>,
     /// Stacked distinct blocks, applied in order on every loop iteration.
+    /// Each block carries its own halting gate (micro-step ACT).
     pub blocks: Vec<LoopedBlock<B>>,
     pub norm_f: RmsNorm<B>,
-    pub halt: HaltingHead<B>,
     pub head: Linear<B>,
 }
 
@@ -72,7 +74,6 @@ impl<B: Backend> LoopedTransformer<B> {
                 .map(|_| LoopedBlock::new(config, device))
                 .collect(),
             norm_f: RmsNormConfig::new(config.d_model).init(device),
-            halt: HaltingHead::new(config.d_model, config.halt_bias_init, device),
             head: LinearConfig::new(config.d_model, config.vocab_size)
                 .with_bias(false)
                 .init(device),
@@ -128,11 +129,13 @@ impl<B: Backend> LoopedTransformer<B> {
             x = self.iterate(x, &key_pad);
         }
         let logits = self.logits(x);
+        let n = self.blocks.len();
         LoopOutput {
             logits,
             ponder: Tensor::zeros([1], &device),
             steps_used: loops,
             mean_halt: loops as f32,
+            block_halts: vec![loops as f32; n],
         }
     }
 
@@ -164,10 +167,6 @@ impl<B: Backend> LoopedTransformer<B> {
         let real_n: usize = lengths.iter().sum();
 
         let mut x = self.embed.forward(tokens);
-        let mut out = Tensor::zeros([b, t, d], &device);
-        let mut cum = Tensor::zeros([b, t], &device);
-        let mut ponder = Tensor::zeros([b, t], &device);
-        let mut halt_step = Tensor::zeros([b, t], &device);
         let mut stats = collect_stats.then(|| StepStats {
             attn_xtx: Tensor::zeros([d, d], &device),
             attn_n: 0,
@@ -178,93 +177,118 @@ impl<B: Backend> LoopedTransformer<B> {
         });
 
         let max = config.max_loops;
-        let mut steps_used = max;
+        let n = self.blocks.len();
         // Loop-invariant constants hoisted: reusing them across iterations
-        // avoids re-allocating identical tensors 8x per forward (backend
-        // buffers pool-reuse anyway; this kills the launches too).
+        // avoids re-allocating identical tensors per step (backend buffers
+        // pool-reuse anyway; this kills the launches too).
         let zeros_bt = Tensor::<B, 2>::zeros([b, t], &device);
         let ones_bt = Tensor::<B, 2>::ones([b, t], &device);
-        for s in 1..=max {
-            // Running = unhalted AND real (pad rows never run, so the loop
-            // can still early-exit on padded batches).
-            let still: Tensor<B, 2, burn::tensor::Bool> = cum
-                .clone()
-                .lower_equal_elem(1.0 - ACT_EPS)
-                .bool_and(key_pad.clone().bool_not());
-            let still_f = still.clone().float();
-
-            // Block stack, with optional single-pass stats collection.
-            let mut xs = x.clone();
-            if collect_stats && let Some(s) = stats.as_mut() {
-                for block in &self.blocks {
-                    let (y, inp) = block.forward_split(xs, Some(key_pad.clone()));
-                    let (sum, _) = xtx_sum(inp.attn_in * keep_d.clone());
-                    s.attn_xtx = s.attn_xtx.clone() + sum;
-                    s.attn_n += real_n;
-                    let (sum, _) = xtx_sum(inp.mlp_in * keep_d.clone());
-                    s.mlp_xtx = s.mlp_xtx.clone() + sum;
-                    s.mlp_n += real_n;
-                    let (sum, _) = xtx_sum(inp.hidden * keep_h.clone());
-                    s.down_xtx = s.down_xtx.clone() + sum;
-                    s.down_n += real_n;
-                    xs = y;
-                }
-            } else {
-                for block in &self.blocks {
-                    xs = block.forward_masked(xs, Some(key_pad.clone()));
-                }
-            }
-            let x_new = xs;
-            // Freeze halted states so running tokens attend to stable keys/values.
-            // Single select op; replaces ones/sub/mul/mul/add with identical math.
-            let still3 = still.clone().unsqueeze_dim::<3>(2).repeat_dim(2, d);
-            x = x.mask_where(still3, x_new);
-
-            let p = self.halt.probs(x.clone());
-            let p_run = zeros_bt.clone().mask_where(still.clone(), p);
-
-            if s == max {
-                // Force-halt everything still running: remainder weight.
-                // Maxed-out tokens pay the full ponder price.
-                let rem = zeros_bt.clone().mask_where(still.clone(), ones_bt.clone() - cum.clone());
-                out = out + rem.clone().unsqueeze_dim::<3>(2) * x.clone();
-                cum = cum + rem.clone();
-                ponder = ponder + still_f.clone() + rem.clone();
-                halt_step = halt_step + rem.mul_scalar(s as f64);
-            } else {
-                let cum_try = cum.clone() + p_run.clone();
-                let halt_now = cum_try.clone().greater_equal_elem(1.0 - ACT_EPS);
-                let rem = zeros_bt
-                    .clone()
-                    .mask_where(still.clone(), ones_bt.clone() - cum.clone());
-                let w = p_run.mask_where(halt_now.clone(), rem);
-                out = out + w.clone().unsqueeze_dim::<3>(2) * x.clone();
-                cum = cum + w.clone();
-                ponder = ponder + still_f.clone() + w.clone() * halt_now.float();
-                halt_step = halt_step + (w * still_f.clone()).mul_scalar(s as f64);
-            }
-
-            // Break check every 2nd loop (+final): the host sync stalls the
-            // pipeline, and the break only skips halted tail iterations.
-            // Ponder/stats accounting is unaffected.
-            let running: Tensor<B, 1> = (still_f * keep_f.clone()).sum();
-            if (s == max || s % 2 == 0) && scalar_of(&running) == 0.0 {
-                steps_used = s;
-                break;
-            }
-        }
-
+        // Learned asynchronous depth: blocks run SEQUENTIALLY, each iterating
+        // to its own gate's fixed point before handing its readout to the
+        // next block. Every token passes through every block; each block
+        // decides its own per-token iteration count. (An interleaved design
+        // with one shared cumulative halter would let early blocks starve
+        // downstream stages: a token halted at B1 would never see B2/B3.)
+        // For n=1 this is exactly the classic single-gate ACT loop.
         // Means over real tokens only; pads never ran.
         let denom = keep_f.clone().sum().clamp_min(1.0);
-        let ponder_mean = (ponder * keep_f.clone()).sum().div(denom.clone());
-        let mean_halt = scalar_of(&(halt_step * keep_f).sum().div(denom));
-        let logits = self.logits(out);
+        let mut total_ponder = Tensor::<B, 2>::zeros([b, t], &device);
+        let mut total_halt = Tensor::<B, 2>::zeros([b, t], &device);
+        let mut steps_used = 0usize;
+        let mut block_halts = Vec::with_capacity(n);
+        for block in &self.blocks {
+            let mut out = Tensor::zeros([b, t, d], &device);
+            let mut cum = Tensor::zeros([b, t], &device);
+            let mut ponder = Tensor::zeros([b, t], &device);
+            let mut halt_step = Tensor::zeros([b, t], &device);
+            let mut used = max;
+            for s in 1..=max {
+                // Running = unhalted AND real (pad rows never run, so the
+                // loop can still early-exit on padded batches).
+                let still: Tensor<B, 2, burn::tensor::Bool> = cum
+                    .clone()
+                    .lower_equal_elem(1.0 - ACT_EPS)
+                    .bool_and(key_pad.clone().bool_not());
+                let still_f = still.clone().float();
+
+                // Single pass: this IS the forward; stats ride along.
+                let (x_new_full, inp) = block.forward_split(x.clone(), Some(key_pad.clone()));
+                if collect_stats && let Some(st) = stats.as_mut() {
+                    // Detached: stats are consumed only as values (`.inner()`
+                    // in `forward_act_with_stats`); grads through this path
+                    // are unused. Cuts ~20MiB/iter of tracked matmul
+                    // retention, no math change.
+                    let (sum, _) = xtx_sum(inp.attn_in.detach() * keep_d.clone());
+                    st.attn_xtx = st.attn_xtx.clone() + sum;
+                    st.attn_n += real_n;
+                    let (sum, _) = xtx_sum(inp.mlp_in.detach() * keep_d.clone());
+                    st.mlp_xtx = st.mlp_xtx.clone() + sum;
+                    st.mlp_n += real_n;
+                    let (sum, _) = xtx_sum(inp.hidden.detach() * keep_h.clone());
+                    st.down_xtx = st.down_xtx.clone() + sum;
+                    st.down_n += real_n;
+                }
+                // Freeze halted states so running tokens attend to stable keys/values.
+                // Single select op; replaces ones/sub/mul/mul/add with identical math.
+                let still3 = still.clone().unsqueeze_dim::<3>(2).repeat_dim(2, d);
+                x = x.mask_where(still3, x_new_full);
+
+                let p = block.halt.probs(x.clone());
+                let p_run = zeros_bt.clone().mask_where(still.clone(), p);
+
+                if s == max {
+                    // Force-halt everything still running: remainder weight.
+                    // Maxed-out tokens pay the full ponder price.
+                    let rem =
+                        zeros_bt.clone().mask_where(still.clone(), ones_bt.clone() - cum.clone());
+                    out = out + rem.clone().unsqueeze_dim::<3>(2) * x.clone();
+                    cum = cum + rem.clone();
+                    ponder = ponder + still_f.clone() + rem.clone();
+                    halt_step = halt_step + rem.mul_scalar(s as f64);
+                } else {
+                    let cum_try = cum.clone() + p_run.clone();
+                    let halt_now = cum_try.clone().greater_equal_elem(1.0 - ACT_EPS);
+                    let rem = zeros_bt
+                        .clone()
+                        .mask_where(still.clone(), ones_bt.clone() - cum.clone());
+                    let w = p_run.mask_where(halt_now.clone(), rem);
+                    out = out + w.clone().unsqueeze_dim::<3>(2) * x.clone();
+                    cum = cum + w.clone();
+                    ponder = ponder + still_f.clone() + w.clone() * halt_now.float();
+                    halt_step = halt_step + (w * still_f.clone()).mul_scalar(s as f64);
+                }
+
+                // Break check every 2nd loop (+final): the host sync stalls
+                // the pipeline, and the break only skips halted tail steps.
+                // Ponder/stats accounting is unaffected.
+                let still: Tensor<B, 2, burn::tensor::Bool> = cum
+                    .clone()
+                    .lower_equal_elem(1.0 - ACT_EPS)
+                    .bool_and(key_pad.clone().bool_not());
+                let running: Tensor<B, 1> = (still.float() * keep_f.clone()).sum();
+                if (s == max || s % 2 == 0) && scalar_of(&running) == 0.0 {
+                    used = s;
+                    break;
+                }
+            }
+            // This block's readout seeds the next block.
+            block_halts.push(scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone())));
+            total_ponder = total_ponder + ponder;
+            total_halt = total_halt + halt_step;
+            steps_used += used;
+            x = out;
+        }
+
+        let ponder_mean = (total_ponder * keep_f.clone()).sum().div(denom.clone());
+        let mean_halt = scalar_of(&(total_halt * keep_f).sum().div(denom));
+        let logits = self.logits(x);
         (
             LoopOutput {
                 logits,
                 ponder: ponder_mean,
                 steps_used,
                 mean_halt,
+                block_halts,
             },
             stats,
         )
@@ -310,6 +334,7 @@ impl<B: Backend> LoopedTransformer<B> {
             ponder: Tensor::from_floats([steps_used as f32], &device),
             steps_used,
             mean_halt: steps_used as f32,
+            block_halts: vec![steps_used as f32; self.blocks.len()],
         }
     }
 
@@ -349,14 +374,14 @@ impl<B: Backend> LoopedTransformer<B> {
                     (format!("down{i}"), b.mlp.down.weight.id, 2),
                     (format!("norm1_{i}"), b.norm1.gamma.id, 1),
                     (format!("norm2_{i}"), b.norm2.gamma.id, 1),
+                    (format!("halt_w{i}"), b.halt.head.weight.id, 2),
+                    (format!("halt_b{i}"), b.halt.head.bias.as_ref().unwrap().id, 1),
                 ]
             );
         }
         specs.extend(
             [
                 ("norm_f".to_string(), self.norm_f.gamma.id, 1),
-                ("halt_w".to_string(), self.halt.head.weight.id, 2),
-                ("halt_b".to_string(), self.halt.head.bias.as_ref().unwrap().id, 1),
                 ("head".to_string(), self.head.weight.id, 2),
             ]
         );
@@ -665,6 +690,37 @@ mod tests {
         // graph is trainable
         let loss = lm_loss(out.logits, tokens(), full_mask(), out.ponder, cfg.ponder_weight);
         let _grads = loss.backward();
+    }
+
+    #[test]
+    fn per_block_gates_are_independent() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        assert_ne!(
+            model.blocks[0].halt.head.weight.id,
+            model.blocks[1].halt.head.weight.id
+        );
+        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths());
+        assert_eq!(out.block_halts.len(), 2);
+        // Total halt is the sum over blocks (where-compute accounting).
+        let sum: f32 = out.block_halts.iter().sum();
+        assert!(
+            (sum - out.mean_halt).abs() < 1e-3,
+            "sum {sum} vs total {}",
+            out.mean_halt
+        );
+        assert!(out.steps_used <= 16);
+    }
+
+    #[test]
+    fn grad_specs_cover_per_block_gates() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        let specs = model.grad_specs();
+        // embed + norm_f + head + 11 per block
+        assert_eq!(specs.len(), 3 + 11 * 2);
+        assert!(specs.iter().any(|(n, _, _)| n == "halt_w0"));
+        assert!(specs.iter().any(|(n, _, _)| n == "halt_b1"));
     }
 
     #[test]

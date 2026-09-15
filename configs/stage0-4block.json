@@ -25,7 +25,7 @@
     "lr_muon": 0.002,
     "lr_adamw": 0.0003,
     "batch_size": 2,
-    "steps": 1000,
+    "steps": 500,
     "log_every": 50,
     "eval_every": 200,
     "ckpt_every": 100,
@@ -34,7 +34,7 @@
     "ckpt_dir": "checkpoints-4block-wide",
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
-    "accum_steps": 16,
+    "accum_steps": 8,
     "free_schedule": [1.0, 0.5, 0.2],
     "ponder_warmup_steps": 0
   },

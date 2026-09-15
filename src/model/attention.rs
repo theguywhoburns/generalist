@@ -79,36 +79,42 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(scale);
 
-        // keep[b,h,i,j] = causal (j <= i) AND key not pad.
-        let qi = Tensor::<B, 1, Int>::arange(0..t as i64, &device)
-            .unsqueeze_dim::<2>(1)
-            .repeat_dim(1, t);
-        let kj = Tensor::<B, 1, Int>::arange(0..t as i64, &device)
-            .unsqueeze_dim::<2>(0)
-            .repeat_dim(0, t);
-        let causal = kj
+        // Additive -1e30 bias, broadcastable: causal [1,1,T,T] plus an
+        // optional key-padding [B,1,1,T]. Blocked-by-either -> -1e30
+        // (both -> -2e30, still exactly 0 after exp), unblocked -> 0:
+        // identical softmax to the old expanded [B,H,T,T] keep-mask (~2x
+        // scores-sized tensors: the old full-size bools plus full-size
+        // float bias were the largest per-step tape entries and OOMed
+        // batch 6 on the first T=512 micro).
+        let qi = Tensor::<B, 1, Int>::arange(0..t as i64, &device).unsqueeze_dim::<2>(1);
+        let kj = Tensor::<B, 1, Int>::arange(0..t as i64, &device).unsqueeze_dim::<2>(0);
+        let causal_bias = kj
             .lower_equal(qi)
             .unsqueeze_dim::<3>(0)
             .unsqueeze_dim::<4>(0)
-            .repeat_dim(0, b)
-            .repeat_dim(1, self.n_heads);
-        let keep = match key_pad {
-            None => causal,
+            .float()
+            .mul_scalar(-1.0)
+            .add_scalar(1.0)
+            .mul_scalar(-1e30);
+        let scores = scores + causal_bias;
+        let scores = match key_pad {
+            None => scores,
             Some(pad) => {
-                let keys_kept = pad
+                let key_bias = pad
                     .bool_not()
                     .unsqueeze_dim::<3>(1)
                     .unsqueeze_dim::<4>(2)
-                    .repeat_dim(1, self.n_heads)
-                    .repeat_dim(2, t);
-                causal.bool_and(keys_kept)
+                    .float()
+                    .mul_scalar(-1.0)
+                    .add_scalar(1.0)
+                    .mul_scalar(-1e30);
+                scores + key_bias
             }
         };
         // Blocked -> -1e30 attends to nothing (exp underflows to exactly 0;
         // finite so a fully-blocked row can't NaN — and pos0 is always kept
         // by the pad_mask guard anyway).
-        let bias = keep.float().mul_scalar(-1.0).add_scalar(1.0).mul_scalar(-1e30);
-        let probs = burn::tensor::activation::softmax(scores + bias, 3);
+        let probs = burn::tensor::activation::softmax(scores, 3);
         let y = probs.matmul(v);
 
         let y = y

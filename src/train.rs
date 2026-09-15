@@ -7,6 +7,7 @@
 //! caller's job; see `Experiment` for data dispatch.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use std::path::{Path, PathBuf};
 
 use burn::{
@@ -368,6 +369,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         let mut active = vec![true; g];
         let mut steps_sum = 0usize;
         let mut halt_sum = 0.0f32;
+        let mut block_sums: Vec<f32> = vec![];
         let mut n_decode = 0usize;
         for _ in 0..max_new {
             for (i, row) in ids.iter().enumerate() {
@@ -402,6 +404,12 @@ impl<B: AutodiffBackend> Trainer<B> {
             let res = model.forward(tokens, &self.config, StopMode::Act, &lens);
             steps_sum += res.steps_used;
             halt_sum += res.mean_halt;
+            if block_sums.len() < res.block_halts.len() {
+                block_sums.resize(res.block_halts.len(), 0.0);
+            }
+            for (acc, v) in block_sums.iter_mut().zip(res.block_halts.iter()) {
+                *acc += *v;
+            }
             n_decode += 1;
             let v = self.config.vocab_size;
             let mut next_ids = vec![0i64; g];
@@ -448,6 +456,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
+                    block_halt: block_sums.iter().map(|s| s / n_decode.max(1) as f32).collect(),
                 }
             })
             .collect()
@@ -564,6 +573,8 @@ pub fn run_stage<B: AutodiffBackend>(
     // Init snapshot doubles as the first chained checkpoint.
     let mut last_ckpt = format!("{}/step000000.mpk", run.train.ckpt_dir);
     trainer.save_checkpoint(Path::new(&last_ckpt));
+    // Throughput clock: rate is measured over each log interval.
+    let mut last_log = (Instant::now(), 0usize);
 
     for step in 0..run.train.steps {
         // Ponder warmup: effective weight ramps 0 -> base over
@@ -602,13 +613,26 @@ pub fn run_stage<B: AutodiffBackend>(
                 None => grads,
                 Some(a) => merge_grads::<B>(&specs, a, grads),
             });
+            // Per-micro pool release. Each micro visits an independently
+            // sampled band (up to 8 different T-bucket shape families per
+            // optimizer step); the pool otherwise retains every family's
+            // pages plus autotune scratch until the step ends, and the
+            // within-step peak crosses 4GB (~3.75GB sustained, death on a
+            // 15MB page). Allocator-only: same windows, same grads, no
+            // math/dynamics change.
+            B::memory_cleanup(device);
         }
         trainer.optimizer_step(acc_grads.expect("at least one micro-batch"));
-        // NOTE: no per-step pool release here. With bucketed shapes the pool
-        // reuses stably across steps; releasing every step caused 1<->3GB
-        // sawtooth churn (free everything, re-alloc from driver, fragment).
-        // The pool is still handed back after eval below, where decode
-        // allocates its own shape families.
+        // Per-step pool release. The cubecl pool never hands pages back to
+        // the driver on its own, so band-hopping (T buckets 64..512 x fused
+        // shape families x autotune scratch) accumulates monotonically until
+        // a fresh page no longer fits in 4GB (death: 61.77MB page at ~3.7GB
+        // used, mid-train, before any eval). Releasing after every optimizer
+        // step bounds retention to one step's families plus persistent state
+        // (params/optimizer/precond, ~100MB). Allocator-only: no math,
+        // batch-composition, or dynamics change. Costs some re-alloc churn
+        // versus the old never-release policy; correctness first.
+        B::memory_cleanup(device);
         let n = accum as f32;
         let info = StepInfo {
             loss: loss_sum / n,
@@ -625,10 +649,14 @@ pub fn run_stage<B: AutodiffBackend>(
                 Some(mb) => format!("vram {mb}MB"),
                 None => "vram n/a".to_string(),
             };
+            let now = Instant::now();
+            let dt = now.duration_since(last_log.0).as_secs_f64().max(1e-6);
+            let rate = (step - last_log.1) as f64 / dt;
+            last_log = (now, step);
             println!(
-                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {} {vram}",
+                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {} {vram} {:.2} st/s",
                 info.loss, info.ce_answer, info.ce_eos,
-                info.ponder, info.steps_used, info.mean_halt, trainer.free_k
+                info.ponder, info.steps_used, info.mean_halt, trainer.free_k, rate
             );
         }
         if step % run.train.ckpt_every == 0 {
@@ -660,9 +688,11 @@ pub fn run_stage<B: AutodiffBackend>(
                         Some(mb) => format!("vram {mb}MB"),
                         None => "vram n/a".to_string(),
                     };
+                    let bh: Vec<String> =
+                        s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
                     println!(
-                        "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} (n={}) {vram}",
-                        s.accuracy, s.copy_rate, s.mean_halt, s.n
+                        "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] (n={}) {vram}",
+                        s.accuracy, s.copy_rate, s.mean_halt, bh.join(" "), s.n
                     );
                     watchdog.ping_step(step);
                     for r in rs.iter() {
@@ -691,9 +721,28 @@ pub fn run_stage<B: AutodiffBackend>(
         }
         for ((task, track), rs) in &cells {
             let s = summarize(rs);
+            let bh: Vec<String> = s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
+            let bhc: Vec<String> =
+                s.mean_block_halt_correct.iter().map(|v| format!("{v:.2}")).collect();
+            let bhw: Vec<String> =
+                s.mean_block_halt_wrong.iter().map(|v| format!("{v:.2}")).collect();
+            let p90: Vec<String> = s.p90_block_halt.iter().map(|v| format!("{v:.1}")).collect();
+            let cor: Vec<String> = s
+                .block_halt_corr
+                .iter()
+                .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
+                .collect();
             println!(
-                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} (n={})",
-                s.accuracy, s.copy_rate, s.mean_halt, s.n
+                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] cor [{}] (n={})",
+                s.accuracy,
+                s.copy_rate,
+                s.mean_halt,
+                bh.join(" "),
+                bhc.join(" "),
+                bhw.join(" "),
+                p90.join(" "),
+                cor.join(" "),
+                s.n
             );
             for r in rs.iter() {
                 let mut line = r.to_json();

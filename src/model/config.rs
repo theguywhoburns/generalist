@@ -72,7 +72,7 @@ impl LoopedConfig {
         let embed = v * d;
         let block = 4 * d * d + 3 * d * h + 2 * d; // attn + mlp + 2 norms
         let norms = d; // norm_f
-        let halt = d + 1; // halting head
+        let halt = self.n_blocks * (d + 1); // one halting gate per block
         let head = v * d; // untied LM head
         embed + self.n_blocks * block + norms + halt + head
     }
@@ -96,7 +96,14 @@ mod tests {
     #[test]
     fn two_blocks_is_18m_class() {
         let cfg = LoopedConfig::base_1m().with_n_blocks(2);
-        assert_eq!(cfg.param_count(), 1_836_545);
-        assert_eq!(cfg.param_count(), 984_065 + 852_480);
+        // Second block (attn+mlp+norms+own halt gate): 852_480 + 257.
+        assert_eq!(cfg.param_count(), 984_065 + 852_737);
+        assert_eq!(cfg.param_count(), 1_836_802);
+    }
+
+    #[test]
+    fn four_blocks_param_count() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(4);
+        assert_eq!(cfg.param_count(), 3_542_276);
     }
 }
