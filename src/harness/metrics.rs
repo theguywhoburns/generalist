@@ -52,6 +52,12 @@ pub struct Summary {
     /// Per-block p50 / p90 over records (means hide bimodal policies).
     pub p50_block_halt: Vec<f64>,
     pub p90_block_halt: Vec<f64>,
+    /// Per-block std over records (zero std = point-mass policy; correlations
+    /// against such columns are degenerate — see `block_halt_corr`).
+    pub std_block_halt: Vec<f64>,
+    /// Utilization shares: `mean_i / sum(mean)`. The computation topology —
+    /// how the workload splits across blocks, comparable across cells.
+    pub share_block_halt: Vec<f64>,
     /// Lower-triangle Pearson correlations between block-halt vectors
     /// (row i holds corr(i,0)..corr(i,i-1)): ~1.0 everywhere means the four
     /// gates are one global head in disguise; near-0 means differentiated.
@@ -119,15 +125,29 @@ pub fn summarize(records: &[Record]) -> Summary {
     let mut mean_block_halt_wrong = vec![0.0; width];
     let mut p50_block_halt = vec![0.0; width];
     let mut p90_block_halt = vec![0.0; width];
+    let mut std_block_halt = vec![0.0; width];
+    let mut share_block_halt = vec![0.0; width];
     for i in 0..width {
         let vals = col(i);
         mean_block_halt[i] = mean(&vals);
         mean_block_halt_correct[i] = mean(&correct_col(i));
         mean_block_halt_wrong[i] = mean(&wrong_col(i));
-        let mut sorted = vals;
+        let mut sorted = vals.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         p50_block_halt[i] = quantile_sorted(&sorted, 0.5);
         p90_block_halt[i] = quantile_sorted(&sorted, 0.9);
+        let m = mean_block_halt[i];
+        std_block_halt[i] = if vals.is_empty() {
+            0.0
+        } else {
+            (vals.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / vals.len() as f64).sqrt()
+        };
+    }
+    let total: f64 = mean_block_halt.iter().sum();
+    if total > 0.0 {
+        for (sh, m) in share_block_halt.iter_mut().zip(mean_block_halt.iter()) {
+            *sh = m / total;
+        }
     }
     // Lower-triangle block correlations (diagnostic-only, no objective).
     let cols: Vec<Vec<f64>> = (0..width).map(col).collect();
@@ -150,6 +170,8 @@ pub fn summarize(records: &[Record]) -> Summary {
         mean_block_halt_wrong,
         p50_block_halt,
         p90_block_halt,
+        std_block_halt,
+        share_block_halt,
         block_halt_corr,
     }
 }
@@ -240,6 +262,22 @@ mod tests {
         c.block_halt = vec![5.0, 5.0, 5.0];
         let s2 = summarize(&[a, c]);
         assert!(s2.block_halt_corr[1][0].is_finite());
+    }
+
+    #[test]
+    fn shares_sum_to_one_and_std_flags_point_mass() {
+        let mut a = rec(true, false);
+        a.block_halt = vec![2.0, 2.0];
+        let mut b = rec(false, false);
+        b.block_halt = vec![4.0, 2.0];
+        let s = summarize(&[a, b]);
+        // means [3.0, 2.0] -> shares [0.6, 0.4]
+        assert!((s.share_block_halt[0] - 0.6).abs() < 1e-9);
+        assert!((s.share_block_halt[1] - 0.4).abs() < 1e-9);
+        assert!((s.share_block_halt.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        // constant column has zero std; varying column does not
+        assert!((s.std_block_halt[1] - 0.0).abs() < 1e-9);
+        assert!(s.std_block_halt[0] > 0.0);
     }
 
     #[test]

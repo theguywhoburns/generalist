@@ -540,6 +540,10 @@ pub fn run_stage<B: AutodiffBackend>(
     println!("pool: {} instances", pool.len());
     let eval_set = eval_split(&pool, 16);
     println!("eval: {} instances", eval_set.len());
+    // Larger final-eval split (48/cell): bhC/bhW and correlations are noise
+    // at n=16. Deterministic prefix-superset of `eval_set`.
+    let final_set = eval_split(&pool, 48);
+    println!("final eval: {} instances", final_set.len());
     // Length-band training pool: stable padded T across steps.
     let mut train_pool = pool;
     train_pool.sort_by_key(|i| i.prompt.len() + i.target.len());
@@ -708,16 +712,16 @@ pub fn run_stage<B: AutodiffBackend>(
     last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, run.train.steps);
     trainer.save_checkpoint(Path::new(&last_ckpt));
     // Final eval, always (independent of the eval_every cadence): one
-    // authoritative read per run, tagged "final".
+    // authoritative read per run on the larger split, tagged "final".
     {
-        let records = trainer.evaluate(&eval_set, run.train.eval_max_new);
+        let records = trainer.evaluate(&final_set, run.train.eval_max_new);
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
-        for r in records {
+        for r in &records {
             cells
                 .entry((r.task.clone(), format!("{:?}", r.track)))
                 .or_default()
-                .push(r);
+                .push(r.clone());
         }
         for ((task, track), rs) in &cells {
             let s = summarize(rs);
@@ -727,13 +731,15 @@ pub fn run_stage<B: AutodiffBackend>(
             let bhw: Vec<String> =
                 s.mean_block_halt_wrong.iter().map(|v| format!("{v:.2}")).collect();
             let p90: Vec<String> = s.p90_block_halt.iter().map(|v| format!("{v:.1}")).collect();
+            let sh: Vec<String> =
+                s.share_block_halt.iter().map(|v| format!("{v:.2}")).collect();
             let cor: Vec<String> = s
                 .block_halt_corr
                 .iter()
                 .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
                 .collect();
             println!(
-                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] cor [{}] (n={})",
+                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] sh [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.copy_rate,
                 s.mean_halt,
@@ -741,6 +747,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 bhc.join(" "),
                 bhw.join(" "),
                 p90.join(" "),
+                sh.join(" "),
                 cor.join(" "),
                 s.n
             );
@@ -749,6 +756,33 @@ pub fn run_stage<B: AutodiffBackend>(
                 line.pop();
                 log.push_str(&format!("{line},\"eval\":\"final\"}}\n"));
             }
+        }
+        // Pool-level summary: correlations and shares computed across the
+        // whole final set, where per-16-cell slices are variance-starved.
+        {
+            let s = summarize(&records);
+            let bh: Vec<String> =
+                s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
+            let sh: Vec<String> =
+                s.share_block_halt.iter().map(|v| format!("{v:.2}")).collect();
+            let std: Vec<String> =
+                s.std_block_halt.iter().map(|v| format!("{v:.2}")).collect();
+            let cor: Vec<String> = s
+                .block_halt_corr
+                .iter()
+                .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
+                .collect();
+            println!(
+                "  eval [final-pool]: acc {:.2} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                s.accuracy,
+                s.copy_rate,
+                s.mean_halt,
+                bh.join(" "),
+                sh.join(" "),
+                std.join(" "),
+                cor.join(" "),
+                s.n
+            );
         }
     }
     std::fs::write(&log_path, log).expect("write log");
