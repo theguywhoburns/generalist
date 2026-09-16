@@ -20,7 +20,7 @@ fn main() {
     println!("muon params: {}", model.muon_ids().len());
 
     let tokens: Tensor<B, 2, Int> = Tensor::zeros([2, 32], &device);
-    let out = model.forward(tokens, &config, StopMode::Fixed { loops: 4 }, &[32, 32]);
+    let out = model.forward(tokens, &config, StopMode::Fixed { loops: 4 }, &[32, 32], None);
     println!(
         "fixed logits: {:?}, steps: {}",
         out.logits.dims(),

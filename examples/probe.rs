@@ -61,7 +61,7 @@ fn main() {
         let tokens =
             Tensor::<B, 2, Int>::from_data(TensorData::new(shifted, [1, t]), &device);
         let mode = if std::env::args().any(|a| a == "fixed") { generalist::model::StopMode::Fixed { loops: 8 } } else { generalist::model::StopMode::Act };
-        let out = model.forward(tokens, &cfg, mode, &[t]);
+        let out = model.forward(tokens, &cfg, mode, &[t], None);
         let v = cfg.vocab_size;
         let logits = out.logits.slice([0..1, t - 1..t, 0..v]).reshape([v]);
         let data = logits.into_data();

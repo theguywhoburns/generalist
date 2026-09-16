@@ -106,10 +106,11 @@ impl<B: Backend> LoopedTransformer<B> {
         config: &LoopedConfig,
         mode: StopMode,
         lengths: &[usize],
+        order: Option<&[usize]>,
     ) -> LoopOutput<B> {
         match mode {
             StopMode::Fixed { loops } => self.forward_fixed(tokens, lengths, loops),
-            StopMode::Act => self.forward_act(tokens, config, false, lengths).0,
+            StopMode::Act => self.forward_act(tokens, config, false, lengths, order).0,
             StopMode::Converge => self.forward_converge(tokens, config, lengths),
         }
     }
@@ -144,12 +145,16 @@ impl<B: Backend> LoopedTransformer<B> {
     /// Returns output plus input-covariance sufficient statistics when
     /// `collect_stats` is set (training path; use `forward_act_with_stats`
     /// on an autodiff backend to get detached inner-backend stats).
+    /// `order` permutes block execution (eval-only role diagnostic; `None` =
+    /// trained order). `block_halts[i]` always refers to block `i`, wherever
+    /// it ran.
     pub fn forward_act(
         &self,
         tokens: Tensor<B, 2, Int>,
         config: &LoopedConfig,
         collect_stats: bool,
         lengths: &[usize],
+        order: Option<&[usize]>,
     ) -> (LoopOutput<B>, Option<StepStats<B>>) {
         let device = tokens.device();
         let [b, t] = tokens.dims();
@@ -178,6 +183,19 @@ impl<B: Backend> LoopedTransformer<B> {
 
         let max = config.max_loops;
         let n = self.blocks.len();
+        // Execution order: trained order by default; a permutation for the
+        // role diagnostic. Validated: same length, in-range indices.
+        let exec: Vec<usize> = match order {
+            None => (0..n).collect(),
+            Some(o) => {
+                assert_eq!(o.len(), n, "block order length {} != n_blocks {n}", o.len());
+                assert!(
+                    o.iter().all(|&i| i < n),
+                    "block order index out of range"
+                );
+                o.to_vec()
+            }
+        };
         // Loop-invariant constants hoisted: reusing them across iterations
         // avoids re-allocating identical tensors per step (backend buffers
         // pool-reuse anyway; this kills the launches too).
@@ -195,8 +213,9 @@ impl<B: Backend> LoopedTransformer<B> {
         let mut total_ponder = Tensor::<B, 2>::zeros([b, t], &device);
         let mut total_halt = Tensor::<B, 2>::zeros([b, t], &device);
         let mut steps_used = 0usize;
-        let mut block_halts = Vec::with_capacity(n);
-        for block in &self.blocks {
+        let mut block_halts = vec![0.0f32; n];
+        for &bi in &exec {
+            let block = &self.blocks[bi];
             let mut out = Tensor::zeros([b, t, d], &device);
             let mut cum = Tensor::zeros([b, t], &device);
             let mut ponder = Tensor::zeros([b, t], &device);
@@ -271,8 +290,8 @@ impl<B: Backend> LoopedTransformer<B> {
                     break;
                 }
             }
-            // This block's readout seeds the next block.
-            block_halts.push(scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone())));
+            // This block's readout seeds the next block (in execution order).
+            block_halts[bi] = scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone()));
             total_ponder = total_ponder + ponder;
             total_halt = total_halt + halt_step;
             steps_used += used;
@@ -416,7 +435,7 @@ impl<B: AutodiffBackend> LoopedTransformer<B> {
         config: &LoopedConfig,
         lengths: &[usize],
     ) -> (LoopOutput<B>, StepStats<B::InnerBackend>) {
-        let (out, stats) = self.forward_act(tokens, config, true, lengths);
+        let (out, stats) = self.forward_act(tokens, config, true, lengths, None);
         let s = stats.expect("collect_stats=true must return stats");
         (
             out,
@@ -680,7 +699,7 @@ mod tests {
     fn act_forward_ponder_bounded() {
         let cfg = tiny_config();
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let (out, stats) = model.forward_act(tokens(), &cfg, true, &lengths());
+        let (out, stats) = model.forward_act(tokens(), &cfg, true, &lengths(), None);
         assert_eq!(out.logits.dims(), [2, 4, 256]);
         assert!(out.steps_used <= 4);
         let p = scalar_of(&out.ponder);
@@ -700,7 +719,7 @@ mod tests {
             model.blocks[0].halt.head.weight.id,
             model.blocks[1].halt.head.weight.id
         );
-        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths());
+        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
         assert_eq!(out.block_halts.len(), 2);
         // Total halt is the sum over blocks (where-compute accounting).
         let sum: f32 = out.block_halts.iter().sum();
@@ -710,6 +729,38 @@ mod tests {
             out.mean_halt
         );
         assert!(out.steps_used <= 16);
+    }
+
+    #[test]
+    fn identity_order_matches_default_bitwise() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        let (a, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
+        let (b, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0, 1]));
+        let va = a.logits.into_data().as_slice::<f32>().unwrap().to_vec();
+        let vb = b.logits.into_data().as_slice::<f32>().unwrap().to_vec();
+        assert_eq!(va, vb);
+        assert_eq!(a.block_halts, b.block_halts);
+    }
+
+    #[test]
+    fn reversed_order_runs_with_block_indexed_halts() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[1, 0]));
+        assert_eq!(out.logits.dims(), [2, 4, 256]);
+        // bh[i] still refers to block i, wherever it executed.
+        assert_eq!(out.block_halts.len(), 2);
+        let sum: f32 = out.block_halts.iter().sum();
+        assert!((sum - out.mean_halt).abs() < 1e-3);
+    }
+
+    #[test]
+    #[should_panic(expected = "block order length")]
+    fn short_order_panics() {
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        let _ = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0]));
     }
 
     #[test]

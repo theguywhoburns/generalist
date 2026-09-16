@@ -39,28 +39,28 @@ fn main() {
 
     // Warmup (autotune/fusion caches).
     let lens = vec![64usize, 64];
-    let _ = model.forward(tokens.clone(), &config, StopMode::Fixed { loops: 1 }, &lens);
+    let _ = model.forward(tokens.clone(), &config, StopMode::Fixed { loops: 1 }, &lens, None);
 
     for loops in [1, 4, 8] {
         let ms = ms_of(|| {
-            let _ = model.forward(tokens.clone(), &config, StopMode::Fixed { loops }, &lens);
+            let _ = model.forward(tokens.clone(), &config, StopMode::Fixed { loops }, &lens, None);
         });
         println!("fixed loops={loops}: {ms:.1} ms (B=2,T=64)");
     }
     let ms = ms_of(|| {
-        let _ = model.forward(tokens.clone(), &config, StopMode::Act, &lens);
+        let _ = model.forward(tokens.clone(), &config, StopMode::Act, &lens, None);
     });
     println!("act (max 8): {ms:.1} ms");
     let ms = ms_of(|| {
-        let _ = model.forward(tokens.clone(), &config, StopMode::Converge, &lens);
+        let _ = model.forward(tokens.clone(), &config, StopMode::Converge, &lens, None);
     });
     println!("converge (max 8): {ms:.1} ms");
 
-    let out = model.forward(tokens.clone(), &config, StopMode::Act, &lens);
+    let out = model.forward(tokens.clone(), &config, StopMode::Act, &lens, None);
     println!("act steps_used={} mean_halt={:.2}", out.steps_used, out.mean_halt);
     let ms = ms_of(|| {
         let _ = model
-            .forward(tokens.clone(), &config, StopMode::Fixed { loops: 4 }, &lens)
+            .forward(tokens.clone(), &config, StopMode::Fixed { loops: 4 }, &lens, None)
             .logits
             .sum()
             .backward();

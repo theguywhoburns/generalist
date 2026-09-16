@@ -233,7 +233,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let tokens_inner = truth.tokens.clone().inner();
             let lens = truth.lengths.clone();
             let valid = self.model.valid();
-            let logits = valid.forward(tokens_inner, &self.config, StopMode::Act, &lens).logits;
+            let logits = valid.forward(tokens_inner, &self.config, StopMode::Act, &lens, None).logits;
             let [b2, t2, _] = logits.dims();
             let pred = int_vec(
                 &logits
@@ -315,8 +315,13 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// register nodes on the global autodiff tape, which is reclaimed only
     /// by `backward()` — un-backwarded eval graphs pile up (~80MB/instance
     /// at 1M scale) and OOM both RAM and VRAM.
-    pub fn evaluate(&self, instances: &[Instance], max_new: usize) -> Vec<MetricRecord> {
-        self.evaluate_batched(instances, max_new, 8)
+    pub fn evaluate(
+        &self,
+        instances: &[Instance],
+        max_new: usize,
+        order: Option<&[usize]>,
+    ) -> Vec<MetricRecord> {
+        self.evaluate_batched(instances, max_new, 8, order)
     }
 
     /// Batched greedy decode with per-row EOS masking. Rows decode in lockstep
@@ -329,6 +334,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         instances: &[Instance],
         max_new: usize,
         chunk: usize,
+        order: Option<&[usize]>,
     ) -> Vec<MetricRecord> {
         let model = self.model.valid();
         let mut out = Vec::with_capacity(instances.len());
@@ -347,7 +353,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let t_worst = crate::harness::bucket_len(worst_row);
             let sub = (EVAL_BT_BUDGET / t_worst).clamp(1, group.len());
             for sub_group in group.chunks(sub) {
-                out.extend(self.decode_chunk(&model, sub_group, max_new));
+                out.extend(self.decode_chunk(&model, sub_group, max_new, order));
             }
         }
         // Decode allocates a fresh shape family per chunk and per growing
@@ -362,6 +368,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         model: &LoopedTransformer<B::InnerBackend>,
         group: &[Instance],
         max_new: usize,
+        order: Option<&[usize]>,
     ) -> Vec<MetricRecord> {
         let g = group.len();
         let mut ids: Vec<Vec<i64>> = group.iter().map(|i| i.prompt_ids()).collect();
@@ -401,7 +408,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 TensorData::new(flat, [g, tmax]),
                 &self.device,
             );
-            let res = model.forward(tokens, &self.config, StopMode::Act, &lens);
+            let res = model.forward(tokens, &self.config, StopMode::Act, &lens, order);
             steps_sum += res.steps_used;
             halt_sum += res.mean_halt;
             if block_sums.len() < res.block_halts.len() {
@@ -677,7 +684,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 evals.push((name, pool));
             }
             for (label, set) in evals {
-                let records = trainer.evaluate(set, run.train.eval_max_new);
+                let records = trainer.evaluate(set, run.train.eval_max_new, None);
                 let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
                     std::collections::BTreeMap::new();
                 for r in records {
@@ -712,9 +719,13 @@ pub fn run_stage<B: AutodiffBackend>(
     last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, run.train.steps);
     trainer.save_checkpoint(Path::new(&last_ckpt));
     // Final eval, always (independent of the eval_every cadence): one
-    // authoritative read per run on the larger split, tagged "final".
-    {
-        let records = trainer.evaluate(&final_set, run.train.eval_max_new);
+    // authoritative read per run on the larger split, tagged "final" —
+    // plus a block-reversed repeat ("final-shuffled"), the role diagnostic:
+    // if blocks learned roles, reversed order collapses accuracy.
+    let n_blocks = trainer.model.blocks.len();
+    let reversed: Vec<usize> = (0..n_blocks).rev().collect();
+    for (label, order) in [("final", None), ("final-shuffled", Some(reversed.as_slice()))] {
+        let records = trainer.evaluate(&final_set, run.train.eval_max_new, order);
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
         for r in &records {
@@ -739,7 +750,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
                 .collect();
             println!(
-                "  eval [final] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] sh [{}] cor [{}] (n={})",
+                "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] sh [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.copy_rate,
                 s.mean_halt,
@@ -754,7 +765,7 @@ pub fn run_stage<B: AutodiffBackend>(
             for r in rs.iter() {
                 let mut line = r.to_json();
                 line.pop();
-                log.push_str(&format!("{line},\"eval\":\"final\"}}\n"));
+                log.push_str(&format!("{line},\"eval\":\"{label}\"}}\n"));
             }
         }
         // Pool-level summary: correlations and shares computed across the
@@ -773,7 +784,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
                 .collect();
             println!(
-                "  eval [final-pool]: acc {:.2} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                "  eval [{label}-pool]: acc {:.2} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.copy_rate,
                 s.mean_halt,
@@ -890,10 +901,10 @@ mod tests {
             assert!(info.loss >= 0.0);
         }
         let eval_set: Vec<Instance> = pool.iter().take(4).cloned().collect();
-        let records = trainer.evaluate(&eval_set, 8);
+        let records = trainer.evaluate(&eval_set, 8, None);
         assert_eq!(records.len(), 4);
         // Chunk size must not change verdicts on this set.
-        let records2 = trainer.evaluate_batched(&eval_set, 8, 2);
+        let records2 = trainer.evaluate_batched(&eval_set, 8, 2, None);
         assert_eq!(records2.len(), 4);
         for (a, b) in records.iter().zip(records2.iter()) {
             assert_eq!(a.correct, b.correct);
