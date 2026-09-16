@@ -90,37 +90,38 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_manifest_loads() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/stage0-smoke.json");
-        let cfg = RunConfig::load_json(&path).unwrap();
-        assert_eq!(cfg.model.param_count(), 984_065);
-        assert_eq!(cfg.experiment.tasks.len(), 6);
-        // Ponder-warmup key must be present in checked-in manifests (0 = off).
-        assert_eq!(cfg.train.ponder_warmup_steps, 0);
-    }
-
-    #[test]
     fn all_checked_in_manifests_load() {
-        // Every RunConfig manifest must parse and carry the warmup key.
-        for name in [
-            "stage0-smoke.json",
-            "smoke-tiny.json",
-            "probe-16.json",
-            "probe-32.json",
-            "profile.json",
-            "scale-probe.json",
-            "resume-s0.json",
-        ] {
-            let path =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs").join(name);
+        // Every RunConfig manifest in configs/ must parse. No names are
+        // hardcoded: deleting or adding a manifest updates this test
+        // automatically. Chain plans (*chain.json) parse as ExperimentPlan.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs");
+        let mut run_count = 0;
+        let mut chain_count = 0;
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        names.sort();
+        for name in &names {
+            let path = dir.join(name);
             let text = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                text.contains("ponder_warmup_steps"),
-                "{name} missing ponder_warmup_steps key"
-            );
-            let cfg = RunConfig::load_json(&path).unwrap();
-            let _ = cfg.train.ponder_warmup_steps;
+            if name.contains("chain") {
+                let plan: super::ExperimentPlan = serde_json::from_str(&text).unwrap();
+                assert!(!plan.experiments.is_empty(), "{name} has no experiments");
+                chain_count += 1;
+            } else {
+                assert!(
+                    text.contains("ponder_warmup_steps"),
+                    "{name} missing ponder_warmup_steps key"
+                );
+                let cfg = RunConfig::load_json(&path).unwrap();
+                assert!(cfg.model.param_count() > 0, "{name} has no params");
+                assert!(!cfg.experiment.tasks.is_empty(), "{name} has no tasks");
+                run_count += 1;
+            }
         }
+        assert!(run_count > 0 && chain_count > 0, "configs/ walk found nothing");
     }
 
     #[test]

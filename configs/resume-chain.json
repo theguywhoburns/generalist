@@ -1,9 +1,0 @@
-{
-  "experiments": [
-    {
-      "name": "s0-resume",
-      "manifest": "configs/resume-s0.json",
-      "init_from": "checkpoints/step000200.mpk"
-    }
-  ]
-}

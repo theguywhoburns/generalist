@@ -2,7 +2,7 @@
   "experiments": [
     {
       "name": "s0-parity",
-      "manifest": "configs/scale-probe.json",
+      "manifest": "configs/smoke-tiny.json",
       "init_from": null
     }
   ]

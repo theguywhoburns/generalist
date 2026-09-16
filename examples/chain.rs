@@ -12,7 +12,9 @@ use generalist::{
 fn main() {
     generalist::fail_fast::install();
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).map(|s| s.as_str()).unwrap_or("configs/chain.json");
+    let path = args.get(1).map(|s| s.as_str()).expect(
+        "usage: cargo run --example chain -- configs/chain.json [gpu]",
+    );
     let gpu = args.iter().any(|a| a == "gpu");
     let plan = ExperimentPlan::load_json(std::path::Path::new(path)).expect("load plan");
     if gpu {

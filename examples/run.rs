@@ -1,6 +1,6 @@
-//! Dispatch dry-run: `cargo run --example run -- configs/stage0-smoke.json`
+//! Dispatch dry-run: `cargo run --example run -- configs/<run>.json`
 //! Loads the manifest, generates the pool, prints cell counts and one sample.
-//! No training, no GPU.
+//! No training, no GPU. The manifest path is required.
 
 use generalist::{
     harness::{RunConfig, generate},
@@ -10,7 +10,7 @@ use generalist::{
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "configs/stage0-smoke.json".to_string());
+        .expect("usage: cargo run --example run -- configs/<run>.json");
     let run =
         RunConfig::load_json(std::path::Path::new(&path)).expect("load run manifest");
     println!(
