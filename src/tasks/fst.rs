@@ -75,6 +75,34 @@ impl Rule for SubstRule {
     }
 }
 
+/// Fixed-map variant: ONE constant substitution for every instance
+/// (`a→b b→c c→a`), no header, memorizable purely in weights. Both tracks
+/// sample the identical rule. Scores above chance (ln 3 ≈ 1.10) here mean
+/// the substrate owns a transduction primitive; failure means no context
+/// experiment matters until that exists. Bottom rung of the staircase.
+pub struct SubstFstFixedTask;
+
+/// The constant map. Fixed point-free (teaches transduction, not copying).
+const FIXED_SOURCE: &[u8] = b"abc";
+const FIXED_MAP: &[u8] = b"bca";
+
+impl Task for SubstFstFixedTask {
+    fn name(&self) -> &'static str {
+        "subst-fst-fixed"
+    }
+
+    fn stage(&self) -> u8 {
+        0
+    }
+
+    fn sample_rule(&self, _rng: &mut HarnessRng, _track: Track) -> Box<dyn Rule> {
+        Box::new(SubstRule {
+            source: FIXED_SOURCE.to_vec(),
+            map: FIXED_MAP.to_vec(),
+        })
+    }
+}
+
 /// Oracle variant: identical latent rules and targets, but the prompt states
 /// the substitution explicitly (`MAP a->c b->a c->b`). Demos, regimes,
 /// scoring, and the anti-copy policy are unchanged, so oracle-vs-normal
@@ -197,5 +225,27 @@ mod tests {
     #[test]
     fn oracle_demos_never_copy_query_target() {
         crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstOracleTask, 304, 200);
+    }
+
+    #[test]
+    fn fixed_map_is_constant_across_tracks_and_calls() {
+        let task = SubstFstFixedTask;
+        let mut rng = HarnessRng::new(305);
+        let a = task.sample_rule(&mut rng, Track::A);
+        let b = task.sample_rule(&mut rng, Track::B);
+        // Identical rule both tracks; no header (pure weight memorization).
+        assert!(a.oracle_header().is_none());
+        let qa = a.render_query(&mut rng);
+        let qb = b.render_query(&mut rng);
+        assert!(a.verify(&qa.input, &qa.target));
+        assert!(b.verify(&qb.input, &qb.target));
+        // Fixed point-free constant map: never the identity copy.
+        assert_eq!(qa.target.len(), qa.input.len());
+        assert_ne!(qa.target, qa.input);
+    }
+
+    #[test]
+    fn fixed_demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstFixedTask, 306, 200);
     }
 }

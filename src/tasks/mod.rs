@@ -153,6 +153,7 @@ impl TaskRegistry {
         r.register(Box::new(dyck::DyckTask));
         r.register(Box::new(fst::SubstFstTask));
         r.register(Box::new(fst::SubstFstOracleTask));
+        r.register(Box::new(fst::SubstFstFixedTask));
         r.register(Box::new(periodic::PeriodicTask));
         r.register(Box::new(copy::CopyTask));
         r.register(Box::new(scan::ScanTask));
@@ -187,12 +188,13 @@ mod tests {
     #[test]
     fn registry_lists_builtin_tasks() {
         let r = TaskRegistry::builtin();
-        assert_eq!(r.len(), 7);
+        assert_eq!(r.len(), 8);
         for name in [
             "parity",
             "dyck1",
             "subst-fst",
             "subst-fst-oracle",
+            "subst-fst-fixed",
             "periodic",
             "copy-rev-rep",
             "scan-tiny",
@@ -210,6 +212,7 @@ mod tests {
             "dyck1",
             "subst-fst",
             "subst-fst-oracle",
+            "subst-fst-fixed",
             "periodic",
             "copy-rev-rep",
             "scan-tiny",
