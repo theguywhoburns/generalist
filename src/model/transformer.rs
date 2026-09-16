@@ -696,18 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn nope_model_runs_end_to_end() {
-        use crate::model::config::PosScheme;
-        let cfg = tiny_config().with_pos_scheme(PosScheme::Nope);
-        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        assert!(!model.blocks[0].attn.use_rope);
-        let out = model.forward_fixed(tokens(), &lengths(), 2);
-        assert_eq!(out.logits.dims(), [2, 4, 256]);
-        let (out_act, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
-        assert_eq!(out_act.block_halts.len(), 1);
-    }
-
-    #[test]
     fn act_forward_ponder_bounded() {
         let cfg = tiny_config();
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());

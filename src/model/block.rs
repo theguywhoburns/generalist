@@ -5,10 +5,7 @@ use burn::{
 };
 
 use super::{
-    attention::MultiHeadAttention,
-    config::{LoopedConfig, PosScheme},
-    halting::HaltingHead,
-    mlp::SwiGluMlp,
+    attention::MultiHeadAttention, config::LoopedConfig, halting::HaltingHead, mlp::SwiGluMlp,
 };
 
 /// Inputs to each matrix group, exposed for Newton-Muon input statistics.
@@ -39,7 +36,6 @@ impl<B: Backend> LoopedBlock<B> {
                 config.n_heads,
                 config.head_dim,
                 config.max_seq_len,
-                matches!(config.pos_scheme, PosScheme::Rope),
                 device,
             ),
             mlp: SwiGluMlp::new(config.d_model, config.ffn_hidden, device),

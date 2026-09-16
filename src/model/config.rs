@@ -1,16 +1,5 @@
 use burn::config::Config;
 
-/// Positional encoding scheme. Stateless in both variants: identical
-/// parameter sets and checkpoint compatibility, different forward math.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum PosScheme {
-    /// Rotary relative embeddings on Q/K (length-extrapolating).
-    #[default]
-    Rope,
-    /// No explicit positions: causal-mask ordering only.
-    Nope,
-}
-
 /// How the shared looped block decides depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
@@ -57,11 +46,6 @@ pub struct LoopedConfig {
     /// 2 blocks ≈ 1.84M params; the comparison axis for width-vs-depth.
     #[config(default = 1)]
     pub n_blocks: usize,
-    /// Positional scheme: RoPE (relative, extrapolates) or NoPE (causal
-    /// mask only — the model must infer position itself). Stateless either
-    /// way: same params, same checkpoints, different forward.
-    #[config(default = "PosScheme::Rope")]
-    pub pos_scheme: PosScheme,
 }
 
 impl LoopedConfig {
@@ -121,14 +105,5 @@ mod tests {
     fn four_blocks_param_count() {
         let cfg = LoopedConfig::base_1m().with_n_blocks(4);
         assert_eq!(cfg.param_count(), 3_542_276);
-    }
-
-    #[test]
-    fn pos_scheme_defaults_to_rope_and_nope_keeps_param_count() {
-        let rope = LoopedConfig::base_1m();
-        assert_eq!(rope.pos_scheme, PosScheme::Rope);
-        let nope = LoopedConfig::base_1m().with_pos_scheme(PosScheme::Nope);
-        // Stateless either way: identical params, different forward.
-        assert_eq!(nope.param_count(), rope.param_count());
     }
 }
