@@ -92,14 +92,23 @@ pub struct StepInfo {
     pub ce_eos: f32,
 }
 
+/// Top-bucket row cap: T=512 micros carry B×T² attention tape (saved
+/// softmax trios across all unrolled block-steps) that peaks past 4GB at
+/// batch 6 regardless of pool packing — every observed death lands on these
+/// micros. Cap them to 2 rows; mean-reduced CE keeps the grads unbiased
+/// (same caveat as the B×T trim below).
+pub fn top_bucket_rows(t_pad: usize, rows: usize) -> usize {
+    if t_pad >= 512 { rows.clamp(1, 2) } else { rows }
+}
+
 /// Activation budget for one training micro-batch, as max `batch × padded_T`.
 /// The banded sampler hops length bands (bucket edges 64..512); at a fixed
-/// batch size the top band quadruples the autodiff tape (logits are the
-/// largest activation: `vocab == d_model` here), which OOMs small GPUs
-/// (RTX 3050 4GB) after pool fragmentation from earlier bands + eval.
-/// Long-band windows are trimmed so the tape size stays band-independent
-/// (T=512 trains at batch 8, T≤256 at the configured batch). Mean-reduced
-/// CE keeps merged micro-grads a mean of micro-means either way.
+/// batch size the top band explodes the autodiff tape — the `[B,H,T,T]`
+/// attention trio scales as B×T² and dominates logits (~2.4GB vs ~2MB at
+/// batch 6/T=512 over 32 unrolled block-steps), which OOMs small GPUs
+/// (RTX 3050 4GB) on the first full-depth T=512 micro.
+/// Long-band windows are trimmed so the tape size stays band-independent.
+/// Mean-reduced CE keeps merged micro-grads a mean of micro-means either way.
 const MICRO_BT_BUDGET: usize = 2048;
 
 /// Same budget for eval decode chunks (B×T per fused forward). Eval prompts
@@ -524,6 +533,11 @@ pub fn final_eval_passes(n_blocks: usize, shuffle: bool) -> Vec<(String, Option<
     passes
 }
 
+/// Space-joined 2dp rendering for eval summary vectors.
+fn fmt2(vals: &[f64]) -> String {
+    vals.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>().join(" ")
+}
+
 /// Outcome of one stage: last checkpoint path for `$prev` chaining.
 pub struct StageOutcome {
     pub last_ckpt: String,
@@ -629,6 +643,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 .unwrap_or(1);
             let t_pad = crate::harness::bucket_len(t_raw);
             let micro = &window[..(MICRO_BT_BUDGET / t_pad).clamp(1, window.len())];
+            let micro = &micro[..top_bucket_rows(t_pad, micro.len())];
             let fk = trainer.free_k;
             let (info, grads) = trainer.forward_backward(micro, scale, fk);
             loss_sum += info.loss;
@@ -716,11 +731,9 @@ pub fn run_stage<B: AutodiffBackend>(
                         Some(mb) => format!("vram {mb}MB"),
                         None => "vram n/a".to_string(),
                     };
-                    let bh: Vec<String> =
-                        s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
                     println!(
                         "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] (n={}) {vram}",
-                        s.accuracy, s.copy_rate, s.mean_halt, bh.join(" "), s.n
+                        s.accuracy, s.copy_rate, s.mean_halt, fmt2(&s.mean_block_halt), s.n
                     );
                     watchdog.ping_step(step);
                     for r in rs.iter() {
@@ -753,14 +766,6 @@ pub fn run_stage<B: AutodiffBackend>(
         }
         for ((task, track), rs) in &cells {
             let s = summarize(rs);
-            let bh: Vec<String> = s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
-            let bhc: Vec<String> =
-                s.mean_block_halt_correct.iter().map(|v| format!("{v:.2}")).collect();
-            let bhw: Vec<String> =
-                s.mean_block_halt_wrong.iter().map(|v| format!("{v:.2}")).collect();
-            let p90: Vec<String> = s.p90_block_halt.iter().map(|v| format!("{v:.1}")).collect();
-            let sh: Vec<String> =
-                s.share_block_halt.iter().map(|v| format!("{v:.2}")).collect();
             let cor: Vec<String> = s
                 .block_halt_corr
                 .iter()
@@ -771,11 +776,11 @@ pub fn run_stage<B: AutodiffBackend>(
                 s.accuracy,
                 s.copy_rate,
                 s.mean_halt,
-                bh.join(" "),
-                bhc.join(" "),
-                bhw.join(" "),
-                p90.join(" "),
-                sh.join(" "),
+                fmt2(&s.mean_block_halt),
+                fmt2(&s.mean_block_halt_correct),
+                fmt2(&s.mean_block_halt_wrong),
+                fmt2(&s.p90_block_halt),
+                fmt2(&s.share_block_halt),
                 cor.join(" "),
                 s.n
             );
@@ -789,12 +794,6 @@ pub fn run_stage<B: AutodiffBackend>(
         // whole final set, where per-16-cell slices are variance-starved.
         {
             let s = summarize(&records);
-            let bh: Vec<String> =
-                s.mean_block_halt.iter().map(|v| format!("{v:.2}")).collect();
-            let sh: Vec<String> =
-                s.share_block_halt.iter().map(|v| format!("{v:.2}")).collect();
-            let std: Vec<String> =
-                s.std_block_halt.iter().map(|v| format!("{v:.2}")).collect();
             let cor: Vec<String> = s
                 .block_halt_corr
                 .iter()
@@ -805,9 +804,9 @@ pub fn run_stage<B: AutodiffBackend>(
                 s.accuracy,
                 s.copy_rate,
                 s.mean_halt,
-                bh.join(" "),
-                sh.join(" "),
-                std.join(" "),
+                fmt2(&s.mean_block_halt),
+                fmt2(&s.share_block_halt),
+                fmt2(&s.std_block_halt),
                 cor.join(" "),
                 s.n
             );
@@ -1090,8 +1089,16 @@ mod tests {
     }
 
     #[test]
-    fn final_eval_passes_gate_shuffle() {
-        let off = final_eval_passes(4, false);
+    fn top_bucket_cap_only_clips_512() {
+        assert_eq!(top_bucket_rows(512, 6), 2);
+        assert_eq!(top_bucket_rows(512, 2), 2);
+        assert_eq!(top_bucket_rows(512, 1), 1);
+        assert_eq!(top_bucket_rows(256, 6), 6);
+        assert_eq!(top_bucket_rows(64, 8), 8);
+    }
+
+    #[test]
+    fn final_eval_passes_gate_shuffle() {        let off = final_eval_passes(4, false);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].0, "final");
         assert!(off[0].1.is_none());

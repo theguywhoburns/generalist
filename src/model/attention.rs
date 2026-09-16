@@ -19,6 +19,7 @@ pub struct MultiHeadAttention<B: Backend> {
     pub v: Linear<B>,
     pub o: Linear<B>,
     pub rope: RotaryEncoding<B>,
+    pub use_rope: bool,
     pub n_heads: usize,
     pub head_dim: usize,
 }
@@ -29,6 +30,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         n_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
+        use_rope: bool,
         device: &B::Device,
     ) -> Self {
         assert_eq!(d_model, n_heads * head_dim);
@@ -43,6 +45,7 @@ impl<B: Backend> MultiHeadAttention<B> {
             v: proj(),
             o: proj(),
             rope: RotaryEncodingConfig::new(max_seq_len, head_dim).init(device),
+            use_rope,
             n_heads,
             head_dim,
         }
@@ -109,8 +112,10 @@ impl<B: Backend> MultiHeadAttention<B> {
     ) -> Tensor<B, 3> {
         let [b, t, _] = x.dims();
         let device = x.device();
-        let q = self.rope.forward(self.split_heads(self.q.forward(x.clone())));
-        let k = self.rope.forward(self.split_heads(self.k.forward(x.clone())));
+        let q = self.split_heads(self.q.forward(x.clone()));
+        let q = if self.use_rope { self.rope.forward(q) } else { q };
+        let k = self.split_heads(self.k.forward(x.clone()));
+        let k = if self.use_rope { self.rope.forward(k) } else { k };
         let v = self.split_heads(self.v.forward(x));
 
         // scores[b,h,i,j] = q[b,h,i] . k[b,h,j] / sqrt(head_dim)
@@ -190,7 +195,7 @@ mod tests {
 
     fn test_mha() -> MultiHeadAttention<TestBackend> {
         // Production head geometry: H=4, head_dim=64.
-        MultiHeadAttention::new(256, 4, 64, 512, &test_device())
+        MultiHeadAttention::new(256, 4, 64, 512, true, &test_device())
     }
 
     /// Deterministic `O(1)`-magnitude input (no RNG dependence).
@@ -215,8 +220,10 @@ mod tests {
             x.reshape([b, t, mha.n_heads, mha.head_dim])
                 .swap_dims(1, 2)
         };
-        let q = mha.rope.forward(split(mha.q.forward(x.clone())));
-        let k = mha.rope.forward(split(mha.k.forward(x.clone())));
+        let q = split(mha.q.forward(x.clone()));
+        let q = if mha.use_rope { mha.rope.forward(q) } else { q };
+        let k = split(mha.k.forward(x.clone()));
+        let k = if mha.use_rope { mha.rope.forward(k) } else { k };
         let v = split(mha.v.forward(x));
         let scale = 1.0 / (mha.head_dim as f64).sqrt();
         let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(scale);
@@ -346,6 +353,29 @@ mod tests {
         assert_finite(&gvals, "degenerate-pad output");
         let diff = max_abs_diff(got, want);
         assert!(diff <= FWD_TOL, "degenerate pad diff {diff} > {FWD_TOL}");
+    }
+
+    #[test]
+    fn nope_matches_reference_and_differs_from_rope() {
+        let device = test_device();
+        let (b, t) = (2usize, 96usize);
+        let x = test_input(b, t);
+        let pad = pad_mask::<TestBackend>(&[96, 41], t, &device);
+        // Same weights, RoPE on vs off: build once, flip the flag.
+        let mut mha = test_mha();
+        let got_rope = mha.forward_masked(x.clone(), Some(pad.clone()));
+        mha.use_rope = false;
+        let got_nope = mha.forward_masked(x.clone(), Some(pad.clone()));
+        let want_nope = reference_forward(&mha, x, Some(pad));
+        let diff = max_abs_diff(got_nope.clone(), want_nope);
+        // Position-sensitive input: RoPE must actually change the output.
+        assert!(
+            max_abs_diff(got_rope, got_nope.clone()) > 1e-3,
+            "RoPE/NoPE unexpectedly identical on position-sensitive input"
+        );
+        let vals = got_nope.into_data().as_slice::<f32>().unwrap().to_vec();
+        assert_finite(&vals, "nope output");
+        assert!(diff <= FWD_TOL, "nope vs reference diff {diff} > {FWD_TOL}");
     }
 
     #[test]
