@@ -138,6 +138,12 @@ impl DemoProtocol {
         }
 
         let mut prompt = String::new();
+        // Oracle header first (if the rule states itself explicitly): part
+        // of the unscored prompt context, never of the target.
+        if let Some(header) = rule.oracle_header() {
+            prompt.push_str(&header);
+            prompt.push('\n');
+        }
         let push_pair = |s: &mut String, input: &str, output: Option<&str>| {
             s.push_str(input);
             s.push_str(&sep);

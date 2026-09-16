@@ -75,6 +75,68 @@ impl Rule for SubstRule {
     }
 }
 
+/// Oracle variant: identical latent rules and targets, but the prompt states
+/// the substitution explicitly (`MAP a->c b->a c->b`). Demos, regimes,
+/// scoring, and the anti-copy policy are unchanged, so oracle-vs-normal
+/// accuracy deltas isolate rule *execution* from rule *induction*.
+pub struct SubstFstOracleTask;
+
+impl Task for SubstFstOracleTask {
+    fn name(&self) -> &'static str {
+        "subst-fst-oracle"
+    }
+
+    fn stage(&self) -> u8 {
+        0
+    }
+
+    fn sample_rule(&self, rng: &mut HarnessRng, track: Track) -> Box<dyn Rule> {
+        // Same distribution as `SubstFstTask` (pool seeds differ by task
+        // name, so instances differ — only the distribution matches).
+        let alphabet: &[u8] = match track {
+            Track::A => b"abc",
+            Track::B => b"xyz",
+        };
+        let mut targets = alphabet.to_vec();
+        rng.shuffle(&mut targets);
+        if targets == alphabet {
+            targets.swap(0, 1);
+        }
+        Box::new(OracleSubstRule(SubstRule {
+            source: alphabet.to_vec(),
+            map: targets,
+        }))
+    }
+}
+
+/// `SubstRule` wrapper stating the map explicitly. All behavior delegates.
+pub struct OracleSubstRule(pub SubstRule);
+
+impl Rule for OracleSubstRule {
+    fn render_demo(&self, rng: &mut HarnessRng) -> Demo {
+        self.0.render_demo(rng)
+    }
+
+    fn render_query(&self, rng: &mut HarnessRng) -> Query {
+        self.0.render_query(rng)
+    }
+
+    fn verify(&self, input: &str, output: &str) -> bool {
+        self.0.verify(input, output)
+    }
+
+    fn oracle_header(&self) -> Option<String> {
+        let pairs: Vec<String> = self
+            .0
+            .source
+            .iter()
+            .zip(self.0.map.iter())
+            .map(|(s, m)| format!("{}->{}", *s as char, *m as char))
+            .collect();
+        Some(format!("MAP {}", pairs.join(" ")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +174,28 @@ mod tests {
     #[test]
     fn demos_never_copy_query_target() {
         crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstTask, 301, 200);
+    }
+
+    #[test]
+    fn oracle_states_map_and_keeps_targets() {
+        use crate::tasks::DemoProtocol;
+        let task = SubstFstOracleTask;
+        let mut rng = HarnessRng::new(303);
+        let rule = task.sample_rule(&mut rng, Track::A);
+        let header = rule.oracle_header().expect("oracle states its map");
+        assert!(header.starts_with("MAP "));
+        // Header ships first in the built prompt; the target still verifies
+        // against the same rule (header is context, never scored).
+        let proto = DemoProtocol::default();
+        let inst = proto.build(task.name(), task.stage(), Track::A, rule.as_ref(), &mut rng);
+        let prompt = String::from_utf8(inst.prompt).unwrap();
+        assert!(prompt.starts_with(&format!("{header}\n")), "header first");
+        let target = String::from_utf8(inst.target).unwrap();
+        assert!(rule.verify(&inst.info.query_input, &target));
+    }
+
+    #[test]
+    fn oracle_demos_never_copy_query_target() {
+        crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstOracleTask, 304, 200);
     }
 }

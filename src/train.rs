@@ -76,6 +76,10 @@ pub struct TrainConfig {
     /// Applies to the ponder term only, never the CE term.
     #[config(default = 0)]
     pub ponder_warmup_steps: usize,
+    /// Repeat the final eval with reversed block order ("final-shuffled"):
+    /// the role diagnostic. Eval-only; training never permutes.
+    #[config(default = true)]
+    pub shuffle_eval: bool,
 }
 
 pub struct StepInfo {
@@ -507,6 +511,19 @@ pub fn eval_split(pool: &[Instance], per_cell: usize) -> Vec<Instance> {
         .collect()
 }
 
+/// Final-eval passes: trained order always; reversed block order iff
+/// `shuffle` (role diagnostic). Eval-only; training never permutes.
+pub fn final_eval_passes(n_blocks: usize, shuffle: bool) -> Vec<(String, Option<Vec<usize>>)> {
+    let mut passes = vec![("final".to_string(), None)];
+    if shuffle {
+        passes.push((
+            "final-shuffled".to_string(),
+            Some((0..n_blocks).rev().collect()),
+        ));
+    }
+    passes
+}
+
 /// Outcome of one stage: last checkpoint path for `$prev` chaining.
 pub struct StageOutcome {
     pub last_ckpt: String,
@@ -720,12 +737,12 @@ pub fn run_stage<B: AutodiffBackend>(
     trainer.save_checkpoint(Path::new(&last_ckpt));
     // Final eval, always (independent of the eval_every cadence): one
     // authoritative read per run on the larger split, tagged "final" —
-    // plus a block-reversed repeat ("final-shuffled"), the role diagnostic:
-    // if blocks learned roles, reversed order collapses accuracy.
+    // plus a block-reversed repeat ("final-shuffled") iff `shuffle_eval`,
+    // the role diagnostic: if blocks learned roles, reversed order
+    // collapses accuracy.
     let n_blocks = trainer.model.blocks.len();
-    let reversed: Vec<usize> = (0..n_blocks).rev().collect();
-    for (label, order) in [("final", None), ("final-shuffled", Some(reversed.as_slice()))] {
-        let records = trainer.evaluate(&final_set, run.train.eval_max_new, order);
+    for (label, order) in final_eval_passes(n_blocks, run.train.shuffle_eval) {
+        let records = trainer.evaluate(&final_set, run.train.eval_max_new, order.as_deref());
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
         for r in &records {
@@ -1070,6 +1087,18 @@ mod tests {
             &test_device(),
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn final_eval_passes_gate_shuffle() {
+        let off = final_eval_passes(4, false);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].0, "final");
+        assert!(off[0].1.is_none());
+        let on = final_eval_passes(4, true);
+        assert_eq!(on.len(), 2);
+        assert_eq!(on[1].0, "final-shuffled");
+        assert_eq!(on[1].1, Some(vec![3, 2, 1, 0]));
     }
 
     #[test]

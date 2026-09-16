@@ -96,6 +96,15 @@ pub trait Rule: Send + Sync {
         DemoPolicy::ExcludeAnswer
     }
 
+    /// Explicit statement of the latent rule, prepended to the prompt when
+    /// `Some` (oracle tasks). Default `None`: demos alone carry the rule.
+    /// The header is context, never scored — targets and verification are
+    /// unchanged, so oracle-vs-normal deltas isolate rule *execution* from
+    /// rule *induction*.
+    fn oracle_header(&self) -> Option<String> {
+        None
+    }
+
     /// Produce a wrong output for the ~5% corrupted-demo instances.
     /// Default: flip one character to a different ASCII symbol.
     fn corrupt(&self, rng: &mut HarnessRng, output: &str) -> String {
@@ -143,6 +152,7 @@ impl TaskRegistry {
         r.register(Box::new(parity::ParityTask));
         r.register(Box::new(dyck::DyckTask));
         r.register(Box::new(fst::SubstFstTask));
+        r.register(Box::new(fst::SubstFstOracleTask));
         r.register(Box::new(periodic::PeriodicTask));
         r.register(Box::new(copy::CopyTask));
         r.register(Box::new(scan::ScanTask));
@@ -177,8 +187,16 @@ mod tests {
     #[test]
     fn registry_lists_builtin_tasks() {
         let r = TaskRegistry::builtin();
-        assert_eq!(r.len(), 6);
-        for name in ["parity", "dyck1", "subst-fst", "periodic", "copy-rev-rep", "scan-tiny"] {
+        assert_eq!(r.len(), 7);
+        for name in [
+            "parity",
+            "dyck1",
+            "subst-fst",
+            "subst-fst-oracle",
+            "periodic",
+            "copy-rev-rep",
+            "scan-tiny",
+        ] {
             assert!(r.get(name).is_some(), "missing {name}");
         }
     }
@@ -191,6 +209,7 @@ mod tests {
         for name in [
             "dyck1",
             "subst-fst",
+            "subst-fst-oracle",
             "periodic",
             "copy-rev-rep",
             "scan-tiny",

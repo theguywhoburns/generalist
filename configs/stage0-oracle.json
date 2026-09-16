@@ -31,7 +31,7 @@
     "ckpt_every": 100,
     "eval_max_new": 64,
     "seed": 0,
-    "ckpt_dir": "checkpoints-4block-wide",
+    "ckpt_dir": "checkpoints-oracle",
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
     "accum_steps": 2,
@@ -40,7 +40,7 @@
     "shuffle_eval": true
   },
   "experiment": {
-    "tasks": ["parity", "dyck1", "subst-fst", "periodic", "copy-rev-rep", "scan-tiny"],
+    "tasks": ["subst-fst-oracle"],
     "tracks": ["A", "B"],
     "per_cell": 256,
     "seeds": [0, 1, 2],
