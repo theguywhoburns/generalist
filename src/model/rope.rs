@@ -4,9 +4,7 @@ use burn::{
     tensor::{Bool, Tensor, backend::Backend},
 };
 
-use super::{
-    attention::MultiHeadAttention, config::LoopedConfig, halting::HaltingHead, mlp::SwiGluMlp,
-};
+use super::{attention::MultiHeadAttention, config::LoopedConfig, mlp::SwiGluMlp};
 
 /// Inputs to each matrix group, exposed for Newton-Muon input statistics.
 pub struct BlockInputs<B: Backend> {
@@ -15,20 +13,22 @@ pub struct BlockInputs<B: Backend> {
     pub hidden: Tensor<B, 3>,
 }
 
-/// The single weight-tied block. Instantiated once, applied up to
-/// `max_loops` times. Physical layers: 1. Virtual depth: loop count.
-/// Each block owns its halting gate, so stacked blocks halt independently.
+/// One encoder layer, burn-`TransformerEncoderLayer` style: unfused causal
+/// MHA with RoPE, RMSNorms, SwiGLU MLP. Deliberately halt-free and
+/// optimizer-blind: halting lives in [`LoopedStage`](super::transformer::LoopedStage),
+/// parameter routing in the model's `grad_specs`/`muon_ids` (rank-based).
+/// A decoder cross-attention variant belongs here once a task produces a
+/// memory stream; until then it would be dead code.
 #[derive(Module, Debug)]
-pub struct LoopedBlock<B: Backend> {
+pub struct RopeTransformer<B: Backend> {
     pub attn: MultiHeadAttention<B>,
     pub mlp: SwiGluMlp<B>,
     pub norm1: RmsNorm<B>,
     pub norm2: RmsNorm<B>,
-    pub halt: HaltingHead<B>,
     pub scale: f64,
 }
 
-impl<B: Backend> LoopedBlock<B> {
+impl<B: Backend> RopeTransformer<B> {
     pub fn new(config: &LoopedConfig, device: &B::Device) -> Self {
         Self {
             attn: MultiHeadAttention::new(
@@ -41,7 +41,6 @@ impl<B: Backend> LoopedBlock<B> {
             mlp: SwiGluMlp::new(config.d_model, config.ffn_hidden, device),
             norm1: RmsNormConfig::new(config.d_model).init(device),
             norm2: RmsNormConfig::new(config.d_model).init(device),
-            halt: HaltingHead::new(config.d_model, config.halt_bias_init, device),
             scale: config.residual_scale(),
         }
     }

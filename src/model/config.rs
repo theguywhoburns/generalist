@@ -42,10 +42,14 @@ pub struct LoopedConfig {
     pub conv_patience: usize,
     #[config(default = 512)]
     pub max_seq_len: usize,
-    /// Stacked distinct blocks looped as one unit (1 = headline config).
-    /// 2 blocks ≈ 1.84M params; the comparison axis for width-vs-depth.
+    /// Sequential looped stages (4 stages × 1 block = current headline).
+    /// More stages = more independently-halted compute units.
     #[config(default = 1)]
-    pub n_blocks: usize,
+    pub n_stages: usize,
+    /// Encoder layers per stage, sharing one gate. 1 = per-block ACT;
+    /// all blocks in one stage = global ACT over the stack (ablation axis).
+    #[config(default = 1)]
+    pub blocks_per_stage: usize,
 }
 
 impl LoopedConfig {
@@ -69,12 +73,13 @@ impl LoopedConfig {
         let d = self.d_model;
         let v = self.vocab_size;
         let h = self.ffn_hidden;
+        let n = self.n_stages * self.blocks_per_stage; // total encoder layers
         let embed = v * d;
         let block = 4 * d * d + 3 * d * h + 2 * d; // attn + mlp + 2 norms
         let norms = d; // norm_f
-        let halt = self.n_blocks * (d + 1); // one halting gate per block
+        let halt = self.n_stages * (d + 1); // one halting gate per stage
         let head = v * d; // untied LM head
-        embed + self.n_blocks * block + norms + halt + head
+        embed + n * block + norms + halt + head
     }
 
     /// Residual branch scale `1 / sqrt(2 * max_loops)`.
@@ -95,15 +100,23 @@ mod tests {
 
     #[test]
     fn two_blocks_is_18m_class() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
-        // Second block (attn+mlp+norms+own halt gate): 852_480 + 257.
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
+        // Second stage (block + own halt gate): 852_480 + 257.
         assert_eq!(cfg.param_count(), 984_065 + 852_737);
         assert_eq!(cfg.param_count(), 1_836_802);
     }
 
     #[test]
     fn four_blocks_param_count() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(4);
+        let cfg = LoopedConfig::base_1m().with_n_stages(4);
         assert_eq!(cfg.param_count(), 3_542_276);
+    }
+
+    #[test]
+    fn two_blocks_one_stage_shares_a_gate() {
+        // 1 stage × 2 blocks: second block without its own gate.
+        let cfg = LoopedConfig::base_1m().with_blocks_per_stage(2);
+        assert_eq!(cfg.param_count(), 984_065 + 852_480);
+        assert_eq!(cfg.param_count(), 1_836_545);
     }
 }

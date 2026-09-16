@@ -7,8 +7,9 @@ use burn::{
 };
 
 use super::{
-    block::LoopedBlock,
     config::{LoopedConfig, StopMode},
+    halting::HaltingHead,
+    rope::RopeTransformer,
 };
 use crate::optim::PrecondInput;
 
@@ -56,39 +57,32 @@ fn xtx_sum<B: Backend>(x: Tensor<B, 3>) -> (Tensor<B, 2>, usize) {
     (x2.clone().transpose().matmul(x2), n)
 }
 
-/// The 1M looped character transformer (Option A, untied head).
+/// One looped stage: a stack of `blocks_per_stage` encoder layers sharing
+/// a single halting gate. The stage iterates its whole stack to the gate's
+/// fixed point, then hands its readout to the next stage.
+/// `blocks_per_stage = 1` is per-block ACT (current); one stage holding all
+/// blocks is global ACT over the stack (the ablation axis).
 #[derive(Module, Debug)]
-pub struct LoopedTransformer<B: Backend> {
-    pub embed: Embedding<B>,
-    /// Stacked distinct blocks, applied in order on every loop iteration.
-    /// Each block carries its own halting gate (micro-step ACT).
-    pub blocks: Vec<LoopedBlock<B>>,
-    pub norm_f: RmsNorm<B>,
-    pub head: Linear<B>,
+pub struct LoopedStage<B: Backend> {
+    pub blocks: Vec<RopeTransformer<B>>,
+    pub halt: HaltingHead<B>,
 }
 
-impl<B: Backend> LoopedTransformer<B> {
+impl<B: Backend> LoopedStage<B> {
     pub fn new(config: &LoopedConfig, device: &B::Device) -> Self {
-        config.assert_valid();
-        assert!(config.n_blocks >= 1, "n_blocks must be >= 1");
+        assert!(
+            config.blocks_per_stage >= 1,
+            "blocks_per_stage must be >= 1"
+        );
         Self {
-            embed: EmbeddingConfig::new(config.vocab_size, config.d_model)
-                .with_initializer(burn::module::Initializer::Normal {
-                    mean: 0.0,
-                    std: 0.02,
-                })
-                .init(device),
-            blocks: (0..config.n_blocks)
-                .map(|_| LoopedBlock::new(config, device))
+            blocks: (0..config.blocks_per_stage)
+                .map(|_| RopeTransformer::new(config, device))
                 .collect(),
-            norm_f: RmsNormConfig::new(config.d_model).init(device),
-            head: LinearConfig::new(config.d_model, config.vocab_size)
-                .with_bias(false)
-                .init(device),
+            halt: HaltingHead::new(config.d_model, config.halt_bias_init, device),
         }
     }
 
-    /// One full pass through the stacked blocks (one loop iteration).
+    /// One full pass through this stage's stack.
     fn iterate(
         &self,
         x: Tensor<B, 3>,
@@ -97,6 +91,52 @@ impl<B: Backend> LoopedTransformer<B> {
         let mut x = x;
         for block in &self.blocks {
             x = block.forward_masked(x, Some(key_pad.clone()));
+        }
+        x
+    }
+}
+
+/// The 1M looped character transformer (Option A, untied head).
+#[derive(Module, Debug)]
+pub struct LoopedTransformer<B: Backend> {
+    pub embed: Embedding<B>,
+    /// Sequential looped stages; each iterates to its own gate's fixed
+    /// point before handing its readout on (learned asynchronous depth).
+    pub stages: Vec<LoopedStage<B>>,
+    pub norm_f: RmsNorm<B>,
+    pub head: Linear<B>,
+}
+
+impl<B: Backend> LoopedTransformer<B> {
+    pub fn new(config: &LoopedConfig, device: &B::Device) -> Self {
+        config.assert_valid();
+        assert!(config.n_stages >= 1, "n_stages must be >= 1");
+        Self {
+            embed: EmbeddingConfig::new(config.vocab_size, config.d_model)
+                .with_initializer(burn::module::Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02,
+                })
+                .init(device),
+            stages: (0..config.n_stages)
+                .map(|_| LoopedStage::new(config, device))
+                .collect(),
+            norm_f: RmsNormConfig::new(config.d_model).init(device),
+            head: LinearConfig::new(config.d_model, config.vocab_size)
+                .with_bias(false)
+                .init(device),
+        }
+    }
+
+    /// One full pass through all stages (one loop iteration).
+    fn iterate(
+        &self,
+        x: Tensor<B, 3>,
+        key_pad: &Tensor<B, 2, burn::tensor::Bool>,
+    ) -> Tensor<B, 3> {
+        let mut x = x;
+        for stage in &self.stages {
+            x = stage.iterate(x, key_pad);
         }
         x
     }
@@ -138,7 +178,7 @@ impl<B: Backend> LoopedTransformer<B> {
             x = self.iterate(x, &key_pad);
         }
         let logits = self.logits(x);
-        let n = self.blocks.len();
+        let n = self.stages.len();
         LoopOutput {
             logits,
             ponder: Tensor::zeros([1], &device),
@@ -153,8 +193,8 @@ impl<B: Backend> LoopedTransformer<B> {
     /// Returns output plus input-covariance sufficient statistics when
     /// `collect_stats` is set (training path; use `forward_act_with_stats`
     /// on an autodiff backend to get detached inner-backend stats).
-    /// `order` permutes block execution (eval-only role diagnostic; `None` =
-    /// trained order). `block_halts[i]` always refers to block `i`, wherever
+    /// `order` permutes stage execution (eval-only role diagnostic; `None` =
+    /// trained order). `block_halts[i]` always refers to stage `i`, wherever
     /// it ran.
     pub fn forward_act(
         &self,
@@ -190,16 +230,16 @@ impl<B: Backend> LoopedTransformer<B> {
         });
 
         let max = config.max_loops;
-        let n = self.blocks.len();
+        let n = self.stages.len();
         // Execution order: trained order by default; a permutation for the
         // role diagnostic. Validated: same length, in-range indices.
         let exec: Vec<usize> = match order {
             None => (0..n).collect(),
             Some(o) => {
-                assert_eq!(o.len(), n, "block order length {} != n_blocks {n}", o.len());
+                assert_eq!(o.len(), n, "stage order length {} != n_stages {n}", o.len());
                 assert!(
                     o.iter().all(|&i| i < n),
-                    "block order index out of range"
+                    "stage order index out of range"
                 );
                 o.to_vec()
             }
@@ -209,21 +249,19 @@ impl<B: Backend> LoopedTransformer<B> {
         // pool-reuse anyway; this kills the launches too).
         let zeros_bt = Tensor::<B, 2>::zeros([b, t], &device);
         let ones_bt = Tensor::<B, 2>::ones([b, t], &device);
-        // Learned asynchronous depth: blocks run SEQUENTIALLY, each iterating
-        // to its own gate's fixed point before handing its readout to the
-        // next block. Every token passes through every block; each block
-        // decides its own per-token iteration count. (An interleaved design
-        // with one shared cumulative halter would let early blocks starve
-        // downstream stages: a token halted at B1 would never see B2/B3.)
-        // For n=1 this is exactly the classic single-gate ACT loop.
+        // Learned asynchronous depth: stages run SEQUENTIALLY, each iterating
+        // its whole block stack to its gate's fixed point before handing its
+        // readout to the next stage. Every token passes through every stage;
+        // each stage decides its own per-token iteration count.
+        // For one single-block stage this is exactly classic single-gate ACT.
         // Means over real tokens only; pads never ran.
         let denom = keep_f.clone().sum().clamp_min(1.0);
         let mut total_ponder = Tensor::<B, 2>::zeros([b, t], &device);
         let mut total_halt = Tensor::<B, 2>::zeros([b, t], &device);
         let mut steps_used = 0usize;
         let mut block_halts = vec![0.0f32; n];
-        for &bi in &exec {
-            let block = &self.blocks[bi];
+        for &si in &exec {
+            let stage = &self.stages[si];
             let mut out = Tensor::zeros([b, t, d], &device);
             let mut cum = Tensor::zeros([b, t], &device);
             let mut ponder = Tensor::zeros([b, t], &device);
@@ -238,29 +276,35 @@ impl<B: Backend> LoopedTransformer<B> {
                     .bool_and(key_pad.clone().bool_not());
                 let still_f = still.clone().float();
 
-                // Single pass: this IS the forward; stats ride along.
-                let (x_new_full, inp) = block.forward_split(x.clone(), Some(key_pad.clone()));
-                if collect_stats && let Some(st) = stats.as_mut() {
-                    // Detached: stats are consumed only as values (`.inner()`
-                    // in `forward_act_with_stats`); grads through this path
-                    // are unused. Cuts ~20MiB/iter of tracked matmul
-                    // retention, no math change.
-                    let (sum, _) = xtx_sum(inp.attn_in.detach() * keep_d.clone());
-                    st.attn_xtx = st.attn_xtx.clone() + sum;
-                    st.attn_n += real_n;
-                    let (sum, _) = xtx_sum(inp.mlp_in.detach() * keep_d.clone());
-                    st.mlp_xtx = st.mlp_xtx.clone() + sum;
-                    st.mlp_n += real_n;
-                    let (sum, _) = xtx_sum(inp.hidden.detach() * keep_h.clone());
-                    st.down_xtx = st.down_xtx.clone() + sum;
-                    st.down_n += real_n;
+                // Single pass through the stage stack: this IS the forward;
+                // stats ride along per block.
+                let mut xs = x.clone();
+                for block in &stage.blocks {
+                    let (y, inp) = block.forward_split(xs, Some(key_pad.clone()));
+                    if collect_stats && let Some(st) = stats.as_mut() {
+                        // Detached: stats are consumed only as values (`.inner()`
+                        // in `forward_act_with_stats`); grads through this path
+                        // are unused. Cuts ~20MiB/iter of tracked matmul
+                        // retention, no math change.
+                        let (sum, _) = xtx_sum(inp.attn_in.detach() * keep_d.clone());
+                        st.attn_xtx = st.attn_xtx.clone() + sum;
+                        st.attn_n += real_n;
+                        let (sum, _) = xtx_sum(inp.mlp_in.detach() * keep_d.clone());
+                        st.mlp_xtx = st.mlp_xtx.clone() + sum;
+                        st.mlp_n += real_n;
+                        let (sum, _) = xtx_sum(inp.hidden.detach() * keep_h.clone());
+                        st.down_xtx = st.down_xtx.clone() + sum;
+                        st.down_n += real_n;
+                    }
+                    xs = y;
                 }
+                let x_new_full = xs;
                 // Freeze halted states so running tokens attend to stable keys/values.
                 // Single select op; replaces ones/sub/mul/mul/add with identical math.
                 let still3 = still.clone().unsqueeze_dim::<3>(2).repeat_dim(2, d);
                 x = x.mask_where(still3, x_new_full);
 
-                let p = block.halt.probs(x.clone());
+                let p = stage.halt.probs(x.clone());
                 let p_run = zeros_bt.clone().mask_where(still.clone(), p);
 
                 if s == max {
@@ -298,8 +342,9 @@ impl<B: Backend> LoopedTransformer<B> {
                     break;
                 }
             }
-            // This block's readout seeds the next block (in execution order).
-            block_halts[bi] = scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone()));
+            // This stage's readout seeds the next stage (in execution order).
+            // `block_halts[si]` always refers to stage `si` (`bh[i]` = Bi).
+            block_halts[si] = scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone()));
             total_ponder = total_ponder + ponder;
             total_halt = total_halt + halt_step;
             steps_used += used;
@@ -361,7 +406,7 @@ impl<B: Backend> LoopedTransformer<B> {
             ponder: Tensor::from_floats([steps_used as f32], &device),
             steps_used,
             mean_halt: steps_used as f32,
-            block_halts: vec![steps_used as f32; self.blocks.len()],
+            block_halts: vec![steps_used as f32; self.stages.len()],
         }
     }
 
@@ -382,23 +427,32 @@ impl<B: Backend> LoopedTransformer<B> {
 
     /// Every float param with name and rank: the canonical id set for grad
     /// partitioning, accumulation merging, and coverage tests.
-    /// Block params are suffixed per block (`q0`, `q1`, ...).
+    /// Blocks are numbered flat across stages (`q0`, `q1`, ...); stage gates
+    /// are `halt_w{s}`/`halt_b{s}` per stage.
     pub fn grad_specs(&self) -> Vec<(String, ParamId, usize)> {
         let mut specs = vec![("embed".to_string(), self.embed.weight.id, 2)];
-        for (i, b) in self.blocks.iter().enumerate() {
+        let mut i = 0usize;
+        for (s, stage) in self.stages.iter().enumerate() {
+            for b in &stage.blocks {
+                specs.extend(
+                    [
+                        (format!("q{i}"), b.attn.q.weight.id, 2),
+                        (format!("k{i}"), b.attn.k.weight.id, 2),
+                        (format!("v{i}"), b.attn.v.weight.id, 2),
+                        (format!("o{i}"), b.attn.o.weight.id, 2),
+                        (format!("gate{i}"), b.mlp.gate.weight.id, 2),
+                        (format!("up{i}"), b.mlp.up.weight.id, 2),
+                        (format!("down{i}"), b.mlp.down.weight.id, 2),
+                        (format!("norm1_{i}"), b.norm1.gamma.id, 1),
+                        (format!("norm2_{i}"), b.norm2.gamma.id, 1),
+                    ]
+                );
+                i += 1;
+            }
             specs.extend(
                 [
-                    (format!("q{i}"), b.attn.q.weight.id, 2),
-                    (format!("k{i}"), b.attn.k.weight.id, 2),
-                    (format!("v{i}"), b.attn.v.weight.id, 2),
-                    (format!("o{i}"), b.attn.o.weight.id, 2),
-                    (format!("gate{i}"), b.mlp.gate.weight.id, 2),
-                    (format!("up{i}"), b.mlp.up.weight.id, 2),
-                    (format!("down{i}"), b.mlp.down.weight.id, 2),
-                    (format!("norm1_{i}"), b.norm1.gamma.id, 1),
-                    (format!("norm2_{i}"), b.norm2.gamma.id, 1),
-                    (format!("halt_w{i}"), b.halt.head.weight.id, 2),
-                    (format!("halt_b{i}"), b.halt.head.bias.as_ref().unwrap().id, 1),
+                    (format!("halt_w{s}"), stage.halt.head.weight.id, 2),
+                    (format!("halt_b{s}"), stage.halt.head.bias.as_ref().unwrap().id, 1),
                 ]
             );
         }
@@ -413,8 +467,9 @@ impl<B: Backend> LoopedTransformer<B> {
 
     /// Newton-Muon input group per hidden matrix.
     pub fn precond_roles(&self) -> HashMap<ParamId, PrecondInput> {
-        self.blocks
+        self.stages
             .iter()
+            .flat_map(|s| s.blocks.iter())
             .flat_map(|b| {
                 [
                     (b.attn.q.weight.id, PrecondInput::AttnIn),
@@ -716,12 +771,12 @@ mod tests {
     }
 
     #[test]
-    fn per_block_gates_are_independent() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+    fn per_stage_gates_are_independent() {
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         assert_ne!(
-            model.blocks[0].halt.head.weight.id,
-            model.blocks[1].halt.head.weight.id
+            model.stages[0].halt.head.weight.id,
+            model.stages[1].halt.head.weight.id
         );
         let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
         assert_eq!(out.block_halts.len(), 2);
@@ -737,7 +792,7 @@ mod tests {
 
     #[test]
     fn identity_order_matches_default_bitwise() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let (a, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
         let (b, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0, 1]));
@@ -749,7 +804,7 @@ mod tests {
 
     #[test]
     fn reversed_order_runs_with_block_indexed_halts() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[1, 0]));
         assert_eq!(out.logits.dims(), [2, 4, 256]);
@@ -760,22 +815,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "block order length")]
+    #[should_panic(expected = "stage order length")]
     fn short_order_panics() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let _ = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0]));
     }
 
     #[test]
     fn grad_specs_cover_per_block_gates() {
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let specs = model.grad_specs();
-        // embed + norm_f + head + 11 per block
+        // embed + norm_f + head + 11 per single-block stage
         assert_eq!(specs.len(), 3 + 11 * 2);
         assert!(specs.iter().any(|(n, _, _)| n == "halt_w0"));
         assert!(specs.iter().any(|(n, _, _)| n == "halt_b1"));
+    }
+
+    #[test]
+    fn one_stage_two_blocks_shares_a_gate() {
+        // Global-ACT layout: 2 blocks, 1 gate, 1 bh entry, same 14 Muon ids.
+        let cfg = LoopedConfig::base_1m().with_blocks_per_stage(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        assert_eq!(model.stages.len(), 1);
+        assert_eq!(model.stages[0].blocks.len(), 2);
+        assert_eq!(model.muon_ids().len(), 14);
+        assert_eq!(model.grad_specs().len(), 3 + 9 * 2 + 2);
+        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
+        assert_eq!(out.block_halts.len(), 1);
+        assert_eq!(out.logits.dims(), [2, 4, 256]);
     }
 
     #[test]
@@ -907,7 +976,7 @@ mod tests {
         // 2 blocks: 14 hidden matrices on Muon; embed/head/halt (2D but
         // excluded) plus all 1D params on AdamW. Behavior must equal the
         // old explicit enumeration exactly.
-        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let muon = model.muon_ids();
         assert_eq!(muon.len(), 14);

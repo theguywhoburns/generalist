@@ -76,7 +76,7 @@ pub struct TrainConfig {
     /// Applies to the ponder term only, never the CE term.
     #[config(default = 0)]
     pub ponder_warmup_steps: usize,
-    /// Repeat the final eval with reversed block order ("final-shuffled"):
+    /// Repeat the final eval with reversed stage order ("final-shuffled"):
     /// the role diagnostic. Eval-only; training never permutes.
     #[config(default = true)]
     pub shuffle_eval: bool,
@@ -522,12 +522,12 @@ pub fn eval_split(pool: &[Instance], per_cell: usize) -> Vec<Instance> {
 
 /// Final-eval passes: trained order always; reversed block order iff
 /// `shuffle` (role diagnostic). Eval-only; training never permutes.
-pub fn final_eval_passes(n_blocks: usize, shuffle: bool) -> Vec<(String, Option<Vec<usize>>)> {
+pub fn final_eval_passes(n_stages: usize, shuffle: bool) -> Vec<(String, Option<Vec<usize>>)> {
     let mut passes = vec![("final".to_string(), None)];
     if shuffle {
         passes.push((
             "final-shuffled".to_string(),
-            Some((0..n_blocks).rev().collect()),
+            Some((0..n_stages).rev().collect()),
         ));
     }
     passes
@@ -753,8 +753,8 @@ pub fn run_stage<B: AutodiffBackend>(
     // plus a block-reversed repeat ("final-shuffled") iff `shuffle_eval`,
     // the role diagnostic: if blocks learned roles, reversed order
     // collapses accuracy.
-    let n_blocks = trainer.model.blocks.len();
-    for (label, order) in final_eval_passes(n_blocks, run.train.shuffle_eval) {
+    let n_stages = trainer.model.stages.len();
+    for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval) {
         let records = trainer.evaluate(&final_set, run.train.eval_max_new, order.as_deref());
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
@@ -975,11 +975,11 @@ mod tests {
         }
         assert!(zero.is_empty(), "params with zero grad: {zero:?}");
         // Weights must actually move after a step.
-        let before = trainer.model.blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let before = trainer.model.stages[0].blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let before_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let refs: Vec<&Instance> = batch.iter().collect();
         trainer.train_step(&refs);
-        let after = trainer.model.blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let after = trainer.model.stages[0].blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         let after_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         assert_ne!(before, after, "muon param frozen after a step");
         assert_ne!(before_head, after_head, "adamw param frozen after a step");

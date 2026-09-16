@@ -11,7 +11,8 @@
     "conv_tol": 0.001,
     "conv_patience": 2,
     "max_seq_len": 512,
-    "n_blocks": 4
+    "n_stages": 4,
+    "blocks_per_stage": 1
   },
   "optim": {
     "precond_ewma": 0.95,
