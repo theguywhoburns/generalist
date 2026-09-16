@@ -12,6 +12,14 @@ use super::{
 };
 use crate::optim::PrecondInput;
 
+/// 2D params the Muon paper recipe keeps on AdamW anyway: embedding and
+/// LM head (despite being 2D), plus halt-gate weights (single-output rows
+/// where orthogonalization buys nothing). New modules: name embedding-like
+/// or gate-like 2D params accordingly and routing follows automatically.
+fn is_adamw_2d(name: &str) -> bool {
+    name == "embed" || name == "head" || name.starts_with("halt_w")
+}
+
 /// Graves ACT halting threshold: a token halts once cumulative halt mass
 /// reaches `1 - ACT_EPS`.
 const ACT_EPS: f64 = 0.01;
@@ -357,22 +365,18 @@ impl<B: Backend> LoopedTransformer<B> {
         }
     }
 
-    /// 2D hidden-matrix ids routed to Muon/Newton-Muon. Everything else
-    /// (embedding, norms, halt head, LM head) goes to AdamW.
+    /// 2D hidden-matrix ids routed to Muon/Newton-Muon, derived from
+    /// [`Self::grad_specs`] by rank — not by enumeration — so new block
+    /// types with 2D hidden matrices need zero optimizer changes.
+    /// Exclusions (Muon paper recipe + degeneracy): embedding and LM head
+    /// stay on AdamW despite being 2D; halt-gate weights are thin
+    /// single-output rows where orthogonalization buys nothing.
+    /// Everything else (norms, biases) is 1D and goes to AdamW.
     pub fn muon_ids(&self) -> HashSet<ParamId> {
-        self.blocks
-            .iter()
-            .flat_map(|b| {
-                [
-                    b.attn.q.weight.id,
-                    b.attn.k.weight.id,
-                    b.attn.v.weight.id,
-                    b.attn.o.weight.id,
-                    b.mlp.gate.weight.id,
-                    b.mlp.up.weight.id,
-                    b.mlp.down.weight.id,
-                ]
-            })
+        self.grad_specs()
+            .into_iter()
+            .filter(|(name, _, rank)| *rank == 2 && !is_adamw_2d(name))
+            .map(|(_, id, _)| id)
             .collect()
     }
 
@@ -896,6 +900,35 @@ mod tests {
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         assert_eq!(model.muon_ids().len(), 7);
         assert_eq!(model.precond_roles().len(), 7);
+    }
+
+    #[test]
+    fn muon_routing_is_rank_based_with_recipe_exclusions() {
+        // 2 blocks: 14 hidden matrices on Muon; embed/head/halt (2D but
+        // excluded) plus all 1D params on AdamW. Behavior must equal the
+        // old explicit enumeration exactly.
+        let cfg = LoopedConfig::base_1m().with_n_blocks(2);
+        let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
+        let muon = model.muon_ids();
+        assert_eq!(muon.len(), 14);
+        let specs = model.grad_specs();
+        let names: std::collections::HashMap<ParamId, String> =
+            specs.into_iter().map(|(n, id, _)| (id, n)).collect();
+        for id in &muon {
+            let n = &names[id];
+            assert!(
+                !is_adamw_2d(n),
+                "Muon-routed param should be a hidden matrix, got {n}"
+            );
+        }
+        // Spot-check the exclusion side: embed, head, halt gates excluded.
+        for (n, id, _) in model.grad_specs() {
+            if is_adamw_2d(&n) {
+                assert!(!muon.contains(&id), "{n} must stay on AdamW");
+            }
+        }
+        assert!(is_adamw_2d("embed") && is_adamw_2d("head") && is_adamw_2d("halt_w3"));
+        assert!(!is_adamw_2d("q0") && !is_adamw_2d("down1"));
     }
 
     #[test]

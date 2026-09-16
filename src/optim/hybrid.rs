@@ -3,8 +3,9 @@
 //!
 //! Burn's `OptimizerAdaptor` skips parameters with no gradient in the passed
 //! `GradientsParams`, so each adaptor steps only its own partition:
-//! 1. [`split_grads`] partitions by the model's explicit id sets (dimension
-//!    alone is insufficient: the embedding is also 2D but must use AdamW);
+//! 1. [`split_grads`] partitions by rank via the model's id set (all 2D
+//!    hidden matrices to Muon; embedding/head/halt-gate 2D excluded by the
+//!    Muon paper recipe — see `is_adamw_2d`);
 //! 2. [`precondition_grads`] applies the Newton-Muon right-preconditioner to
 //!    the Muon partition before the Muon step.
 //!
