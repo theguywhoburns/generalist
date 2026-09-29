@@ -146,6 +146,34 @@ impl RunConfig {
         if t.ckpt_dir.is_empty() {
             problems.push("train: ckpt_dir must not be empty".to_string());
         }
+        // Holdout fraction, cross-checked against the pool the run will build.
+        if !(0.0..1.0).contains(&t.eval_holdout) {
+            problems.push(format!(
+                "train: eval_holdout must be in [0, 1), got {}",
+                t.eval_holdout
+            ));
+        } else if t.eval_holdout == 0.0 {
+            problems.push(
+                "train: eval_holdout is 0, so the eval split is drawn from the \
+                 training pool and every reported accuracy is in-distribution; \
+                 set a positive value to measure generalization"
+                    .to_string(),
+            );
+        }
+        // The holdout must leave enough instances per cell for the final eval's
+        // per-block means and correlations to mean anything. Only enforced once
+        // `per_cell` is large enough for the question to matter: a smoke
+        // manifest exists to prove the pipeline runs, not to measure.
+        let cells = (self.experiment.per_cell as f64) * self.experiment.seeds.len() as f64;
+        let held_per_cell = t.eval_holdout * cells;
+        if t.eval_holdout > 0.0 && self.experiment.per_cell >= 32 && held_per_cell < 8.0 {
+            problems.push(format!(
+                "train: eval_holdout {} leaves ~{held_per_cell:.1} eval instances per \
+                 (task, track, seed) cell; the final-eval correlations and p90s need a \
+                 handful to be non-degenerate, so raise per_cell or eval_holdout",
+                t.eval_holdout
+            ));
+        }
         // A warmup longer than the run never reaches full weight: the
         // effective ponder pressure is silently wrong for the whole run.
         if t.ponder_warmup_steps > t.steps {

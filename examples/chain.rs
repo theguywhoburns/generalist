@@ -62,7 +62,19 @@ fn run_chain<B: burn::tensor::backend::AutodiffBackend>(
             &run.experiment,
             &generalist::tasks::TaskRegistry::builtin(),
         );
-        let eval_here = eval_split(&pool, 16);
+        // Retained splits must come from the HELD-OUT side of this stage's own
+        // split. `run_stage` applies the identical partition internally, so
+        // the set computed here is exactly the set it evaluates against.
+        let (_, held) =
+            generalist::train::partition_holdout(&pool, run.train.eval_holdout, run.train.seed);
+        if held.is_empty() {
+            eprintln!(
+                "warning: {}: eval_holdout is 0, so this stage's retained split is \
+                 in-distribution and its forgetting evals do not measure generalization",
+                exp.name
+            );
+        }
+        let eval_here = eval_split(&held, 16);
         let outcome = run_stage::<B>(
             &run,
             device,

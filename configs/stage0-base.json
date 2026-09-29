@@ -43,6 +43,7 @@
     "eval_max_new": 64,
     "seed": 0,
     "ckpt_dir": "checkpoints-stage0",
+    "eval_holdout": 0.1,
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
     "accum_steps": 2,

@@ -25,6 +25,11 @@ Every stage runs twin tracks:
 - **Track B** — rule never seen, defined only by k prompt examples.
   The k=0→k>0 accuracy delta is the ICL signal.
 
+Instances are split into train and held-out eval *before* anything touches the
+pool (`train.eval_holdout`, default 10%), so no reported accuracy is measured
+on data the model trained on. The holdout is deterministic per instance, so
+forgetting checks across chained stages compare against the same instances.
+
 ## In-context demonstration protocol
 
 - Every task instance ships with k demonstrations of THAT INSTANCE's latent
@@ -86,9 +91,19 @@ convergence control. The non-looped columns are not implemented.
 
 ## Eval
 
-Held-out only: unseen rules, 2× length, novel symbols, noisy context.
+Held-out only: unseen rules, 2× length, novel symbols, noisy context. The
+instance-level split is enforced in `run_stage`, not left to the caller —
+`eval_holdout: 0` is rejected by the loader unless you are deliberately
+reproducing a pre-holdout number.
+
 Re-run all earlier stages after each new stage (forgetting check). Log halt
 depth per token position (syntax vs reasoning tokens), not just per task.
+
+One caveat on the role diagnostic: reversing stage order collapses accuracy
+by construction, because stages run sequentially and each one's readout feeds
+the next. Reversal reverses the data flow, so collapse is not by itself
+evidence of learned role specialization. A control (the same shuffle applied
+to an untrained model) is needed before reading it as specialization.
 
 Pre-registered bars: Track B (k≥2) exact-match ≥80%; 2× length ≥60%; schema
 validity ≥95%; missing-key false answers ≤5%; disjoint-style math within

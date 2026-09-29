@@ -41,6 +41,7 @@
     "eval_max_new": 8,
     "seed": 0,
     "ckpt_dir": "checkpoints-smoke-tiny",
+    "eval_holdout": 0.25,
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
     "accum_steps": 1,

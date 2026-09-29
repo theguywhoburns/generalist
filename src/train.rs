@@ -83,6 +83,15 @@ pub struct TrainConfig {
     /// the role diagnostic. Eval-only; training never permutes.
     #[config(default = true)]
     pub shuffle_eval: bool,
+    /// Fraction of each (task, track) cell held out of training and used for
+    /// eval. Every reported accuracy is measured on instances the model never
+    /// saw.
+    ///
+    /// `0.0` restores the old in-distribution behavior and is only for
+    /// reproducing a pre-holdout number; the loader warns when it sees it,
+    /// because such a number does not measure generalization.
+    #[config(default = 0.1)]
+    pub eval_holdout: f64,
 }
 
 pub struct StepInfo {
@@ -513,8 +522,71 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 }
 
-/// Fixed eval split: first 16 instances per (task, track). Deterministic
-/// from the pool, so forgetting checks across stages compare like with like.
+/// Split a pool into (train, held-out eval) with **no instance in both**.
+///
+/// Why this exists: the eval split used to be the first `per_cell` instances
+/// of the training pool, so every reported accuracy was measured on data the
+/// model had trained on. For procedural tasks each instance samples its own
+/// latent rule, so an instance-level split is genuinely held out — the rules
+/// differ even though the task family is the same. Track A is still
+/// "task semantics seen in training" by design; Track B rules are unseen
+/// either way.
+///
+/// Deterministic given `seed`, and the split is per (task, track) cell so a
+/// cell that runs dry is visible rather than silently reshuffling the whole
+/// pool. `eval_frac = 0.0` disables the holdout and restores the old
+/// in-distribution behavior — only for reproducing an old number.
+pub fn partition_holdout(
+    pool: &[Instance],
+    eval_frac: f64,
+    seed: u64,
+) -> (Vec<Instance>, Vec<Instance>) {
+    assert!(
+        (0.0..1.0).contains(&eval_frac),
+        "eval_frac must be in [0, 1), got {eval_frac}"
+    );
+    if eval_frac == 0.0 {
+        return (pool.to_vec(), Vec::new());
+    }
+    // Bucket by cell, then hash each instance to decide its side. Hashing (not
+    // a sequential slice) keeps the eval set spread across the length range
+    // rather than clustered at whatever `generate` happened to emit first.
+    let mut train: Vec<Instance> = Vec::with_capacity(pool.len());
+    let mut held: Vec<Instance> = Vec::new();
+    for inst in pool {
+        if is_held_out(inst, eval_frac, seed) {
+            held.push(inst.clone());
+        } else {
+            train.push(inst.clone());
+        }
+    }
+    (train, held)
+}
+
+/// Stable per-instance holdout decision. Uses the instance's own identity
+/// (task, track, k, prompt bytes) rather than its pool index, so the same
+/// instance lands on the same side regardless of generation order.
+fn is_held_out(inst: &Instance, eval_frac: f64, seed: u64) -> bool {
+    let mut h: u64 = seed ^ 0x9E37_79B9_7F4A_7C15;
+    h = h
+        .wrapping_mul(0x100_0000_01B3)
+        .wrapping_add(inst.info.task.len() as u64);
+    for b in inst.info.task.as_bytes() {
+        h = h.wrapping_mul(0x100_0000_01B3).wrapping_add(*b as u64);
+    }
+    h = h.wrapping_mul(31).wrapping_add(inst.info.track as u64);
+    h = h.wrapping_mul(31).wrapping_add(inst.info.k as u64);
+    for b in &inst.prompt {
+        h = h.wrapping_mul(0x100_0000_01B3).wrapping_add(*b as u64);
+    }
+    // Compare the top 53 bits against the fraction: exact for any f64 in [0,1)
+    // and independent of platform f64 division.
+    ((h >> 11) as f64) < eval_frac * (1u64 << 53) as f64
+}
+
+/// First `per_cell` instances per (task, track) of a pool. Deterministic, so
+/// forgetting checks across stages compare like with like. Apply this to the
+/// HELD-OUT side of a [`partition_holdout`] split, not to the training pool.
 pub fn eval_split(pool: &[Instance], per_cell: usize) -> Vec<Instance> {
     let mut cells: std::collections::BTreeMap<(String, u8), Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -603,15 +675,32 @@ pub fn run_stage<B: AutodiffBackend>(
     std::fs::create_dir_all(&run.train.ckpt_dir).expect("ckpt dir");
     let registry = TaskRegistry::builtin();
     let pool = generate(&run.experiment, &registry);
-    println!("pool: {} instances", pool.len());
-    let eval_set = eval_split(&pool, 16);
-    println!("eval: {} instances", eval_set.len());
+    // Hold out eval instances BEFORE anything touches the pool, so no reported
+    // accuracy is measured on data the model trained on.
+    let (train_pool, held) = partition_holdout(&pool, run.train.eval_holdout, run.train.seed);
+    let held_note = if held.is_empty() {
+        "EVAL SET EMPTY: eval_holdout is 0, so every accuracy below is in-distribution".to_string()
+    } else {
+        format!("{} of them held out", held.len())
+    };
+    println!(
+        "pool: {} instances ({} train, {})",
+        pool.len(),
+        train_pool.len(),
+        held_note
+    );
+    let eval_set = eval_split(&held, 16);
+    println!("eval: {} instances (held out)", eval_set.len());
     // Larger final-eval split (48/cell): bhC/bhW and correlations are noise
     // at n=16. Deterministic prefix-superset of `eval_set`.
-    let final_set = eval_split(&pool, 48);
-    println!("final eval: {} instances", final_set.len());
+    let final_set = eval_split(&held, 48);
+    println!("final eval: {} instances (held out)", final_set.len());
+    assert!(
+        !train_pool.is_empty(),
+        "train pool is empty: per_cell and eval_holdout leave nothing to train on"
+    );
     // Length-band training pool: stable padded T across steps.
-    let mut train_pool = pool;
+    let mut train_pool = train_pool;
     train_pool.sort_by_key(|i| i.prompt.len() + i.target.len());
 
     // `run.train` is passed straight through. A previous version rebuilt a
@@ -1145,6 +1234,136 @@ mod tests {
             other => panic!("expected constant LRs in the smoke default, got {other:?}"),
         };
         assert_eq!((muon, adamw), (want_muon, want_adamw));
+    }
+
+    /// The load-bearing property of the holdout: no instance may appear in
+    /// both the training pool and the eval pool. Before this, `eval_split`
+    /// took a prefix of the training pool, so every reported accuracy was
+    /// measured on data the model had trained on.
+    #[test]
+    fn holdout_partitions_without_overlap_and_keeps_both_sides() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string(), "subst-fst".to_string()],
+            per_cell: 64,
+            seeds: vec![0, 1],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let (train, held) = partition_holdout(&pool, 0.1, 7);
+        assert_eq!(train.len() + held.len(), pool.len(), "instances lost");
+        assert!(!train.is_empty() && !held.is_empty());
+        // Disjoint by construction, checked here by content rather than by
+        // trusting the partition: key on (task, track, k, prompt, target).
+        let key = |i: &Instance| {
+            format!(
+                "{:?}/{:?}/k{}/{}/{}",
+                i.info.task,
+                i.info.track,
+                i.info.k,
+                String::from_utf8_lossy(&i.prompt),
+                String::from_utf8_lossy(&i.target)
+            )
+        };
+        let train_keys: std::collections::HashSet<String> = train.iter().map(key).collect();
+        for inst in &held {
+            assert!(
+                !train_keys.contains(&key(inst)),
+                "instance leaked into both sides: {:?}",
+                String::from_utf8_lossy(&inst.prompt)
+            );
+        }
+        // Roughly the requested fraction, allowing for hash variance.
+        let frac = held.len() as f64 / pool.len() as f64;
+        assert!((0.04..0.16).contains(&frac), "holdout fraction {frac}");
+    }
+
+    /// The holdout must be stable: same seed, same split, whatever the pool
+    /// order. Two stages of a chain each call this with the same seed, and
+    /// their forgetting evals are only comparable if they hold out the same
+    /// instances.
+    #[test]
+    fn holdout_is_deterministic_and_order_independent() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 64,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let (_, a) = partition_holdout(&pool, 0.1, 3);
+        let (_, b) = partition_holdout(&pool, 0.1, 3);
+        let key = |i: &Instance| String::from_utf8_lossy(&i.prompt).into_owned();
+        let ka: std::collections::HashSet<String> = a.iter().map(key).collect();
+        let kb: std::collections::HashSet<String> = b.iter().map(key).collect();
+        assert_eq!(ka, kb, "same seed gave a different split");
+
+        // Reversing the pool must not move any instance across the boundary.
+        let mut rev = pool.clone();
+        rev.reverse();
+        let (_, c) = partition_holdout(&rev, 0.1, 3);
+        let kc: std::collections::HashSet<String> = c.iter().map(key).collect();
+        assert_eq!(ka, kc, "split depends on pool order");
+
+        // A different seed is a different split (otherwise the seed is ignored).
+        let (_, d) = partition_holdout(&pool, 0.1, 4);
+        let kd: std::collections::HashSet<String> = d.iter().map(key).collect();
+        assert_ne!(ka, kd, "seed had no effect on the split");
+    }
+
+    /// `eval_holdout: 0` must reproduce the old in-distribution behavior
+    /// exactly — that is the only reason the escape hatch exists.
+    #[test]
+    fn zero_holdout_preserves_the_old_behavior() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 16,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let (train, held) = partition_holdout(&pool, 0.0, 1);
+        assert_eq!(train.len(), pool.len());
+        assert!(held.is_empty());
+    }
+
+    /// A holdout of 1.0 would empty the training pool. The loader rejects it
+    /// (see `RunConfig::validate`), and the partition function refuses it too
+    /// rather than handing back an empty training set.
+    #[test]
+    fn full_holdout_is_rejected() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 8,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let threw = std::panic::catch_unwind(|| partition_holdout(&pool, 1.0, 0)).is_err();
+        assert!(threw, "eval_frac 1.0 was accepted");
+
+        // And the loader reports it as a validation problem, not a panic.
+        let mut cfg = crate::harness::RunConfig::smoke();
+        cfg.train.eval_holdout = 1.0;
+        let joined = cfg.validate().join("\n");
+        assert!(
+            joined.contains("eval_holdout must be in [0, 1)"),
+            "{joined}"
+        );
+    }
+
+    /// `eval_holdout: 0` is the escape hatch for reproducing a pre-holdout
+    /// number. The loader must call that out as untrustworthy rather than
+    /// letting an in-distribution accuracy pass for a generalization result.
+    #[test]
+    fn zero_holdout_is_flagged_as_in_distribution() {
+        let mut cfg = crate::harness::RunConfig::smoke();
+        cfg.train.eval_holdout = 0.0;
+        let joined = cfg.validate().join("\n");
+        assert!(joined.contains("in-distribution"), "{joined}");
     }
 
     #[test]
