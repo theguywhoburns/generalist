@@ -7,7 +7,13 @@ pub enum StopMode {
     Fixed { loops: usize },
     /// Graves-style ACT: per-token halt distribution + ponder penalty.
     /// Only `max_loops` and `ponder_weight` are forced, never the exact depth.
-    Act,
+    /// `shuffle_train` is a hint the trainer acts on (it resamples the
+    /// execution order each step); the model itself takes the order as an
+    /// argument, so the mode itself carries no behaviour.
+    Act {
+        /// Resample stage order every training step. See [`StopConfig`].
+        shuffle_train: bool,
+    },
     /// Latent convergence (RD-VLA style): stop when the relative state
     /// change stays below `conv_tol` for `conv_patience` steps.
     Converge,
@@ -29,7 +35,22 @@ pub enum StopMode {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum StopConfig {
     /// Graves-style ACT: learned per-token halting + ponder penalty.
-    Act,
+    ///
+    /// `shuffle_train` resamples the stage execution order on every training
+    /// forward. It is the **causal control** for the role diagnostic: a model
+    /// trained under random order either still collapses under reversal
+    /// (order-dependence is structural) or does not (order-dependence was
+    /// learned, and therefore avoidable). Note the training loss of a
+    /// shuffled run is NOT comparable to an ordered one — the model is
+    /// solving a different, permutation-robust function.
+    ///
+    /// Eval always uses the trained order; shuffling is a training-time
+    /// intervention only.
+    Act {
+        /// Resample stage order every training step. See above.
+        #[serde(default)]
+        shuffle_train: bool,
+    },
     /// Exactly `loops` applications of every stage. No halting head, no
     /// ponder, and a constant `block_halts` — the compute-matched control.
     Fixed {
@@ -43,14 +64,26 @@ pub enum StopConfig {
 }
 
 impl StopConfig {
-    /// The dispatch value the model takes. Fieldless: `Fixed`'s `loops` and
+    /// The dispatch value the model takes. `Fixed`'s `loops` and
     /// `Converge`'s tolerances are read back off `LoopedConfig`.
     pub fn to_mode(self) -> StopMode {
         match self {
-            StopConfig::Act => StopMode::Act,
+            StopConfig::Act { shuffle_train } => StopMode::Act { shuffle_train },
             StopConfig::Fixed { loops } => StopMode::Fixed { loops },
             StopConfig::Converge => StopMode::Converge,
         }
+    }
+
+    /// Whether training should resample stage order each step. Only ACT
+    /// can: `Fixed`/`Converge` are single-stage-execution modes where order
+    /// is the whole computation.
+    pub fn shuffle_training(&self) -> bool {
+        matches!(
+            self,
+            StopConfig::Act {
+                shuffle_train: true
+            }
+        )
     }
 
     /// Cross-field checks that `LoopedConfig::assert_valid` cannot see.
@@ -74,7 +107,16 @@ impl StopConfig {
             }
             // ACT and Converge both read max_loops; the assert in
             // `assert_valid` already covers `max_loops >= 1`.
-            StopConfig::Act | StopConfig::Converge => {}
+            StopConfig::Act { .. } | StopConfig::Converge => {}
+        }
+        if self.shuffle_training() && cfg.n_stages < 2 {
+            // With one stage the permutation is the identity, so the flag
+            // would silently do nothing while appearing to be a control.
+            errs.push(
+                "stop: shuffle_train is set but model.n_stages is 1, so the \
+                 order permutation is the identity and the control is a no-op"
+                    .to_string(),
+            );
         }
         errs
     }
@@ -82,9 +124,11 @@ impl StopConfig {
 
 impl Default for StopConfig {
     /// ACT is the headline configuration, so it is the default a manifest
-    /// gets by omitting the key entirely.
+    /// gets by omitting the key entirely. `shuffle_train` defaults off.
     fn default() -> Self {
-        StopConfig::Act
+        StopConfig::Act {
+            shuffle_train: false,
+        }
     }
 }
 

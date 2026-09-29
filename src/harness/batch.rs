@@ -34,6 +34,26 @@ pub fn bucket_len(n: usize) -> usize {
     panic!("sequence length exceeds top bucket");
 }
 
+/// [`bucket_len`] that also refuses to exceed a model's `max_seq_len`.
+///
+/// The training path already asserts the *real* length against
+/// `max_seq_len`, but that check misses the padding: a row of real length
+/// 200 buckets to 256, and eval decode adds `max_new` on top, so a
+/// `max_new`-extended row can bucket past `max_seq_len` even when every real
+/// length is legal. RoPE is sized to `max_seq_len`, so the result is an
+/// opaque broadcast panic from deep inside attention rather than a message
+/// naming the knob that is wrong.
+pub fn bucket_len_within(n: usize, max_seq_len: usize, what: &str) -> usize {
+    let b = bucket_len(n);
+    assert!(
+        b <= max_seq_len,
+        "{what}: padded length {b} (bucket for a {n}-length sequence) exceeds \
+         model.max_seq_len {max_seq_len}. Raise max_seq_len to at least the top \
+         bucket edge, or lower eval_max_new / shorten the prompts."
+    );
+    b
+}
+
 pub struct Collated<B: Backend> {
     /// `[B, T]` padded with PAD.
     pub tokens: Tensor<B, 2, Int>,
@@ -173,5 +193,40 @@ mod tests {
         assert_eq!(bucket_len(64), 64);
         assert_eq!(bucket_len(65), 128);
         assert_eq!(bucket_len(512), 512);
+    }
+
+    /// The guard that names the knob instead of letting RoPE fail with an
+    /// opaque broadcast error. Found by running a 20-step multi-stage eval
+    /// with `max_seq_len: 256` against prompts that bucket to 512.
+    #[test]
+    fn bucket_len_within_names_the_knob_when_padded_length_overflows() {
+        // Legal: the padded length fits.
+        assert_eq!(bucket_len_within(200, 256, "t"), 256);
+        assert_eq!(bucket_len_within(10, 512, "t"), 64);
+        // Illegal: real length 200 is legal on its own, but pads to 256 and
+        // that is still fine, so use a case where the bucket itself overflows.
+        let msg = std::panic::catch_unwind(|| bucket_len_within(300, 256, "eval decode"))
+            .expect_err("300 buckets to 512 > 256, must be rejected");
+        let msg = msg
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| msg.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("eval decode"), "context missing: {msg}");
+        assert!(msg.contains("max_seq_len"), "knob not named: {msg}");
+        assert!(msg.contains("512"), "padded length not reported: {msg}");
+    }
+
+    /// The specific gap the training assert misses: a real length under the
+    /// limit whose *padded* length, or whose `max_new`-extended length, is
+    /// not. Real 250 + max_new 8 = 258, which buckets to 512.
+    #[test]
+    fn guard_catches_the_case_the_training_assert_misses() {
+        let threw =
+            std::panic::catch_unwind(|| bucket_len_within(250 + 8, 256, "eval decode")).is_err();
+        assert!(
+            threw,
+            "the max_new overflow that the training assert cannot see went unreported"
+        );
     }
 }

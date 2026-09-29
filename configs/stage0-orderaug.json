@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "ORDER-AUGMENTED control. Identical to stage0-4block except that the stage",
+    "execution order is resampled every training step. This is the CAUSAL test",
+    "for the role diagnostic:",
+    "",
+    "  - If an order-augmented model still collapses under eval-time reversal,",
+    "    order-dependence is structural and the trained-order collapse proves",
+    "    nothing about learned roles.",
+    "  - If it does NOT collapse, order-dependence was learned and is",
+    "    avoidable, which is the claim the diagnostic is supposed to make.",
+    "",
+    "Reading it against configs/stage0-4block.json (same data, same steps, only",
+    "the order augmentation differs) isolates the intervention.",
+    "",
+    "CAVEAT: this run's training loss is NOT comparable to the ordered run's.",
+    "It is solving a different, permutation-robust function. Compare held-out",
+    "accuracy and the profile evidence, not loss.",
+    "",
+    "The profile evidence (entropy / max-deviation / mean off-diagonal",
+    "correlation) is the reading that needs no control at all, so it works on",
+    "the weights-only rungs where the random-weight control sits at chance."
+  ],
+  "extends": "stage0-base.json",
+  "stop": { "kind": "act", "shuffle_train": true },
+  "train": { "ckpt_dir": "checkpoints-orderaug" }
+}

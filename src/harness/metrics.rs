@@ -74,6 +74,19 @@ pub struct Summary {
     /// (row i holds corr(i,0)..corr(i,i-1)): ~1.0 everywhere means the four
     /// gates are one global head in disguise; near-0 means differentiated.
     pub block_halt_corr: Vec<Vec<f64>>,
+    /// Mean of the off-diagonal block-halt correlations, the scalar summary
+    /// of the matrix above. ~1.0 => one global head; ~0 => independent gates.
+    pub mean_offdiag_block_corr: f64,
+    /// Normalized entropy of `share_block_halt`, in [0, 1].
+    ///
+    /// 1.0 = every stage spends exactly its share (one global head in
+    /// disguise); lower = compute is concentrated on some stages. This is the
+    /// null-profile test: it asks directly whether the stages differ, rather
+    /// than inferring it from a reversal collapse.
+    pub stage_halt_entropy: f64,
+    /// `max_i |share_i - 1/n|`: the largest single-stage deviation from a
+    /// uniform profile. 0 = uniform.
+    pub share_max_deviation: f64,
 }
 
 /// Nearest-rank quantile over a sorted slice.
@@ -175,13 +188,31 @@ pub fn summarize(records: &[Record]) -> Summary {
     // Lower-triangle block correlations (diagnostic-only, no objective).
     let cols: Vec<Vec<f64>> = (0..width).map(col).collect();
     let mut block_halt_corr = vec![];
+    let mut offdiag: Vec<f64> = Vec::new();
     for i in 0..width {
         let mut row = vec![];
         for j in 0..i {
-            row.push(pearson(&cols[i], &cols[j]));
+            let c = pearson(&cols[i], &cols[j]);
+            offdiag.push(c);
+            row.push(c);
         }
         block_halt_corr.push(row);
     }
+    let mean_offdiag_block_corr = mean(&offdiag);
+
+    // Profile shape: how far the per-stage compute split is from uniform.
+    // A uniform split is the signature of one global head spread over stages
+    // that all compute the same thing.
+    let stage_halt_entropy = normalized_entropy(&share_block_halt);
+    let share_max_deviation = if width == 0 {
+        0.0
+    } else {
+        let uniform = 1.0 / width as f64;
+        share_block_halt
+            .iter()
+            .map(|s| (s - uniform).abs())
+            .fold(0.0f64, f64::max)
+    };
     Summary {
         n: records.len(),
         accuracy: records.iter().filter(|r| r.correct).count() as f64 / n,
@@ -196,7 +227,27 @@ pub fn summarize(records: &[Record]) -> Summary {
         std_block_halt,
         share_block_halt,
         block_halt_corr,
+        mean_offdiag_block_corr,
+        stage_halt_entropy,
+        share_max_deviation,
     }
+}
+
+/// Shannon entropy of a share vector, normalized to [0, 1] by log2(n).
+///
+/// Returns 0.0 for an empty or single-element vector: with one stage there is
+/// no profile to be non-uniform about, and log2(1) = 0 would be a division by
+/// zero.
+fn normalized_entropy(shares: &[f64]) -> f64 {
+    if shares.len() < 2 {
+        return 0.0;
+    }
+    let h: f64 = shares
+        .iter()
+        .filter(|s| **s > 0.0)
+        .map(|s| -s * s.log2())
+        .sum();
+    h / (shares.len() as f64).log2()
 }
 
 /// Append-only JSONL sink.

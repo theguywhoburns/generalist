@@ -181,9 +181,9 @@ impl ShuffleControl {
 mod tests {
     use super::*;
 
-    /// The case the control exists to catch: a big trained gap that is
-    /// entirely explained by reversal mechanics. The control must be above
-    /// chance for this reading to be available at all.
+    /// The case the control exists to catch: a big trained gap entirely
+    /// explained by reversal mechanics. The control must be above chance for
+    /// this reading to be available at all.
     #[test]
     fn structural_collapse_is_not_reported_as_specialization() {
         let c = ShuffleControl::new(0.60, 0.00, 0.60, 0.01);

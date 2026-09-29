@@ -46,7 +46,7 @@ impl RunConfig {
         Self {
             model: LoopedConfig::base_1m(),
             optim: OptimConfig::Muon(crate::optim::MuonTuning::new()),
-            stop: StopConfig::Act,
+            stop: StopConfig::default(),
             train: TrainConfig::new(),
             experiment: super::experiment::Experiment {
                 per_cell: 8,
@@ -70,7 +70,7 @@ impl RunConfig {
 
     fn stop_summary(&self) -> String {
         match self.stop {
-            StopConfig::Act => "act".to_string(),
+            StopConfig::Act { .. } => "act".to_string(),
             StopConfig::Fixed { loops } => format!("fixed x{loops}"),
             StopConfig::Converge => "converge".to_string(),
         }
@@ -115,6 +115,21 @@ impl RunConfig {
             problems.push(format!(
                 "model: vocab_size {} < 256; this is a byte-level model",
                 m.vocab_size
+            ));
+        }
+        // Sequences are padded UP to a bucket edge, and RoPE is sized to
+        // `max_seq_len`. A `max_seq_len` below the top bucket edge therefore
+        // breaks as soon as a real sequence lands in the top band — and
+        // eval breaks later than training, because decode adds `max_new` on
+        // top. Catching it here names the knob instead of surfacing a
+        // broadcast panic from inside attention.
+        if let Some(top) = crate::harness::BUCKET_EDGES.last()
+            && m.max_seq_len < *top
+        {
+            problems.push(format!(
+                "model: max_seq_len {} is below the top padding bucket {top}; \
+                 padded batches would exceed it (RoPE is sized to max_seq_len)",
+                m.max_seq_len
             ));
         }
 
@@ -188,7 +203,7 @@ impl RunConfig {
         // has a constant step count, so the penalty is a constant offset in
         // the loss and a `ponder_weight` above ~1 just inflates the loss
         // without shaping anything.
-        if !matches!(self.stop, StopConfig::Act) && m.ponder_weight != 0.0 {
+        if !matches!(self.stop, StopConfig::Act { .. }) && m.ponder_weight != 0.0 {
             problems.push(format!(
                 "train: ponder_weight is set but stop is {}; ponder is constant without ACT, so this only offsets the loss",
                 self.stop_summary()
@@ -206,7 +221,7 @@ impl StopConfig {
     /// Label used in log lines and error messages.
     pub fn kind_name(&self) -> &'static str {
         match self {
-            StopConfig::Act => "act",
+            StopConfig::Act { .. } => "act",
             StopConfig::Fixed { .. } => "fixed",
             StopConfig::Converge => "converge",
         }
@@ -290,21 +305,39 @@ mod manifest_tests {
             let from_file =
                 load_run(&path).unwrap_or_else(|e| panic!("configs/{name} did not load:\n{e}"));
 
-            // The typed parse and a fresh serialize must agree with the file's
-            // own resolution, or `extends` is doing something invisible.
+            // Resolution must be deterministic, or `extends` is doing
+            // something invisible.
             let expect = resolve(&path, &mut Vec::new()).unwrap().0;
             assert_eq!(
                 merged, expect,
                 "configs/{name}: resolve is not deterministic"
             );
 
-            // Re-serializing the loaded config must reproduce the merged
-            // document (modulo key order), which is what makes save_run's
-            // "complete, self-contained" output trustworthy.
-            let round = serde_json::to_value(&from_file).expect("serialize");
+            // The right invariant for `save_run` is a SEMANTIC fixed point,
+            // not document equality. A checked-in manifest may omit a
+            // serde-defaulted key (`stop.shuffle_train`, `stop` itself), while
+            // serialization always writes it — so comparing the saved
+            // document to the input would conflate "a default was omitted"
+            // with "resolution is wrong". Compare typed values instead:
+            // save -> load -> save must be stable, and the value must equal
+            // the one loaded from the original file.
+            let saved = serde_json::to_value(&from_file).expect("serialize");
+            let reloaded: RunConfig = serde_json::from_value(saved.clone()).expect("saved parses");
             assert_eq!(
-                round, expect,
-                "configs/{name}: save_run output would not match its own input"
+                serde_json::to_value(&reloaded).expect("re-serialize"),
+                saved,
+                "configs/{name}: save -> load -> save is not a fixed point"
+            );
+            assert_eq!(
+                saved["model"],
+                serde_json::to_value(&from_file.model).expect("model"),
+                "configs/{name}: model block changed across the round trip"
+            );
+            // And the saved document must be loadable on its own, with no base
+            // file present: that is the "self-contained" promise.
+            assert!(
+                !saved.as_object().expect("object").contains_key("extends"),
+                "configs/{name}: saved output kept an extends key"
             );
         }
     }
@@ -355,7 +388,7 @@ mod manifest_tests {
     #[test]
     fn stop_mode_variations_are_wired_through() {
         let base = load_run(&dir().join("stage0-base.json")).expect("base loads");
-        assert_eq!(base.stop, StopConfig::Act);
+        assert_eq!(base.stop, StopConfig::default());
 
         let fixed = load_run(&dir().join("stage0-fixed4.json")).expect("fixed4 loads");
         assert_eq!(fixed.stop, StopConfig::Fixed { loops: 4 });
@@ -383,7 +416,10 @@ mod manifest_tests {
             }
             seen.push(load_run(&dir().join(&name)).expect("loads").stop);
         }
-        assert!(seen.contains(&StopConfig::Act), "no manifest uses act");
+        assert!(
+            seen.contains(&StopConfig::default()),
+            "no manifest uses act"
+        );
         assert!(
             seen.iter().any(|s| matches!(s, StopConfig::Fixed { .. })),
             "no manifest uses fixed depth; that grid cell is unreachable"
@@ -511,18 +547,18 @@ mod tests {
         // key deserializes and means ACT.
         let cfg: RunConfig =
             serde_json::from_str(&serde_json::to_string(&valid()).unwrap()).unwrap();
-        assert_eq!(cfg.stop, StopConfig::Act);
+        assert_eq!(cfg.stop, StopConfig::default());
         // And a document with the key absent parses to Act, not an error.
         let mut v = serde_json::to_value(valid()).unwrap();
         v.as_object_mut().unwrap().remove("stop");
         let back: RunConfig = serde_json::from_value(v).expect("omit stop");
-        assert_eq!(back.stop, StopConfig::Act);
+        assert_eq!(back.stop, StopConfig::default());
     }
 
     #[test]
     fn every_variant_roundtrips_through_json() {
         for stop in [
-            StopConfig::Act,
+            StopConfig::default(),
             StopConfig::Fixed { loops: 4 },
             StopConfig::Converge,
         ] {

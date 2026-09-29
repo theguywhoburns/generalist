@@ -3,7 +3,12 @@
     "CPU smoke test: tiny model, tiny pool, 60 steps. Exercises the full path",
     "(generate -> train -> eval -> checkpoint) in seconds on one core. Not a",
     "tuning run; no result from it is meaningful. Constant LRs on purpose -",
-    "a schedule over 60 steps is noise."
+    "a schedule over 60 steps is noise.",
+    "",
+    "max_seq_len is 512, not 256: sequences pad UP to a bucket edge and RoPE",
+    "is sized to max_seq_len, so a lower value breaks the moment a prompt",
+    "lands in the top band. parity alone never got there, which is why the",
+    "loader now rejects max_seq_len below the top bucket outright."
   ],
   "model": {
     "vocab_size": 256,
@@ -16,7 +21,7 @@
     "halt_bias_init": -3.0,
     "conv_tol": 0.001,
     "conv_patience": 2,
-    "max_seq_len": 256,
+    "max_seq_len": 512,
     "n_stages": 1,
     "blocks_per_stage": 1
   },

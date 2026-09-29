@@ -176,7 +176,7 @@ impl<B: Backend> LoopedTransformer<B> {
     ) -> LoopOutput<B> {
         match mode {
             StopMode::Fixed { loops } => self.forward_fixed(tokens, lengths, loops),
-            StopMode::Act => self.forward_act(tokens, config, lengths, order),
+            StopMode::Act { .. } => self.forward_act(tokens, config, lengths, order),
             StopMode::Converge => self.forward_converge(tokens, config, lengths),
         }
     }
