@@ -12,14 +12,15 @@ use generalist::{
 fn main() {
     generalist::fail_fast::install();
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).map(|s| s.as_str()).expect(
-        "usage: cargo run --example chain -- configs/chain.json [gpu]",
-    );
+    let path = args
+        .get(1)
+        .map(|s| s.as_str())
+        .expect("usage: cargo run --example chain -- configs/chain.json [gpu]");
     let gpu = args.iter().any(|a| a == "gpu");
     // Every manifest in the plan is resolved, merged and validated up front:
     // a typo in stage 4 must not surface after stage 3 has trained.
-    let (plan, runs) = load_chain(std::path::Path::new(path))
-        .unwrap_or_else(|e| panic!("load chain:\n{e}"));
+    let (plan, runs) =
+        load_chain(std::path::Path::new(path)).unwrap_or_else(|e| panic!("load chain:\n{e}"));
     if gpu {
         #[cfg(feature = "cuda")]
         {
