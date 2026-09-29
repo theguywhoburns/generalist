@@ -12,7 +12,7 @@
 //! rejected with `missing field ...`. That matches `LoopedConfig` and
 //! `TrainConfig` and keeps a checked-in manifest a full description of the
 //! run. To obtain a block to edit rather than hand-writing one, round-trip a
-//! config through [`crate::harness::RunConfig::save_json`].
+//! config through [`crate::harness::save_run`].
 //!
 //! Swapping optimizers is a one-line manifest edit plus one match arm in
 //! [`crate::train::Trainer::new`] and [`crate::train::Trainer::optimizer_step`].
@@ -97,7 +97,7 @@ mod tests {
         // is a COMPLETE optimizer spec, not a patch. Same convention as
         // `LoopedConfig`/`TrainConfig`, and it means a checked-in manifest
         // fully determines the run. To get a block to edit, round-trip a
-        // complete config through `RunConfig::save_json`.
+        // complete config through `save_run`.
         let err = serde_json::from_str::<OptimConfig>(r#"{"kind":"muon","ns_steps":3}"#);
         assert!(err.is_err(), "partial optim block was silently accepted");
     }

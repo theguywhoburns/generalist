@@ -728,6 +728,32 @@ fn random_weight_control<B: AutodiffBackend>(
     (accs[0], accs[1])
 }
 
+/// Chance-level accuracy for the shuffle control's informativeness gate.
+///
+/// Taken as the **highest** per-task chance in the split, which is the
+/// conservative choice: a gate that is too easy to pass would let a
+/// barely-above-chance control masquerade as a real floor.
+///
+/// The score is the fraction of distinct byte symbols in the task's targets,
+/// so a task emitting `a`/`b`/`c` has chance 1/3. This is a proxy, not an
+/// exact uniform-over-outputs model — the Dyck and SCAN targets are not
+/// uniform over the alphabet they draw from — so it is used only as a bar to
+/// clear, never as a number to report.
+fn chance_level(instances: &[Instance]) -> f64 {
+    let mut per_task: std::collections::BTreeMap<&str, std::collections::BTreeSet<u8>> =
+        std::collections::BTreeMap::new();
+    for inst in instances {
+        per_task
+            .entry(inst.info.task)
+            .or_default()
+            .extend(inst.target.iter().copied());
+    }
+    per_task
+        .values()
+        .map(|symbols| 1.0 / symbols.len().max(1) as f64)
+        .fold(0.0f64, f64::max)
+}
+
 /// Space-joined 2dp rendering for eval summary vectors.
 fn fmt2(vals: &[f64]) -> String {
     vals.iter()
@@ -1090,8 +1116,13 @@ pub fn run_stage<B: AutodiffBackend>(
             watchdog.ping_step(run.train.steps);
         });
         let ctrl = crate::harness::shuffle_control::ShuffleControl::new(t, ts, c, cs);
-        println!("  shuffle control: {ctrl}");
-        log.push_str(&ctrl.to_json());
+        // Chance level has to come from the task, not be hardcoded: the
+        // control gate is only meaningful relative to how hard guessing is.
+        // Taken as the highest per-task chance across the eval split, which is
+        // the conservative (highest-bar) choice.
+        let chance = chance_level(&final_set);
+        println!("  shuffle control: {}", ctrl.summary(chance));
+        log.push_str(&ctrl.to_json(chance));
         log.push('\n');
     }
 
@@ -1735,6 +1766,95 @@ mod tests {
             assert_eq!(a.correct, b.correct);
             assert_eq!(a.copied, b.copied);
         }
+    }
+
+    /// The shuffle control's informativeness gate compares the control's
+    /// accuracy against a chance level. That level has to come from the
+    /// instances, not a constant, or the gate silently means different things
+    /// on different tasks.
+    #[test]
+    fn chance_level_is_derived_from_target_alphabet() {
+        use crate::tasks::{Instance, InstanceInfo, Track};
+        let mk = |task: &'static str, target: &[u8]| Instance {
+            prompt: b"q".to_vec(),
+            target: target.to_vec(),
+            info: InstanceInfo {
+                task,
+                stage: 0,
+                track: Track::A,
+                ..InstanceInfo::test_info()
+            },
+        };
+        // A task over a 3-symbol alphabet: chance 1/3.
+        let three = vec![
+            mk("subst-fst-fixed", b"a"),
+            mk("subst-fst-fixed", b"b"),
+            mk("subst-fst-fixed", b"c"),
+        ];
+        assert!((chance_level(&three) - 1.0 / 3.0).abs() < 1e-9);
+        // A target repeated across instances adds no new symbols.
+        let repeated = vec![
+            mk("subst-fst-fixed", b"a"),
+            mk("subst-fst-fixed", b"a"),
+            mk("subst-fst-fixed", b"c"),
+        ];
+        assert!((chance_level(&repeated) - 0.5).abs() < 1e-9);
+
+        // Mixed tasks: the MAXIMUM is taken, so the bar is the hardest task's
+        // chance rather than an average that could be gamed by easy tasks.
+        let mixed = vec![
+            mk("subst-fst-fixed", b"a"),
+            mk("subst-fst-fixed", b"b"),
+            mk("parity", b"0"),
+            mk("parity", b"1"),
+        ];
+        assert!(
+            (chance_level(&mixed) - 0.5).abs() < 1e-9,
+            "expected the max per-task chance (0.5), got {}",
+            chance_level(&mixed)
+        );
+
+        // A single-symbol target would divide by zero if unguarded.
+        let one = vec![mk("degenerate", b"a")];
+        assert_eq!(chance_level(&one), 1.0);
+
+        // Empty split must not panic.
+        assert_eq!(chance_level(&[]), 0.0);
+    }
+
+    /// End-to-end on the real degenerate case: the weights-only rung, where
+    /// the untrained control scores 0 in both orders. The run must emit a
+    /// `null` verdict rather than a confident `true`.
+    #[test]
+    fn degenerate_control_yields_unknown_not_a_false_verdict() {
+        let dir = std::env::temp_dir().join("generalist-shuffle-degenerate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut run = crate::harness::RunConfig::smoke();
+        run.train.steps = 2;
+        run.train.ckpt_every = 100;
+        run.train.eval_every = 1000;
+        run.train.eval_max_new = 2;
+        run.train.ckpt_dir = dir.display().to_string();
+        run.train.eval_holdout = 0.25;
+        run.train.shuffle_eval = true;
+
+        run_stage::<TestBackend>(&run, &test_device(), None, &[]);
+        let log = std::fs::read_to_string(dir.join("run.jsonl")).expect("log written");
+        let ctrl = log
+            .lines()
+            .find(|l| l.contains("\"shuffle-control\""))
+            .expect("shuffle-control record present");
+        let v: serde_json::Value = serde_json::from_str(ctrl).expect("valid JSON");
+        // The smoke model is 1 stage, so both orders are identical and the
+        // control sits at chance: the gate must close.
+        assert_eq!(v["control_order"], serde_json::json!(0.0));
+        assert_eq!(
+            v["roles_supported"],
+            serde_json::Value::Null,
+            "degenerate control emitted a verdict: {ctrl}"
+        );
+        assert_eq!(v["control_informative"], serde_json::json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

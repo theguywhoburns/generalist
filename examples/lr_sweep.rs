@@ -145,9 +145,11 @@ fn summarize(results: &[(f64, u64, f64)]) {
         return;
     }
     println!("\n=== held-out accuracy by lr_muon ===");
+    // Header written as a literal (not a format string) so the trailing
+    // column label is not parsed as an empty `{}` placeholder.
     println!(
-        "{:>10} {:>3} {:>7} {:>7} {:>7}  {}",
-        "lr", "n", "mean", "min", "max", "per-seed"
+        "{:>10} {:>3} {:>7} {:>7} {:>7}  per-seed",
+        "lr", "n", "mean", "min", "max"
     );
     let mut lrs: Vec<f64> = results.iter().map(|(lr, _, _)| *lr).collect();
     lrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
