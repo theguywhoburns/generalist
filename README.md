@@ -99,11 +99,24 @@ reproducing a pre-holdout number.
 Re-run all earlier stages after each new stage (forgetting check). Log halt
 depth per token position (syntax vs reasoning tokens), not just per task.
 
-One caveat on the role diagnostic: reversing stage order collapses accuracy
-by construction, because stages run sequentially and each one's readout feeds
-the next. Reversal reverses the data flow, so collapse is not by itself
-evidence of learned role specialization. A control (the same shuffle applied
-to an untrained model) is needed before reading it as specialization.
+**The stage-order shuffle needs a control.** Reversing stage order collapses
+accuracy *by construction*: stages run sequentially, so reversal reverses the
+data flow, and the same collapse appears for random weights. The collapse on
+its own is therefore not evidence of learned role specialization. So every run
+with `shuffle_eval` also evaluates an **untrained** model of the same
+architecture on the same split in both orders, and reports the *excess*
+collapse:
+
+```text
+  trained_order_acc - trained_shuffled_acc      (observed collapse)
+  control_order_acc - control_shuffled_acc      (floor: reversal alone)
+  excess = trained_gap - control_gap
+```
+
+Only an excess above 0.10 supports the "stages learned distinct roles"
+reading; near zero means the stages are order-interchangeable. The verdict
+goes to `run.jsonl` as a `shuffle-control` record carrying `roles_supported`,
+so a sweep can aggregate it without scraping stdout.
 
 Pre-registered bars: Track B (k≥2) exact-match ≥80%; 2× length ≥60%; schema
 validity ≥95%; missing-key false answers ≤5%; disjoint-style math within

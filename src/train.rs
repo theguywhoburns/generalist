@@ -623,15 +623,66 @@ pub fn eval_split(pool: &[Instance], per_cell: usize) -> Vec<Instance> {
 
 /// Final-eval passes: trained order always; reversed block order iff
 /// `shuffle` (role diagnostic). Eval-only; training never permutes.
-pub fn final_eval_passes(n_stages: usize, shuffle: bool) -> Vec<(String, Option<Vec<usize>>)> {
-    let mut passes = vec![("final".to_string(), None)];
+///
+/// `model_tag` distinguishes the trained model from the random-weight control
+/// in the log labels, so a sweep can never conflate the two.
+pub fn final_eval_passes(
+    n_stages: usize,
+    shuffle: bool,
+    model_tag: &str,
+) -> Vec<(String, Option<Vec<usize>>)> {
+    let mut passes = vec![(format!("final-{model_tag}"), None)];
     if shuffle {
         passes.push((
-            "final-shuffled".to_string(),
+            format!("final-{model_tag}-shuffled"),
             Some((0..n_stages).rev().collect()),
         ));
     }
     passes
+}
+
+/// Random-weight control for the stage-order diagnostic.
+///
+/// Returns `(order_acc, shuffled_acc)` for a freshly-initialized model of the
+/// same architecture and the same stop mode, on the same split.
+///
+/// Implemented as a second `Trainer` over new random weights rather than by
+/// hand-rolling a decode path: the control must differ from the trained run in
+/// exactly one respect, and reusing `Trainer::evaluate` guarantees it differs
+/// in nothing else — same chunking, same stop mode, same bucketing.
+fn random_weight_control<B: AutodiffBackend>(
+    run: &crate::harness::RunConfig,
+    set: &[Instance],
+    device: &B::Device,
+    log: &mut String,
+) -> (f64, f64) {
+    // Distinct seed so the control is uncorrelated with the trained model.
+    B::seed(device, run.train.seed ^ 0xA5A5_5A5A_DEAD_BEEF);
+    let control = Trainer::<B>::new(
+        &run.model, &run.optim, run.stop, &run.train, device,
+        None, // no checkpoint: untrained weights, by construction
+    );
+    let n_stages = control.model.stages.len();
+    let mut accs = Vec::new();
+    for (label, order) in final_eval_passes(n_stages, true, "control") {
+        let records = control.evaluate(set, run.train.eval_max_new, order.as_deref());
+        let s = crate::harness::summarize(&records);
+        println!(
+            "  eval [{label}-pool]: acc {:.3} copy {:.3} halt {:.2} bh [{}] (n={}) [untrained control]",
+            s.accuracy,
+            s.copy_rate,
+            s.mean_halt,
+            fmt2(&s.mean_block_halt),
+            s.n
+        );
+        log.push_str(&format!(
+            "{{\"eval\":\"{label}\",\"random_weights\":true,\"accuracy\":{:.6},\"n\":{}}}\n",
+            s.accuracy, s.n
+        ));
+        accs.push(s.accuracy);
+    }
+    B::memory_cleanup(device);
+    (accs[0], accs[1])
 }
 
 /// Space-joined 2dp rendering for eval summary vectors.
@@ -905,12 +956,18 @@ pub fn run_stage<B: AutodiffBackend>(
     last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, run.train.steps);
     trainer.save_checkpoint(Path::new(&last_ckpt));
     // Final eval, always (independent of the eval_every cadence): one
-    // authoritative read per run on the larger split, tagged "final" —
-    // plus a block-reversed repeat ("final-shuffled") iff `shuffle_eval`,
-    // the role diagnostic: if blocks learned roles, reversed order
-    // collapses accuracy.
+    // authoritative read per run on the larger split, plus a block-reversed
+    // repeat iff `shuffle_eval`.
+    //
+    // The reversal collapse is guaranteed by construction (stages are
+    // sequential, so reversal reverses the data flow), so the same two passes
+    // are ALSO run against an untrained model of the same architecture. Only
+    // the trained gap in excess of that control floor is evidence of learned
+    // role specialization — see `harness::shuffle_control`.
     let n_stages = trainer.model.stages.len();
-    for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval) {
+    let mut trained_order: Option<f64> = None;
+    let mut trained_shuffled: Option<f64> = None;
+    for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval, "trained") {
         let records = trainer.evaluate(&final_set, run.train.eval_max_new, order.as_deref());
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
@@ -947,8 +1004,10 @@ pub fn run_stage<B: AutodiffBackend>(
             }
         }
         // Pool-level summary: correlations and shares computed across the
-        // whole final set, where per-16-cell slices are variance-starved.
-        {
+        // whole final set, where per-16-cell slices are variance-starved. The
+        // pool accuracy is also what the shuffle control is read against, so
+        // it is captured rather than only printed.
+        let pool_acc = {
             let s = summarize(&records);
             let cor: Vec<String> = s
                 .block_halt_corr
@@ -966,8 +1025,24 @@ pub fn run_stage<B: AutodiffBackend>(
                 cor.join(" "),
                 s.n
             );
+            s.accuracy
+        };
+        if order.is_none() {
+            trained_order = Some(pool_acc);
+        } else {
+            trained_shuffled = Some(pool_acc);
         }
     }
+
+    // The role diagnostic, read against its floor.
+    if let (Some(t), Some(ts)) = (trained_order, trained_shuffled) {
+        let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log);
+        let ctrl = crate::harness::shuffle_control::ShuffleControl::new(t, ts, c, cs);
+        println!("  shuffle control: {ctrl}");
+        log.push_str(&ctrl.to_json());
+        log.push('\n');
+    }
+
     std::fs::write(&log_path, log).expect("write log");
     println!("wrote {log_path}; last ckpt {last_ckpt}");
     StageOutcome {
@@ -1723,14 +1798,19 @@ mod tests {
 
     #[test]
     fn final_eval_passes_gate_shuffle() {
-        let off = final_eval_passes(4, false);
+        let off = final_eval_passes(4, false, "trained");
         assert_eq!(off.len(), 1);
-        assert_eq!(off[0].0, "final");
+        assert_eq!(off[0].0, "final-trained");
         assert!(off[0].1.is_none());
-        let on = final_eval_passes(4, true);
+        let on = final_eval_passes(4, true, "trained");
         assert_eq!(on.len(), 2);
-        assert_eq!(on[1].0, "final-shuffled");
+        assert_eq!(on[1].0, "final-trained-shuffled");
         assert_eq!(on[1].1, Some(vec![3, 2, 1, 0]));
+        // The tag keeps the trained run and the random-weight control from
+        // colliding in a sweep's log.
+        let ctl = final_eval_passes(4, true, "control");
+        assert_eq!(ctl[0].0, "final-control");
+        assert_eq!(ctl[1].0, "final-control-shuffled");
     }
 
     #[test]
