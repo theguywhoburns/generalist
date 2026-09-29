@@ -359,6 +359,35 @@ impl<B: AutodiffBackend> Trainer<B> {
         chunk: usize,
         order: Option<&[usize]>,
     ) -> Vec<MetricRecord> {
+        self.evaluate_batched_inner(instances, max_new, chunk, order, None)
+    }
+
+    /// [`Self::evaluate`] that reports liveness during decode.
+    ///
+    /// Needed because eval is slow enough to trip the stall watchdog on its
+    /// own: the final eval runs four decode passes (trained order, shuffled,
+    /// and the same two for the random-weight control), and on a 3.5M-param
+    /// model that can exceed `stuck_timeout_secs` with no training step in
+    /// between to ping. A slow-but-progressing eval is indistinguishable from
+    /// a hang to a watchdog that only hears from the training loop.
+    pub fn evaluate_watched(
+        &self,
+        instances: &[Instance],
+        max_new: usize,
+        order: Option<&[usize]>,
+        progress: &dyn Fn(),
+    ) -> Vec<MetricRecord> {
+        self.evaluate_batched_inner(instances, max_new, 8, order, Some(progress))
+    }
+
+    fn evaluate_batched_inner(
+        &self,
+        instances: &[Instance],
+        max_new: usize,
+        chunk: usize,
+        order: Option<&[usize]>,
+        progress: Option<&dyn Fn()>,
+    ) -> Vec<MetricRecord> {
         let model = self.model.valid();
         let mut out = Vec::with_capacity(instances.len());
         for group in instances.chunks(chunk.max(1)) {
@@ -376,7 +405,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let t_worst = crate::harness::bucket_len(worst_row);
             let sub = (EVAL_BT_BUDGET / t_worst).clamp(1, group.len());
             for sub_group in group.chunks(sub) {
-                out.extend(self.decode_chunk(&model, sub_group, max_new, order));
+                out.extend(self.decode_chunk(&model, sub_group, max_new, order, progress));
             }
         }
         // Decode allocates a fresh shape family per chunk and per growing
@@ -392,6 +421,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         group: &[Instance],
         max_new: usize,
         order: Option<&[usize]>,
+        progress: Option<&dyn Fn()>,
     ) -> Vec<MetricRecord> {
         let g = group.len();
         let mut ids: Vec<Vec<i64>> = group.iter().map(|i| i.prompt_ids()).collect();
@@ -402,6 +432,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         let mut block_sums: Vec<f32> = vec![];
         let mut n_decode = 0usize;
         for _ in 0..max_new {
+            // Liveness ping before the forward: one decode step on a 3.5M
+            // model at T=512 can take seconds, and the final eval runs up to
+            // four passes with no training step between them to ping.
+            if let Some(p) = progress {
+                p();
+            }
             for (i, row) in ids.iter().enumerate() {
                 if active[i] && row.len() + 1 >= self.config.max_seq_len {
                     active[i] = false;
@@ -660,6 +696,7 @@ fn random_weight_control<B: AutodiffBackend>(
     set: &[Instance],
     device: &B::Device,
     log: &mut String,
+    progress: &dyn Fn(),
 ) -> (f64, f64) {
     // Distinct seed so the control is uncorrelated with the trained model.
     B::seed(device, run.train.seed ^ 0xA5A5_5A5A_DEAD_BEEF);
@@ -670,7 +707,8 @@ fn random_weight_control<B: AutodiffBackend>(
     let n_stages = control.model.stages.len();
     let mut accs = Vec::new();
     for (label, order) in final_eval_passes(n_stages, true, "control") {
-        let records = control.evaluate(set, run.train.eval_max_new, order.as_deref());
+        let records =
+            control.evaluate_watched(set, run.train.eval_max_new, order.as_deref(), progress);
         let s = crate::harness::summarize(&records);
         println!(
             "  eval [{label}-pool]: acc {:.3} copy {:.3} halt {:.2} bh [{}] (n={}) [untrained control]",
@@ -973,7 +1011,14 @@ pub fn run_stage<B: AutodiffBackend>(
     let mut trained_order: Option<f64> = None;
     let mut trained_shuffled: Option<f64> = None;
     for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval, "trained") {
-        let records = trainer.evaluate(&final_set, run.train.eval_max_new, order.as_deref());
+        let records = trainer.evaluate_watched(
+            &final_set,
+            run.train.eval_max_new,
+            order.as_deref(),
+            &|| {
+                watchdog.ping_step(run.train.steps);
+            },
+        );
         let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
             std::collections::BTreeMap::new();
         for r in &records {
@@ -1041,7 +1086,9 @@ pub fn run_stage<B: AutodiffBackend>(
 
     // The role diagnostic, read against its floor.
     if let (Some(t), Some(ts)) = (trained_order, trained_shuffled) {
-        let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log);
+        let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log, &|| {
+            watchdog.ping_step(run.train.steps);
+        });
         let ctrl = crate::harness::shuffle_control::ShuffleControl::new(t, ts, c, cs);
         println!("  shuffle control: {ctrl}");
         log.push_str(&ctrl.to_json());
