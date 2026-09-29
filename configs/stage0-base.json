@@ -33,7 +33,7 @@
   },
   "stop": { "kind": "act" },
   "train": {
-    "lr_muon": { "kind": "linear", "lr": 0.0005, "max_lr": 0.005, "warmup_steps": 100 },
+    "lr_muon": { "kind": "linear", "lr": 0.0002, "max_lr": 0.002, "warmup_steps": 100 },
     "lr_adamw": { "kind": "constant", "lr": 0.0003 },
     "batch_size": 6,
     "steps": 500,
