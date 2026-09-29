@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig, RotaryEncoding, RotaryEncodingConfig},
-    tensor::{Bool, Int, Tensor, backend::Backend},
+    tensor::{Bool, Tensor, backend::Backend},
 };
 
 /// Query-row tile for the chunked attention forward ([`MultiHeadAttention`]).
@@ -9,9 +9,9 @@ use burn::{
 /// split evenly; any remainder is handled by a smaller final chunk.
 pub const ATTN_QUERY_CHUNK: usize = 64;
 
-/// Unfused causal MHA with RoPE. Unfused Q/K/V keeps one `d x d` input
-/// covariance per matrix, which is what the Newton-Muon right-preconditioner
-/// expects (no packed-QKV block handling needed).
+/// Unfused causal MHA with RoPE. Q/K/V/O stay as four separate `Linear`s
+/// rather than one packed projection, for the same reason as the MLP: no
+/// packed-matrix special cases anywhere downstream.
 #[derive(Module, Debug)]
 pub struct MultiHeadAttention<B: Backend> {
     pub q: Linear<B>,
@@ -70,8 +70,7 @@ impl<B: Backend> MultiHeadAttention<B> {
     /// correct). Explicit math is portable and auditable; query chunking below
     /// keeps the transient `[B, H, C, T]` tiles small at 1M scale.
     ///
-    /// Memory design (no full-`T²` live set — see module docs in
-    /// `newton_muon.rs` for the analogous documented-deviation style):
+    /// Memory design (no full-`T²` live set):
     /// the query axis is tiled in blocks of [`ATTN_QUERY_CHUNK`] rows, so no
     /// `[B, H, T, T]` f32 buffer is ever fully live at once: each chunk only
     /// materializes `[B, H, C, T]` tiles (scores, bias add-out, softmax
@@ -117,32 +116,15 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let k_t = k.swap_dims(2, 3);
 
-        // Additive -1e30 bias, broadcastable: causal [1,1,T,T] plus an
-        // optional key-padding [B,1,1,T]. Blocked-by-either -> -1e30
-        // (both -> -2e30, still exactly 0 after exp), unblocked -> 0:
-        // identical softmax to the old expanded [B,H,T,T] keep-mask (~2x
-        // scores-sized tensors: the old full-size bools plus full-size
-        // float bias were the largest per-step tape entries and OOMed
-        // batch 6 on the first T=512 micro).
-        let qi = Tensor::<B, 1, Int>::arange(0..t as i64, &device).unsqueeze_dim::<2>(1);
-        let kj = Tensor::<B, 1, Int>::arange(0..t as i64, &device).unsqueeze_dim::<2>(0);
-        let causal_bias = kj
-            .lower_equal(qi)
-            .unsqueeze_dim::<3>(0)
-            .unsqueeze_dim::<4>(0)
-            .float()
-            .mul_scalar(-1.0)
-            .add_scalar(1.0)
-            .mul_scalar(-1e30);
-        let key_bias = key_pad.map(|pad| {
-            pad.bool_not()
-                .unsqueeze_dim::<3>(1)
-                .unsqueeze_dim::<4>(2)
-                .float()
-                .mul_scalar(-1.0)
-                .add_scalar(1.0)
-                .mul_scalar(-1e30)
-        });
+        // Additive -1e30 biases from model::masking (broadcastable): causal
+        // [1,1,T,T] plus an optional key-padding [B,1,1,T].
+        // Blocked-by-either -> -1e30 (both -> -2e30, still exactly 0 after
+        // exp), unblocked -> 0: identical softmax to the old expanded
+        // [B,H,T,T] keep-mask (~2x scores-sized tensors: the old full-size
+        // bools plus full-size float bias were the largest per-step tape
+        // entries and OOMed batch 6 on the first T=512 micro).
+        let causal_bias = super::masking::causal_bias(t, &device);
+        let key_bias = key_pad.map(super::masking::key_bias);
 
         // Query-chunked scored attention: per chunk the math is exactly the
         // unfused reference above (same bias values, same softmax over the
@@ -187,6 +169,7 @@ mod tests {
     use crate::model::pad_mask;
     use crate::test_backend::{TestBackend, test_device};
     use burn::tensor::TensorData;
+    use burn::tensor::Int;
 
     fn test_mha() -> MultiHeadAttention<TestBackend> {
         // Production head geometry: H=4, head_dim=64.

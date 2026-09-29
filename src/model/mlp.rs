@@ -5,8 +5,9 @@ use burn::{
 };
 
 /// SwiGLU MLP: `down(silu(gate(x)) * up(x))`. Separate gate/up/down linears
-/// (rather than fused) so each Newton-Muon group sees a single input dim:
-/// gate/up share the `mlp_in` (`d_model`) covariance, down uses `mlp_hidden`.
+/// rather than one fused gate_up matrix: keeps each a plain `Linear`, so
+/// parameter classification, Muon routing, and per-matrix shape-based LR
+/// adjustment all apply uniformly with no packed-matrix special cases.
 #[derive(Module, Debug)]
 pub struct SwiGluMlp<B: Backend> {
     pub gate: Linear<B>,
@@ -33,7 +34,7 @@ impl<B: Backend> SwiGluMlp<B> {
         self.down.forward(h)
     }
 
-    /// Down-projection input, for preconditioner input statistics.
+    /// The SwiGLU hidden state, i.e. the down-projection input.
     pub fn hidden(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         silu(self.gate.forward(x.clone())) * self.up.forward(x)
     }

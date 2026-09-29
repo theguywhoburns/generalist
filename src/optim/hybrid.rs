@@ -1,27 +1,25 @@
-//! Hybrid training glue: Muon/Newton-Muon for 2D hidden matrices,
-//! AdamW for everything else (embedding, norms, halt head, LM head).
+//! Gradient partitioning glue for the hybrid optimizer stack.
 //!
-//! Burn's `OptimizerAdaptor` skips parameters with no gradient in the passed
+//! Every optimizer variant in [`OptimConfig`](super::OptimConfig) wants the
+//! same partition: 2D hidden matrices go to the shape-aware optimizer, and
+//! embedding / LM head / norms / halt gates go to AdamW. That split is
+//! therefore expressed once, here, against the model's own semantic
+//! classification ([`crate::model::ParamKind`]) rather than per optimizer.
+//!
+//! Burn's `OptimizerAdaptor` skips parameters absent from the passed
 //! `GradientsParams`, so each adaptor steps only its own partition:
-//! 1. [`split_grads`] partitions by rank via the model's id set (all 2D
-//!    hidden matrices to Muon; embedding/head/halt-gate 2D excluded by the
-//!    Muon paper recipe — see `is_adamw_2d`);
-//! 2. [`precondition_grads`] applies the Newton-Muon right-preconditioner to
-//!    the Muon partition before the Muon step.
+//! 1. [`split_grads`] partitions by semantic class via the model's id set;
+//! 2. each adaptor is handed only the grads it owns.
 //!
 //! Training loop sketch (each adaptor steps only grads it receives):
 //! ```ignore
 //! let grads = GradientsParams::from_grads(backward, &model);
-//! let (muon_grads, adamw_grads) = split_grads::<B>(&model.muon_ids(), grads);
-//! nm.observe_stats(&stats);
-//! nm.maybe_refresh();
-//! let (muon_grads, leftover) = precondition_grads(&nm, &model.precond_roles(), muon_grads);
-//! assert!(leftover.is_empty());
-//! let model = muon_opt.step(lr_muon, model, muon_grads);
+//! let (hidden_grads, adamw_grads) = split_grads::<B>(&model.muon_ids(), grads);
+//! let model = muon_opt.step(lr_muon, model, hidden_grads);
 //! let model = adamw_opt.step(lr_adamw, model, adamw_grads);
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use burn::{
     module::ParamId,
@@ -29,43 +27,25 @@ use burn::{
     tensor::backend::AutodiffBackend,
 };
 
-use super::newton_muon::{NewtonMuon, PrecondInput};
-
-/// Split into (muon_2d_grads, rest). Missing ids are skipped.
+/// Split into (hidden-matrix grads, everything-else grads). Missing ids are
+/// skipped, so a parameter that received no gradient this step is simply not
+/// stepped.
 /// Ids are processed in sorted order so fused-kernel graphs are identical
 /// across steps (HashMap/HashSet iteration order is nondeterministic and
 /// would defeat the fusion cache).
 pub fn split_grads<B: AutodiffBackend>(
-    muon_ids: &HashSet<ParamId>,
+    hidden_ids: &HashSet<ParamId>,
     mut grads: GradientsParams,
 ) -> (GradientsParams, GradientsParams) {
-    let mut muon = GradientsParams::new();
-    let mut ids: Vec<ParamId> = muon_ids.iter().copied().collect();
+    let mut hidden = GradientsParams::new();
+    let mut ids: Vec<ParamId> = hidden_ids.iter().copied().collect();
     ids.sort();
     for id in ids {
         if let Some(g) = grads.remove::<B::InnerBackend, 2>(id) {
-            muon.register::<B::InnerBackend, 2>(id, g);
+            hidden.register::<B::InnerBackend, 2>(id, g);
         }
     }
-    (muon, grads)
-}
-
-/// Apply `inv @ G` per role. Returns (preconditioned, leftover-without-role).
-pub fn precondition_grads<B: AutodiffBackend>(
-    precond: &NewtonMuon<B::InnerBackend>,
-    roles: &HashMap<ParamId, PrecondInput>,
-    mut grads: GradientsParams,
-) -> (GradientsParams, GradientsParams) {
-    let mut out: GradientsParams = GradientsParams::new();
-    let mut ids: Vec<ParamId> = roles.keys().copied().collect();
-    ids.sort();
-    for id in ids {
-        let role = roles[&id];
-        if let Some(g) = grads.remove::<B::InnerBackend, 2>(id) {
-            out.register::<B::InnerBackend, 2>(id, precond.precondition(role, g));
-        }
-    }
-    (out, grads)
+    (hidden, grads)
 }
 
 /// Merge `next` into `acc` (elementwise add per param in `specs`).
@@ -102,4 +82,70 @@ pub fn merge_grads<B: AutodiffBackend>(
         }
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_backend::{TestBackend, test_device};
+    use burn::nn::{Linear, LinearConfig};
+    use burn::tensor::{Distribution, Tensor};
+
+    type IB = <TestBackend as AutodiffBackend>::InnerBackend;
+
+    fn linear() -> Linear<TestBackend> {
+        LinearConfig::new(4, 4)
+            .with_bias(false)
+            .init::<TestBackend>(&test_device())
+    }
+
+    fn grads_of(model: &Linear<TestBackend>) -> GradientsParams {
+        let x = Tensor::<TestBackend, 2>::random([2, 4], Distribution::Default, &test_device());
+        GradientsParams::from_grads(model.forward(x).sum().backward(), model)
+    }
+
+    #[test]
+    fn split_routes_hidden_ids_out_and_leaves_the_rest() {
+        let a = linear();
+        let mut hidden = HashSet::new();
+        hidden.insert(a.weight.id);
+        let (mut hidden_g, rest_g) = split_grads::<TestBackend>(&hidden, grads_of(&a));
+        // The listed id is consumed into the hidden partition...
+        assert!(hidden_g.remove::<IB, 2>(a.weight.id).is_some());
+        // ...and nothing is left behind in either bucket.
+        assert_eq!(hidden_g.len(), 0, "hidden partition leaked extras");
+        assert_eq!(rest_g.len(), 0, "rest partition should be empty");
+    }
+
+    #[test]
+    fn unlisted_ids_fall_through_to_the_rest() {
+        // The model in `grads_of` is not in `hidden`, so its grad must survive
+        // in the second partition untouched. This is the embedding/head path.
+        let a = linear();
+        let (hidden_g, mut rest_g) = split_grads::<TestBackend>(&HashSet::new(), grads_of(&a));
+        assert_eq!(hidden_g.len(), 0, "nothing should be routed as hidden");
+        assert!(rest_g.remove::<IB, 2>(a.weight.id).is_some());
+    }
+
+    #[test]
+    fn merge_sums_matching_specs_and_keeps_unmatched() {
+        let a = linear();
+        let b = linear();
+        let specs = vec![
+            ("a".to_string(), a.weight.id, 2usize),
+            ("b".to_string(), b.weight.id, 2),
+        ];
+        // acc has `a` only; next has `b` only. Merged must hold both.
+        let mut acc = GradientsParams::new();
+        if let Some(g) = grads_of(&a).remove::<IB, 2>(a.weight.id) {
+            acc.register::<IB, 2>(a.weight.id, g);
+        }
+        let mut next = GradientsParams::new();
+        if let Some(g) = grads_of(&b).remove::<IB, 2>(b.weight.id) {
+            next.register::<IB, 2>(b.weight.id, g);
+        }
+        let mut merged = merge_grads::<TestBackend>(&specs, acc, next);
+        assert!(merged.remove::<IB, 2>(a.weight.id).is_some());
+        assert!(merged.remove::<IB, 2>(b.weight.id).is_some());
+    }
 }

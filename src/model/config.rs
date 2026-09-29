@@ -13,6 +13,81 @@ pub enum StopMode {
     Converge,
 }
 
+/// Manifest-facing, internally tagged form of [`StopMode`].
+///
+/// [`StopMode`] is an enum the model dispatches on but which no run
+/// manifest could previously reach: training hardcoded `Act` in two places,
+/// so the comparison grid's `looped fixed {1,4,8,16}` and converge cells were
+/// unreachable without editing Rust. This is that choice, expressed in JSON:
+///
+/// ```json
+/// "stop": { "kind": "act" }
+/// "stop": { "kind": "fixed", "loops": 4 }
+/// "stop": { "kind": "converge" }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum StopConfig {
+    /// Graves-style ACT: learned per-token halting + ponder penalty.
+    Act,
+    /// Exactly `loops` applications of every stage. No halting head, no
+    /// ponder, and a constant `block_halts` — the compute-matched control.
+    Fixed {
+        /// Loop iterations. Must be >= 1; a large value is a depth sweep.
+        loops: usize,
+    },
+    /// Latent convergence: iterate until the relative state change stays
+    /// below `LoopedConfig::conv_tol` for `LoopedConfig::conv_patience`
+    /// steps. Step count is data-dependent, so cost is not constant.
+    Converge,
+}
+
+impl StopConfig {
+    /// The dispatch value the model takes. Fieldless: `Fixed`'s `loops` and
+    /// `Converge`'s tolerances are read back off `LoopedConfig`.
+    pub fn to_mode(self) -> StopMode {
+        match self {
+            StopConfig::Act => StopMode::Act,
+            StopConfig::Fixed { loops } => StopMode::Fixed { loops },
+            StopConfig::Converge => StopMode::Converge,
+        }
+    }
+
+    /// Cross-field checks that `LoopedConfig::assert_valid` cannot see.
+    /// Returns every problem, not just the first.
+    pub fn validate(&self, cfg: &LoopedConfig) -> Vec<String> {
+        let mut errs = Vec::new();
+        match *self {
+            StopConfig::Fixed { loops } => {
+                if loops == 0 {
+                    errs.push("stop: fixed loops must be >= 1".to_string());
+                } else if loops > cfg.max_loops {
+                    // Not fatal, but it silently exceeds the depth the rest of
+                    // the config (residual scale, RoPE, budget comments)
+                    // was sized for, so say so rather than let it pass.
+                    errs.push(format!(
+                        "stop: fixed loops {loops} exceeds model.max_loops {}; \
+                         residual_scale and the memory budget assume max_loops",
+                        cfg.max_loops
+                    ));
+                }
+            }
+            // ACT and Converge both read max_loops; the assert in
+            // `assert_valid` already covers `max_loops >= 1`.
+            StopConfig::Act | StopConfig::Converge => {}
+        }
+        errs
+    }
+}
+
+impl Default for StopConfig {
+    /// ACT is the headline configuration, so it is the default a manifest
+    /// gets by omitting the key entirely.
+    fn default() -> Self {
+        StopConfig::Act
+    }
+}
+
 /// Option-A base dimensions: `d_model = 256`, byte-level vocab.
 ///
 /// Param budget (untied LM head):

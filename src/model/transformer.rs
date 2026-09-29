@@ -1,24 +1,61 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use burn::{
     module::{Module, ParamId},
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
-    tensor::{Bool, Int, Tensor, TensorData, backend::{AutodiffBackend, Backend}},
+    tensor::{Int, Tensor, TensorData, backend::Backend},
 };
 
 use super::{
+    block::TransformerBlock,
     config::{LoopedConfig, StopMode},
     halting::HaltingHead,
-    rope::RopeTransformer,
+    masking::pad_mask,
 };
-use crate::optim::PrecondInput;
 
-/// 2D params the Muon paper recipe keeps on AdamW anyway: embedding and
-/// LM head (despite being 2D), plus halt-gate weights (single-output rows
-/// where orthogonalization buys nothing). New modules: name embedding-like
-/// or gate-like 2D params accordingly and routing follows automatically.
-fn is_adamw_2d(name: &str) -> bool {
-    name == "embed" || name == "head" || name.starts_with("halt_w")
+/// Semantic parameter class. The optimizer routes on (rank, kind) — never
+/// on name strings — so new modules classify themselves once in
+/// [`LoopedTransformer::param_specs`] and routing follows automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Token embedding (2D but AdamW per the Muon paper recipe).
+    Embedding,
+    /// Attention Q/K/V/O matrices (Muon).
+    Attention,
+    /// MLP gate/up matrices (Muon).
+    MlpIn,
+    /// MLP down matrix (Muon).
+    MlpDown,
+    /// Normalization scales (AdamW).
+    Norm,
+    /// Halting-gate weights (AdamW: thin rows, recipe exclusion).
+    Halt,
+    /// Untied LM head (2D but AdamW per recipe).
+    Output,
+}
+
+impl ParamKind {
+    /// Muon-routed classes: 2D hidden matrices with curvature worth
+    /// orthogonalizing. Everything else rides AdamW.
+    pub fn muon_routed(&self) -> bool {
+        matches!(self, ParamKind::Attention | ParamKind::MlpIn | ParamKind::MlpDown)
+    }
+}
+
+/// One parameter's identity: autodiff id, tensor rank, semantic class, and
+/// a display label (`q0`, `halt_w3`, ...) used only for logs and tests.
+#[derive(Debug, Clone)]
+pub struct ParamSpec {
+    pub id: ParamId,
+    pub rank: usize,
+    pub kind: ParamKind,
+    pub label: String,
+}
+
+impl ParamSpec {
+    pub fn new(id: ParamId, rank: usize, kind: ParamKind, label: String) -> Self {
+        Self { id, rank, kind, label }
+    }
 }
 
 /// Graves ACT halting threshold: a token halts once cumulative halt mass
@@ -38,25 +75,6 @@ pub struct LoopOutput<B: Backend> {
     pub block_halts: Vec<f32>,
 }
 
-/// Sufficient statistics for the Newton-Muon input covariances, summed over
-/// loop iterations: `attn`/`mlp` see `[N, d_model]` inputs, `down` sees
-/// `[N, ffn_hidden]`.
-pub struct StepStats<B: Backend> {
-    pub attn_xtx: Tensor<B, 2>,
-    pub attn_n: usize,
-    pub mlp_xtx: Tensor<B, 2>,
-    pub mlp_n: usize,
-    pub down_xtx: Tensor<B, 2>,
-    pub down_n: usize,
-}
-
-fn xtx_sum<B: Backend>(x: Tensor<B, 3>) -> (Tensor<B, 2>, usize) {
-    let [b, t, d] = x.dims();
-    let n = b * t;
-    let x2 = x.reshape([n, d]);
-    (x2.clone().transpose().matmul(x2), n)
-}
-
 /// One looped stage: a stack of `blocks_per_stage` encoder layers sharing
 /// a single halting gate. The stage iterates its whole stack to the gate's
 /// fixed point, then hands its readout to the next stage.
@@ -64,7 +82,7 @@ fn xtx_sum<B: Backend>(x: Tensor<B, 3>) -> (Tensor<B, 2>, usize) {
 /// blocks is global ACT over the stack (the ablation axis).
 #[derive(Module, Debug)]
 pub struct LoopedStage<B: Backend> {
-    pub blocks: Vec<RopeTransformer<B>>,
+    pub blocks: Vec<TransformerBlock<B>>,
     pub halt: HaltingHead<B>,
 }
 
@@ -76,7 +94,7 @@ impl<B: Backend> LoopedStage<B> {
         );
         Self {
             blocks: (0..config.blocks_per_stage)
-                .map(|_| RopeTransformer::new(config, device))
+                .map(|_| TransformerBlock::new(config, device))
                 .collect(),
             halt: HaltingHead::new(config.d_model, config.halt_bias_init, device),
         }
@@ -158,7 +176,7 @@ impl<B: Backend> LoopedTransformer<B> {
     ) -> LoopOutput<B> {
         match mode {
             StopMode::Fixed { loops } => self.forward_fixed(tokens, lengths, loops),
-            StopMode::Act => self.forward_act(tokens, config, false, lengths, order).0,
+            StopMode::Act => self.forward_act(tokens, config, lengths, order),
             StopMode::Converge => self.forward_converge(tokens, config, lengths),
         }
     }
@@ -190,9 +208,6 @@ impl<B: Backend> LoopedTransformer<B> {
 
     /// Graves-style ACT loop with per-token halting, copy-through freezing of
     /// halted states, and remainder-weighted trajectory readout.
-    /// Returns output plus input-covariance sufficient statistics when
-    /// `collect_stats` is set (training path; use `forward_act_with_stats`
-    /// on an autodiff backend to get detached inner-backend stats).
     /// `order` permutes stage execution (eval-only role diagnostic; `None` =
     /// trained order). `block_halts[i]` always refers to stage `i`, wherever
     /// it ran.
@@ -200,34 +215,16 @@ impl<B: Backend> LoopedTransformer<B> {
         &self,
         tokens: Tensor<B, 2, Int>,
         config: &LoopedConfig,
-        collect_stats: bool,
         lengths: &[usize],
         order: Option<&[usize]>,
-    ) -> (LoopOutput<B>, Option<StepStats<B>>) {
+    ) -> LoopOutput<B> {
         let device = tokens.device();
         let [b, t] = tokens.dims();
         let d = config.d_model;
         let key_pad = pad_mask(lengths, t, &device);
         let keep_f = key_pad.clone().bool_not().float();
-        let keep_d = keep_f
-            .clone()
-            .unsqueeze_dim::<3>(2)
-            .repeat_dim(2, d);
-        let keep_h = keep_f
-            .clone()
-            .unsqueeze_dim::<3>(2)
-            .repeat_dim(2, config.ffn_hidden);
-        let real_n: usize = lengths.iter().sum();
 
         let mut x = self.embed.forward(tokens);
-        let mut stats = collect_stats.then(|| StepStats {
-            attn_xtx: Tensor::zeros([d, d], &device),
-            attn_n: 0,
-            mlp_xtx: Tensor::zeros([d, d], &device),
-            mlp_n: 0,
-            down_xtx: Tensor::zeros([config.ffn_hidden, config.ffn_hidden], &device),
-            down_n: 0,
-        });
 
         let max = config.max_loops;
         let n = self.stages.len();
@@ -276,27 +273,10 @@ impl<B: Backend> LoopedTransformer<B> {
                     .bool_and(key_pad.clone().bool_not());
                 let still_f = still.clone().float();
 
-                // Single pass through the stage stack: this IS the forward;
-                // stats ride along per block.
+                // Single pass through the stage stack: this IS the forward.
                 let mut xs = x.clone();
                 for block in &stage.blocks {
-                    let (y, inp) = block.forward_split(xs, Some(key_pad.clone()));
-                    if collect_stats && let Some(st) = stats.as_mut() {
-                        // Detached: stats are consumed only as values (`.inner()`
-                        // in `forward_act_with_stats`); grads through this path
-                        // are unused. Cuts ~20MiB/iter of tracked matmul
-                        // retention, no math change.
-                        let (sum, _) = xtx_sum(inp.attn_in.detach() * keep_d.clone());
-                        st.attn_xtx = st.attn_xtx.clone() + sum;
-                        st.attn_n += real_n;
-                        let (sum, _) = xtx_sum(inp.mlp_in.detach() * keep_d.clone());
-                        st.mlp_xtx = st.mlp_xtx.clone() + sum;
-                        st.mlp_n += real_n;
-                        let (sum, _) = xtx_sum(inp.hidden.detach() * keep_h.clone());
-                        st.down_xtx = st.down_xtx.clone() + sum;
-                        st.down_n += real_n;
-                    }
-                    xs = y;
+                    xs = block.forward_masked(xs, Some(key_pad.clone()));
                 }
                 let x_new_full = xs;
                 // Freeze halted states so running tokens attend to stable keys/values.
@@ -354,16 +334,13 @@ impl<B: Backend> LoopedTransformer<B> {
         let ponder_mean = (total_ponder * keep_f.clone()).sum().div(denom.clone());
         let mean_halt = scalar_of(&(total_halt * keep_f).sum().div(denom));
         let logits = self.logits(x);
-        (
-            LoopOutput {
-                logits,
-                ponder: ponder_mean,
-                steps_used,
-                mean_halt,
-                block_halts,
-            },
-            stats,
-        )
+        LoopOutput {
+            logits,
+            ponder: ponder_mean,
+            steps_used,
+            mean_halt,
+            block_halts,
+        }
     }
 
     /// Latent-convergence loop (RD-VLA style): run until the relative state
@@ -410,103 +387,81 @@ impl<B: Backend> LoopedTransformer<B> {
         }
     }
 
-    /// 2D hidden-matrix ids routed to Muon/Newton-Muon, derived from
-    /// [`Self::grad_specs`] by rank — not by enumeration — so new block
-    /// types with 2D hidden matrices need zero optimizer changes.
-    /// Exclusions (Muon paper recipe + degeneracy): embedding and LM head
-    /// stay on AdamW despite being 2D; halt-gate weights are thin
-    /// single-output rows where orthogonalization buys nothing.
-    /// Everything else (norms, biases) is 1D and goes to AdamW.
+/// 2D hidden-matrix ids routed to Muon, derived from
+    /// [`Self::param_specs`] by semantic class — not by name strings and not
+    /// by enumeration — so new modules with classified 2D matrices need zero
+    /// optimizer changes. Muon paper recipe: embedding, LM head, norms,
+    /// and halt gates stay on AdamW.
     pub fn muon_ids(&self) -> HashSet<ParamId> {
-        self.grad_specs()
+        self.param_specs()
             .into_iter()
-            .filter(|(name, _, rank)| *rank == 2 && !is_adamw_2d(name))
-            .map(|(_, id, _)| id)
+            .filter(|s| s.rank == 2 && s.kind.muon_routed())
+            .map(|s| s.id)
             .collect()
     }
 
     /// Every float param with name and rank: the canonical id set for grad
     /// partitioning, accumulation merging, and coverage tests.
     /// Blocks are numbered flat across stages (`q0`, `q1`, ...); stage gates
-    /// are `halt_w{s}`/`halt_b{s}` per stage.
+    /// are `halt_w{s}`/`halt_b{s}` per stage. Labels are display-only; the
+    /// optimizer routes on [`ParamSpec::kind`], never on these strings.
     pub fn grad_specs(&self) -> Vec<(String, ParamId, usize)> {
-        let mut specs = vec![("embed".to_string(), self.embed.weight.id, 2)];
+        self.param_specs()
+            .into_iter()
+            .map(|s| (s.label, s.id, s.rank))
+            .collect()
+    }
+
+    /// Canonical parameter inventory: identity, rank, and semantic class.
+    /// Built once here; routing, merging, and tests all derive from it.
+    pub fn param_specs(&self) -> Vec<ParamSpec> {
+        use ParamKind::*;
+        let mut specs = vec![ParamSpec::new(
+            self.embed.weight.id,
+            2,
+            Embedding,
+            "embed".to_string(),
+        )];
         let mut i = 0usize;
         for (s, stage) in self.stages.iter().enumerate() {
             for b in &stage.blocks {
-                specs.extend(
-                    [
-                        (format!("q{i}"), b.attn.q.weight.id, 2),
-                        (format!("k{i}"), b.attn.k.weight.id, 2),
-                        (format!("v{i}"), b.attn.v.weight.id, 2),
-                        (format!("o{i}"), b.attn.o.weight.id, 2),
-                        (format!("gate{i}"), b.mlp.gate.weight.id, 2),
-                        (format!("up{i}"), b.mlp.up.weight.id, 2),
-                        (format!("down{i}"), b.mlp.down.weight.id, 2),
-                        (format!("norm1_{i}"), b.norm1.gamma.id, 1),
-                        (format!("norm2_{i}"), b.norm2.gamma.id, 1),
-                    ]
-                );
+                let attn = [
+                    (format!("q{i}"), b.attn.q.weight.id),
+                    (format!("k{i}"), b.attn.k.weight.id),
+                    (format!("v{i}"), b.attn.v.weight.id),
+                    (format!("o{i}"), b.attn.o.weight.id),
+                ];
+                for (label, id) in attn {
+                    specs.push(ParamSpec::new(id, 2, Attention, label));
+                }
+                let mlp_in = [
+                    (format!("gate{i}"), b.mlp.gate.weight.id),
+                    (format!("up{i}"), b.mlp.up.weight.id),
+                ];
+                for (label, id) in mlp_in {
+                    specs.push(ParamSpec::new(id, 2, MlpIn, label));
+                }
+                specs.push(ParamSpec::new(b.mlp.down.weight.id, 2, MlpDown, format!("down{i}")));
+                specs.push(ParamSpec::new(b.norm1.gamma.id, 1, Norm, format!("norm1_{i}")));
+                specs.push(ParamSpec::new(b.norm2.gamma.id, 1, Norm, format!("norm2_{i}")));
                 i += 1;
             }
-            specs.extend(
-                [
-                    (format!("halt_w{s}"), stage.halt.head.weight.id, 2),
-                    (format!("halt_b{s}"), stage.halt.head.bias.as_ref().unwrap().id, 1),
-                ]
-            );
+            specs.push(ParamSpec::new(
+                stage.halt.head.weight.id,
+                2,
+                Halt,
+                format!("halt_w{s}"),
+            ));
+            specs.push(ParamSpec::new(
+                stage.halt.head.bias.as_ref().unwrap().id,
+                1,
+                Halt,
+                format!("halt_b{s}"),
+            ));
         }
-        specs.extend(
-            [
-                ("norm_f".to_string(), self.norm_f.gamma.id, 1),
-                ("head".to_string(), self.head.weight.id, 2),
-            ]
-        );
+        specs.push(ParamSpec::new(self.norm_f.gamma.id, 1, Norm, "norm_f".to_string()));
+        specs.push(ParamSpec::new(self.head.weight.id, 2, Output, "head".to_string()));
         specs
-    }
-
-    /// Newton-Muon input group per hidden matrix.
-    pub fn precond_roles(&self) -> HashMap<ParamId, PrecondInput> {
-        self.stages
-            .iter()
-            .flat_map(|s| s.blocks.iter())
-            .flat_map(|b| {
-                [
-                    (b.attn.q.weight.id, PrecondInput::AttnIn),
-                    (b.attn.k.weight.id, PrecondInput::AttnIn),
-                    (b.attn.v.weight.id, PrecondInput::AttnIn),
-                    (b.attn.o.weight.id, PrecondInput::AttnIn),
-                    (b.mlp.gate.weight.id, PrecondInput::MlpIn),
-                    (b.mlp.up.weight.id, PrecondInput::MlpIn),
-                    (b.mlp.down.weight.id, PrecondInput::MlpHidden),
-                ]
-            })
-            .collect()
-    }
-}
-
-impl<B: AutodiffBackend> LoopedTransformer<B> {
-    /// Training path: ACT forward plus detached inner-backend input stats for
-    /// the Newton-Muon preconditioner.
-    pub fn forward_act_with_stats(
-        &self,
-        tokens: Tensor<B, 2, Int>,
-        config: &LoopedConfig,
-        lengths: &[usize],
-    ) -> (LoopOutput<B>, StepStats<B::InnerBackend>) {
-        let (out, stats) = self.forward_act(tokens, config, true, lengths, None);
-        let s = stats.expect("collect_stats=true must return stats");
-        (
-            out,
-            StepStats {
-                attn_xtx: s.attn_xtx.inner(),
-                attn_n: s.attn_n,
-                mlp_xtx: s.mlp_xtx.inner(),
-                mlp_n: s.mlp_n,
-                down_xtx: s.down_xtx.inner(),
-                down_n: s.down_n,
-            },
-        )
     }
 }
 
@@ -550,28 +505,6 @@ fn scored_bounds(data: &TensorData) -> (usize, usize) {
     }
     assert!(hi > lo, "loss mask scores no positions");
     (lo, hi)
-}
-
-/// Key-padding mask `[B, T]` (`true` = pad, blocked from attention).
-/// Bytes 0x00 (PAD) and 0x01 (EOS) are reserved; task alphabets never
-/// contain them, so pad positions are unambiguous.
-/// `lens.lower_equal(pos)` is true exactly on pads (`len <= pos`); position
-/// 0 stays open so a fully-padded row never softmaxes over an empty set
-/// (NaN would poison shared-weight gradients).
-pub fn pad_mask<B: Backend>(lengths: &[usize], t: usize, device: &B::Device) -> Tensor<B, 2, Bool> {
-    let b = lengths.len();
-    let pos = Tensor::<B, 1, Int>::arange(0..t as i64, device)
-        .unsqueeze_dim::<2>(0)
-        .repeat_dim(0, b);
-    let data: Vec<i64> = lengths.iter().map(|l| *l as i64).collect();
-    let lens = Tensor::<B, 1, Int>::from_data(TensorData::new(data, [b]), device)
-        .unsqueeze_dim::<2>(1)
-        .repeat_dim(1, t);
-    let first = Tensor::<B, 1, Int>::arange(0..t as i64, device)
-        .lower_equal_elem(0)
-        .unsqueeze_dim::<2>(0)
-        .repeat_dim(0, b);
-    lens.lower_equal(pos).bool_and(first.bool_not())
 }
 
 /// Causal LM loss with ponder penalty: `CE + ponder_weight * ponder`.
@@ -758,13 +691,11 @@ mod tests {
     fn act_forward_ponder_bounded() {
         let cfg = tiny_config();
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let (out, stats) = model.forward_act(tokens(), &cfg, true, &lengths(), None);
+        let out = model.forward_act(tokens(), &cfg, &lengths(), None);
         assert_eq!(out.logits.dims(), [2, 4, 256]);
         assert!(out.steps_used <= 4);
         let p = scalar_of(&out.ponder);
         assert!((0.0..=5.0).contains(&p), "ponder {p} out of range");
-        let s = stats.unwrap();
-        assert!(s.attn_n > 0 && s.down_n > 0);
         // graph is trainable
         let loss = lm_loss(out.logits, tokens(), full_mask(), out.ponder, cfg.ponder_weight);
         let _grads = loss.backward();
@@ -778,7 +709,7 @@ mod tests {
             model.stages[0].halt.head.weight.id,
             model.stages[1].halt.head.weight.id
         );
-        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
+        let out = model.forward_act(tokens(), &cfg, &lengths(), None);
         assert_eq!(out.block_halts.len(), 2);
         // Total halt is the sum over blocks (where-compute accounting).
         let sum: f32 = out.block_halts.iter().sum();
@@ -794,8 +725,8 @@ mod tests {
     fn identity_order_matches_default_bitwise() {
         let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let (a, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
-        let (b, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0, 1]));
+        let a = model.forward_act(tokens(), &cfg, &lengths(), None);
+        let b = model.forward_act(tokens(), &cfg, &lengths(), Some(&[0, 1]));
         let va = a.logits.into_data().as_slice::<f32>().unwrap().to_vec();
         let vb = b.logits.into_data().as_slice::<f32>().unwrap().to_vec();
         assert_eq!(va, vb);
@@ -806,7 +737,7 @@ mod tests {
     fn reversed_order_runs_with_block_indexed_halts() {
         let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[1, 0]));
+        let out = model.forward_act(tokens(), &cfg, &lengths(), Some(&[1, 0]));
         assert_eq!(out.logits.dims(), [2, 4, 256]);
         // bh[i] still refers to block i, wherever it executed.
         assert_eq!(out.block_halts.len(), 2);
@@ -819,7 +750,7 @@ mod tests {
     fn short_order_panics() {
         let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
-        let _ = model.forward_act(tokens(), &cfg, false, &lengths(), Some(&[0]));
+        let _ = model.forward_act(tokens(), &cfg, &lengths(), Some(&[0]));
     }
 
     #[test]
@@ -842,7 +773,7 @@ mod tests {
         assert_eq!(model.stages[0].blocks.len(), 2);
         assert_eq!(model.muon_ids().len(), 14);
         assert_eq!(model.grad_specs().len(), 3 + 9 * 2 + 2);
-        let (out, _) = model.forward_act(tokens(), &cfg, false, &lengths(), None);
+        let out = model.forward_act(tokens(), &cfg, &lengths(), None);
         assert_eq!(out.block_halts.len(), 1);
         assert_eq!(out.logits.dims(), [2, 4, 256]);
     }
@@ -911,22 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn pad_mask_values_are_correct() {
-        // true = pad (blocked). Row len 0 keeps position 0 open (NaN guard).
-        let device = test_device();
-        let m = pad_mask::<TestBackend>(&[4, 0, 2], 4, &device);
-        let v = m.float().into_data().as_slice::<f32>().unwrap().to_vec();
-        assert_eq!(
-            v,
-            vec![
-                0., 0., 0., 0., //
-                0., 1., 1., 1., //
-                0., 0., 1., 1.,
-            ]
-        );
-    }
-
-    #[test]
     fn slice_selects_exact_values() {
         // Value-level (not shape-level): scored_slice and decode argmax
         // both depend on multi-dim slice returning the right elements.
@@ -965,39 +880,39 @@ mod tests {
 
     #[test]
     fn muon_ids_cover_seven_matrices() {
+        // One block: q,k,v,o,gate,up,down. Nothing else is hidden-matrix class.
         let cfg = tiny_config();
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         assert_eq!(model.muon_ids().len(), 7);
-        assert_eq!(model.precond_roles().len(), 7);
     }
 
     #[test]
     fn muon_routing_is_rank_based_with_recipe_exclusions() {
-        // 2 blocks: 14 hidden matrices on Muon; embed/head/halt (2D but
-        // excluded) plus all 1D params on AdamW. Behavior must equal the
-        // old explicit enumeration exactly.
+        // 2 stages: 14 hidden matrices on Muon; embed/head/halt/norm classes
+        // on AdamW. Verified by class, never by name strings.
+        use super::ParamKind;
         let cfg = LoopedConfig::base_1m().with_n_stages(2);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &test_device());
         let muon = model.muon_ids();
         assert_eq!(muon.len(), 14);
-        let specs = model.grad_specs();
-        let names: std::collections::HashMap<ParamId, String> =
-            specs.into_iter().map(|(n, id, _)| (id, n)).collect();
-        for id in &muon {
-            let n = &names[id];
-            assert!(
-                !is_adamw_2d(n),
-                "Muon-routed param should be a hidden matrix, got {n}"
+        for s in model.param_specs() {
+            let routed = muon.contains(&s.id);
+            assert_eq!(
+                routed,
+                s.rank == 2 && s.kind.muon_routed(),
+                "misrouted {} (rank {}, kind {:?})",
+                s.label,
+                s.rank,
+                s.kind
             );
         }
-        // Spot-check the exclusion side: embed, head, halt gates excluded.
-        for (n, id, _) in model.grad_specs() {
-            if is_adamw_2d(&n) {
-                assert!(!muon.contains(&id), "{n} must stay on AdamW");
-            }
-        }
-        assert!(is_adamw_2d("embed") && is_adamw_2d("head") && is_adamw_2d("halt_w3"));
-        assert!(!is_adamw_2d("q0") && !is_adamw_2d("down1"));
+        // Spot-check the recipe side directly on classes: embedding and LM
+        // head are 2D but stay on AdamW, as do norms and the halt gates.
+        assert!(!ParamKind::Embedding.muon_routed());
+        assert!(!ParamKind::Output.muon_routed());
+        assert!(!ParamKind::Halt.muon_routed());
+        assert!(!ParamKind::Norm.muon_routed());
+        assert!(ParamKind::Attention.muon_routed() && ParamKind::MlpDown.muon_routed());
     }
 
     #[test]

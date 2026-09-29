@@ -1,13 +1,15 @@
 pub mod attention;
 pub mod config;
 pub mod halting;
+pub mod masking;
 pub mod mlp;
-pub mod rope;
+pub mod block;
 pub mod transformer;
 
 pub use attention::MultiHeadAttention;
-pub use config::{LoopedConfig, StopMode};
+pub use config::{LoopedConfig, StopConfig, StopMode};
 pub use halting::HaltingHead;
+pub use masking::{causal_bias, key_bias, pad_mask};
 pub use mlp::SwiGluMlp;
-pub use rope::RopeTransformer;
-pub use transformer::{LoopOutput, LoopedStage, LoopedTransformer, StepStats, ce_split, lm_loss, pad_mask};
+pub use block::TransformerBlock;
+pub use transformer::{LoopOutput, LoopedStage, LoopedTransformer, ParamKind, ParamSpec, ce_split, lm_loss};
