@@ -1,9 +1,33 @@
 {
+  "_comment": [
+    "Curriculum chain. Each stage extends the previous one's weights via",
+    "init_from: $prev, and every earlier split is re-evaluated after each stage",
+    "so forgetting shows up as a drop in a 'previous-N' eval row.",
+    "",
+    "Stages are listed in the order they should run; a manifest's own",
+    "experiments are validated when the plan loads, so a typo in stage 3 fails",
+    "before stage 1 trains."
+  ],
   "experiments": [
     {
-      "name": "s0-parity",
-      "manifest": "configs/smoke-tiny.json",
+      "name": "s0-substrate",
+      "manifest": "stage0-fixed.json",
       "init_from": null
+    },
+    {
+      "name": "s0-maponly",
+      "manifest": "stage0-maponly.json",
+      "init_from": "$prev"
+    },
+    {
+      "name": "s0-oracle",
+      "manifest": "stage0-oracle.json",
+      "init_from": "$prev"
+    },
+    {
+      "name": "s0-icl",
+      "manifest": "stage0-4block.json",
+      "init_from": "$prev"
     }
   ]
 }

@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "Compute-matched control for the ACT headline: identical data, fixed depth",
+    "instead of learned halting. If ACT beats this, the extra compute was spent",
+    "adaptively; if they match, the depth was never being used.",
+    "ponder_weight is 0: without a learned stop there is no step count to penalize."
+  ],
+  "extends": "stage0-base.json",
+  "stop": { "kind": "fixed", "loops": 4 },
+  "model": { "ponder_weight": 0.0 },
+  "train": { "ckpt_dir": "checkpoints-fixed4" }
+}

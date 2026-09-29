@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Base manifest for Stage 0. Every stage0-*.json extends this, so the model,",
+    "optimizer, and training recipe are written once and a variation costs only",
+    "its difference. This file is itself a valid, runnable manifest: the 4 stages",
+    "in the comparison grid differ only in tasks, k distribution, and stop mode.",
+    "",
+    "Do not edit the child manifests to change shared settings - edit this file."
+  ],
+  "model": {
+    "vocab_size": 256,
+    "d_model": 256,
+    "n_heads": 4,
+    "head_dim": 64,
+    "ffn_hidden": 768,
+    "max_loops": 8,
+    "ponder_weight": 0.001,
+    "halt_bias_init": -3.0,
+    "conv_tol": 0.001,
+    "conv_patience": 2,
+    "max_seq_len": 512,
+    "n_stages": 4,
+    "blocks_per_stage": 1
+  },
+  "optim": {
+    "kind": "muon",
+    "momentum": 0.95,
+    "dampening": 0.0,
+    "nesterov": true,
+    "ns_steps": 5,
+    "adjust_lr_fn": "Original",
+    "weight_decay": 0.0
+  },
+  "stop": { "kind": "act" },
+  "train": {
+    "lr_muon": { "kind": "linear", "lr": 0.0005, "max_lr": 0.005, "warmup_steps": 100 },
+    "lr_adamw": { "kind": "constant", "lr": 0.0003 },
+    "batch_size": 6,
+    "steps": 500,
+    "log_every": 50,
+    "eval_every": 200,
+    "ckpt_every": 100,
+    "eval_max_new": 64,
+    "seed": 0,
+    "ckpt_dir": "checkpoints-stage0",
+    "stuck_timeout_secs": 900,
+    "eval_start_step": 0,
+    "accum_steps": 2,
+    "free_schedule": [1.0, 0.5, 0.2],
+    "ponder_warmup_steps": 0,
+    "shuffle_eval": true
+  },
+  "experiment": {
+    "tasks": ["parity", "dyck1", "subst-fst", "periodic", "copy-rev-rep", "scan-tiny"],
+    "tracks": ["A", "B"],
+    "per_cell": 256,
+    "seeds": [0, 1, 2],
+    "protocol": {
+      "k_set": [0, 1, 2, 3, 5, 8],
+      "k0_rate": 0.15,
+      "corrupt_rate": 0.05,
+      "seps": ["->", ":", "=", "|"]
+    }
+  }
+}

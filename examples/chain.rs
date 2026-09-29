@@ -4,8 +4,8 @@
 //! each run (forgetting checks).
 
 use generalist::{
-    harness::{ExperimentPlan, RunConfig, generate},
-    tasks::{Instance, TaskRegistry},
+    harness::{ExperimentPlan, load_chain},
+    tasks::Instance,
     train::{eval_split, run_stage},
 };
 
@@ -16,13 +16,16 @@ fn main() {
         "usage: cargo run --example chain -- configs/chain.json [gpu]",
     );
     let gpu = args.iter().any(|a| a == "gpu");
-    let plan = ExperimentPlan::load_json(std::path::Path::new(path)).expect("load plan");
+    // Every manifest in the plan is resolved, merged and validated up front:
+    // a typo in stage 4 must not surface after stage 3 has trained.
+    let (plan, runs) = load_chain(std::path::Path::new(path))
+        .unwrap_or_else(|e| panic!("load chain:\n{e}"));
     if gpu {
         #[cfg(feature = "cuda")]
         {
             use burn::backend::{Autodiff, Cuda, cuda::CudaDevice};
             println!("backend: CUDA (fused)");
-            run_chain::<Autodiff<Cuda>>(plan, &CudaDevice::default());
+            run_chain::<Autodiff<Cuda>>(plan, runs, &CudaDevice::default());
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -32,27 +35,32 @@ fn main() {
         println!("backend: NdArray (CPU)");
         run_chain::<burn::backend::Autodiff<burn::backend::NdArray>>(
             plan,
+            runs,
             &Default::default(),
         );
     }
 }
 
-fn run_chain<B: burn::tensor::backend::AutodiffBackend>(plan: ExperimentPlan, device: &B::Device) {
-    let registry = TaskRegistry::builtin();
+fn run_chain<B: burn::tensor::backend::AutodiffBackend>(
+    plan: ExperimentPlan,
+    runs: Vec<(String, generalist::harness::RunConfig)>,
+    device: &B::Device,
+) {
     // Retained eval pools for forgetting checks: (experiment name, split).
     let mut retained: Vec<(String, Vec<Instance>)> = vec![];
     let mut prev_ckpt: Option<String> = None;
 
-    for exp in &plan.experiments {
-        println!("=== experiment {} ({}) ===", exp.name, exp.manifest);
-        let run = RunConfig::load_json(std::path::Path::new(&exp.manifest))
-            .unwrap_or_else(|e| panic!("load {}: {e}", exp.manifest));
+    for ((name, run), exp) in runs.into_iter().zip(&plan.experiments) {
+        println!("=== experiment {} ({}) ===", name, exp.manifest);
         let init: Option<String> = match exp.init_from.as_deref() {
             None => None,
-            Some("$prev") => prev_ckpt.clone(),
+            Some(ExperimentPlan::PREV) => prev_ckpt.clone(),
             Some(p) => Some(p.to_string()),
         };
-        let pool = generate(&run.experiment, &registry);
+        let pool = generalist::harness::generate(
+            &run.experiment,
+            &generalist::tasks::TaskRegistry::builtin(),
+        );
         let eval_here = eval_split(&pool, 16);
         let outcome = run_stage::<B>(
             &run,
@@ -60,7 +68,7 @@ fn run_chain<B: burn::tensor::backend::AutodiffBackend>(plan: ExperimentPlan, de
             init.as_deref().map(std::path::Path::new),
             &retained,
         );
-        retained.push((exp.name.clone(), eval_here));
+        retained.push((name, eval_here));
         prev_ckpt = Some(outcome.last_ckpt);
     }
     println!("chain done; {} experiments", plan.experiments.len());

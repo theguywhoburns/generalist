@@ -1,0 +1,11 @@
+{
+  "_comment": [
+    "Converge-halt control: iterate until the relative latent change stays under",
+    "conv_tol for conv_patience steps. Convergence-halts while ACT-fails isolates",
+    "the halting head as the failure rather than recurrence."
+  ],
+  "extends": "stage0-base.json",
+  "stop": { "kind": "converge" },
+  "model": { "ponder_weight": 0.0 },
+  "train": { "ckpt_dir": "checkpoints-converge" }
+}

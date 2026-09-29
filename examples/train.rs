@@ -1,9 +1,9 @@
 //! Manifest-driven training: `cargo run --example train -- configs/<run>.json [gpu]`
-//! Single manifest; for chained stages see the `curriculum` example.
+//! Single manifest; for chained stages see the `chain` example.
 //! The manifest path is required: silently defaulting could launch a long
 //! run on the wrong config.
 
-use generalist::{harness::RunConfig, train::run_stage};
+use generalist::{harness::load_run, train::run_stage};
 
 fn main() {
     generalist::fail_fast::install();
@@ -12,7 +12,8 @@ fn main() {
         "usage: cargo run --example train -- configs/<run>.json [gpu]",
     );
     let gpu = args.iter().any(|a| a == "gpu");
-    let run = RunConfig::load_json(std::path::Path::new(path)).expect("load manifest");
+    let run = load_run(std::path::Path::new(path))
+        .unwrap_or_else(|e| panic!("load manifest:\n{e}"));
     if gpu {
         #[cfg(feature = "cuda")]
         {

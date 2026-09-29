@@ -1,7 +1,7 @@
 # Generalist
 
-1M-parameter looped byte-level transformer (`src/model`) + Newton–Muonn optimizer
-reimplementation (`src/optim`). Research vehicle for one question:
+1M-parameter looped byte-level transformer (`src/model`) + stock Muon/AdamW
+hybrid optimizer (`src/optim`). Research vehicle for one question:
 
 **Given a few in-context examples, can transformers (and their looped
 counterparts) actually generalize?**
@@ -79,6 +79,11 @@ Looped+ACT (headline) × looped fixed {1,4,8,16} × param-matched non-looped ×
 compute-matched non-looped (≈L× params, L = measured mean halt, trained
 post-hoc) × blocks {1,2,4}. ≥3 seeds per cell.
 
+The stop-mode half of this grid is manifest-reachable via the `stop` key —
+`configs/stage0-4block.json` (act) and `configs/stage0-fixed4.json` (fixed ×4)
+differ only in that one key, and `configs/stage0-converge.json` covers the
+convergence control. The non-looped columns are not implemented.
+
 ## Eval
 
 Held-out only: unseen rules, 2× length, novel symbols, noisy context.
@@ -104,14 +109,44 @@ Natural language, scale.
 
 ## Layout
 
-- `src/model/` — looped transformer (config, attention, MLP, block, halting, model)
-- `src/optim/` — Newton–Muon preconditioner + hybrid Muon/AdamW training glue
+- `src/model/` — looped transformer (config, attention, MLP, block, halting, masking, model)
+- `src/optim/` — stock Muon (burn), LR schedules, hybrid Muon/AdamW partitioning
 - `src/tasks/` — harness core (registry, demo protocol, seeded RNG) + Stage-0 tasks
-- `src/harness/` — experiment dispatch, batch collator, JSONL metrics, run manifests
-- `src/train.rs` — manifest-driven training loop (ACT + Newton–Muon, eval, checkpoints)
+- `src/harness/` — experiment dispatch, batch collator, JSONL metrics, manifest loader
+- `src/train.rs` — manifest-driven training loop (ACT + Muon/AdamW, eval, checkpoints)
 - `src/test_backend.rs` — single swap point for the test-suite backend
-- `examples/profile.rs` — CPU micro-profile
-- `examples/run.rs` — manifest dispatch dry-run
+- `examples/run.rs` — manifest load + validate + dispatch dry-run
 - `examples/train.rs` — single-manifest training runner
 - `examples/chain.rs` — chained experiments with checkpoint dependencies + forgetting evals
 - `configs/` — run manifests + chains (JSON, no recompile to tweak)
+
+## Config loader
+
+A run manifest is a complete spec in one JSON file, loaded in four stages
+(`src/harness/config.rs`): resolve the `extends` chain, deep-merge, parse,
+validate. Each stage has its own error type, so a missing file, malformed
+JSON, and a schema mismatch are distinguishable — and validation reports
+**every** problem at once, before any pool is generated or weights touched.
+
+`extends` makes a variation cost only its difference. Merge is recursive for
+objects; **arrays replace wholesale**, so `k_set: [0]` genuinely narrows the
+set rather than unioning with an inherited `[0,1,2,3,5,8]`.
+
+```json
+{ "extends": "stage0-base.json",
+  "experiment": { "tasks": ["subst-fst-oracle"] },
+  "train": { "ckpt_dir": "checkpoints-oracle" } }
+```
+
+Variations are internally tagged enums, so each is a manifest edit:
+
+| key | variants |
+|---|---|
+| `optim` | `{"kind": "muon", ...}` |
+| `stop` | `{"kind": "act"}` · `{"kind": "fixed", "loops": 4}` · `{"kind": "converge"}` |
+| `train.lr_muon` / `lr_adamw` | `{"kind": "constant", "lr": …}` · `linear` (warmup) · `cosine` · `step` |
+
+`stop` is the grid axis: `act` is the headline, `fixed` the compute-matched
+control, `converge` the convergence control. Omit the key for ACT.
+`save_run` writes a standalone manifest (no `extends`), which is the way to
+turn a resolved config into an editable starting point.

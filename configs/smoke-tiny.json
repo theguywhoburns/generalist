@@ -1,4 +1,10 @@
 {
+  "_comment": [
+    "CPU smoke test: tiny model, tiny pool, 60 steps. Exercises the full path",
+    "(generate -> train -> eval -> checkpoint) in seconds on one core. Not a",
+    "tuning run; no result from it is meaningful. Constant LRs on purpose -",
+    "a schedule over 60 steps is noise."
+  ],
   "model": {
     "vocab_size": 256,
     "d_model": 32,
@@ -15,16 +21,18 @@
     "blocks_per_stage": 1
   },
   "optim": {
-    "precond_ewma": 0.95,
-    "refresh_every": 32,
-    "ridge_mult": 0.2,
-    "eps": 1e-8,
-    "init_diag": 0.001,
-    "ns_steps": 5
+    "kind": "muon",
+    "momentum": 0.95,
+    "dampening": 0.0,
+    "nesterov": true,
+    "ns_steps": 5,
+    "adjust_lr_fn": "Original",
+    "weight_decay": 0.0
   },
+  "stop": { "kind": "act" },
   "train": {
-    "lr_muon": 0.002,
-    "lr_adamw": 0.001,
+    "lr_muon": { "kind": "constant", "lr": 0.005 },
+    "lr_adamw": { "kind": "constant", "lr": 0.001 },
     "batch_size": 8,
     "steps": 60,
     "log_every": 10,

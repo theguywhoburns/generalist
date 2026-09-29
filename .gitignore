@@ -3,3 +3,10 @@
 .direnv/
 checkpoints*/
 *.mpk
+
+# Run archives. These are multi-hundred-MB zip exports of checkpoints + logs:
+# never commit them, and never let `git add .` stage one.
+*.zip
+
+# Agent scratch notes (external tool state, not project source).
+.workbuddy-ai/

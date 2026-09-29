@@ -1,26 +1,23 @@
 //! Dispatch dry-run: `cargo run --example run -- configs/<run>.json`
-//! Loads the manifest, generates the pool, prints cell counts and one sample.
-//! No training, no GPU. The manifest path is required.
+//! Loads and validates the manifest, generates the pool, prints cell counts
+//! and one sample. No training, no GPU. The manifest path is required.
 
 use generalist::{
-    harness::{RunConfig, generate},
+    harness::{RunConfig, generate, load_run},
     tasks::TaskRegistry,
 };
 
 fn main() {
+    generalist::fail_fast::install();
     let path = std::env::args()
         .nth(1)
         .expect("usage: cargo run --example run -- configs/<run>.json");
-    let run =
-        RunConfig::load_json(std::path::Path::new(&path)).expect("load run manifest");
-    println!(
-        "model params: {} | muon lr: {} | adamw lr: {} | batch: {} | steps: {}",
-        run.model.param_count(),
-        run.train.lr_muon,
-        run.train.lr_adamw,
-        run.train.batch_size,
-        run.train.steps,
-    );
+    // `extends` is resolved, merged and validated here; a bad manifest fails
+    // with every problem listed, before any pool or model exists.
+    let run = load_run(std::path::Path::new(&path))
+        .unwrap_or_else(|e| panic!("load run manifest:\n{e}"));
+    println!("{} | batch {} | steps {}", run.summary(), run.train.batch_size, run.train.steps);
+    println!("muon lr: {:?} | adamw lr: {:?}", run.train.lr_muon, run.train.lr_adamw);
     let registry = TaskRegistry::builtin();
     let pool = generate(&run.experiment, &registry);
     println!("pool instances: {}", pool.len());
@@ -39,4 +36,6 @@ fn main() {
         println!("--- sample target ---");
         println!("{}", String::from_utf8_lossy(&first.target));
     }
+    // Keep the type in the signature honest: RunConfig is what we loaded.
+    let _ = RunConfig::smoke();
 }

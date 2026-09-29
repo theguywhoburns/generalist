@@ -1,12 +1,11 @@
-//! Training loop v1: constant LR, ACT + Newton-Muon preconditioning,
-//! greedy eval with EOS stopping, MPK checkpoints, JSONL metrics.
+//! Training loop: constant LR, ACT + hybrid Muon/AdamW, greedy eval with
+//! EOS stopping, MPK checkpoints, JSONL metrics.
 //!
-//! One step: collate -> `forward_act_with_stats` -> masked LM loss ->
-//! backward -> split (Muon 2D / AdamW rest) -> observe/refresh precond ->
-//! `inv @ G` -> two adaptor steps. Run orchestration (seeds, pools) is the
-//! caller's job; see `Experiment` for data dispatch.
+//! One step: collate -> `forward_act` -> masked LM loss -> backward ->
+//! split (hidden matrices / rest) -> two adaptor steps. Run orchestration
+//! (seeds, pools) is the caller's job; see `Experiment` for data dispatch.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +13,7 @@ use burn::{
     config::Config,
     module::{AutodiffModule, Module, ParamId},
     optim::{
-        AdamW, AdamWConfig, GradientsParams, LearningRate, Muon, Optimizer,
+        AdamW, AdamWConfig, GradientsParams, Muon, Optimizer,
         adaptor::OptimizerAdaptor,
     },
     record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder},
@@ -23,18 +22,22 @@ use burn::{
 
 use crate::{
     harness::Record as MetricRecord,
-    model::{LoopedConfig, LoopedTransformer, StopMode, lm_loss},
-    optim::{NewtonMuon, NewtonMuonConfig, PrecondInput, merge_grads, precondition_grads, split_grads},
+    model::{LoopedConfig, LoopedTransformer, StopConfig, StopMode, lm_loss},
+    optim::{LrConfig, LrPair, OptimConfig, merge_grads, split_grads},
     tasks::{HarnessRng, Instance},
 };
 
 #[derive(Config, Debug)]
 pub struct TrainConfig {
-    /// Muon LR under `muon_config_matched` (5x repo scale).
-    #[config(default = 2e-3)]
-    pub lr_muon: f64,
-    #[config(default = 3e-4)]
-    pub lr_adamw: f64,
+    /// Learning rate for the 2D hidden matrices (the optimizer named by
+    /// `OptimConfig`). A schedule, not a scalar: a flat rate is
+    /// `{"kind": "constant", "lr": ...}`, and a warmup or decay is the same
+    /// key with a different `kind`. See `src/optim/lr.rs`.
+    #[config(default = "LrConfig::Constant { lr: 5e-3 }")]
+    pub lr_muon: LrConfig,
+    /// Same, for the AdamW partition (embed, head, norms, halt gates).
+    #[config(default = "LrConfig::Constant { lr: 3e-4 }")]
+    pub lr_adamw: LrConfig,
     #[config(default = 32)]
     pub batch_size: usize,
     #[config(default = 1000)]
@@ -129,23 +132,31 @@ pub fn ponder_warmup_weight(base: f64, step: usize, warmup_steps: usize) -> f64 
 
 pub struct Trainer<B: AutodiffBackend> {
     pub model: LoopedTransformer<B>,
+    /// Optimizer for the 2D hidden matrices, selected by [`OptimConfig`].
     muon: OptimizerAdaptor<Muon<B::InnerBackend>, LoopedTransformer<B>, B>,
+    /// Optimizer for everything else (embed, head, norms, halt gates).
     adamw: OptimizerAdaptor<AdamW, LoopedTransformer<B>, B>,
-    precond: NewtonMuon<B::InnerBackend>,
     muon_ids: HashSet<ParamId>,
-    roles: HashMap<ParamId, PrecondInput>,
     config: LoopedConfig,
-    lr_muon: LearningRate,
-    lr_adamw: LearningRate,
+    /// How the loop decides depth. Manifest-selected, so a fixed-depth or
+    /// converge control needs no recompile.
+    stop: StopMode,
+    /// Advanced once per optimizer step, never per micro-batch.
+    lrs: LrPair,
     device: B::Device,
     /// Current scheduled-sampling depth (see `free_schedule`).
     pub free_k: usize,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
+    /// # Panics
+    /// Panics if a learning-rate schedule is invalid. Manifests are checked
+    /// by [`crate::harness::RunConfig::validate`] before a `Trainer` exists,
+    /// so reaching here means a programmatic caller skipped that.
     pub fn new(
         model_config: &LoopedConfig,
-        nm_config: &NewtonMuonConfig,
+        optim: &OptimConfig,
+        stop: StopConfig,
         train: &TrainConfig,
         device: &B::Device,
         init_from: Option<&Path>,
@@ -154,25 +165,23 @@ impl<B: AutodiffBackend> Trainer<B> {
         let mut model = LoopedTransformer::<B>::new(model_config, device);
         if let Some(path) = init_from {
             // Stage chaining: start from the previous stage's weights.
-            // Optimizer + preconditioner states restart fresh (documented).
+            // Optimizer states restart fresh (documented).
             model = Self::load_checkpoint(model_config, path, device);
         }
-        let precond = NewtonMuon::<B::InnerBackend>::new(
-            model_config.d_model,
-            model_config.ffn_hidden,
-            nm_config,
-            device,
-        );
+        // Optimizer selection: one match arm per `OptimConfig` variant.
+        let muon = match optim {
+            OptimConfig::Muon(tuning) => tuning.to_muon_config().init(),
+        };
+        let lrs = LrPair::new(&train.lr_muon, &train.lr_adamw)
+            .unwrap_or_else(|(field, e)| panic!("invalid {field}: {e}"));
         Self {
-            muon: nm_config.muon_config_matched().init(),
+            muon,
             adamw: AdamWConfig::new().init(),
             muon_ids: model.muon_ids(),
-            roles: model.precond_roles(),
             model,
-            precond,
             config: model_config.clone(),
-            lr_muon: train.lr_muon,
-            lr_adamw: train.lr_adamw,
+            stop: stop.to_mode(),
+            lrs,
             device: device.clone(),
             free_k: 0,
         }
@@ -246,7 +255,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let tokens_inner = truth.tokens.clone().inner();
             let lens = truth.lengths.clone();
             let valid = self.model.valid();
-            let logits = valid.forward(tokens_inner, &self.config, StopMode::Act, &lens, None).logits;
+            let logits = valid.forward(tokens_inner, &self.config, self.stop, &lens, None).logits;
             let [b2, t2, _] = logits.dims();
             let pred = int_vec(
                 &logits
@@ -270,10 +279,9 @@ impl<B: AutodiffBackend> Trainer<B> {
             "batch length {t} exceeds max_seq_len {}: raise max_seq_len or shorten instances",
             self.config.max_seq_len,
         );
-        let (out, stats) = self
+        let out = self
             .model
-            .forward_act_with_stats(col.tokens, &self.config, &col.lengths);
-        let (ce_answer, ce_eos) = crate::model::ce_split(
+            .forward_act(col.tokens, &self.config, &col.lengths, None);        let (ce_answer, ce_eos) = crate::model::ce_split(
             out.logits.clone(),
             col.targets.clone(),
             col.loss_mask.clone(),
@@ -296,24 +304,24 @@ impl<B: AutodiffBackend> Trainer<B> {
         let scaled = loss.mul_scalar(scale);
         let grads = scaled.backward();
         let grads = GradientsParams::from_grads(grads, &self.model);
-        self.precond.observe_stats(&stats);
         (info, grads)
     }
 
-    /// Consume raw grads through split + Newton-Muon precondition + both
-    /// adaptor steps. Refreshes the preconditioner inverses once per call
-    /// (i.e. once per optimizer step, not per micro-batch).
+    /// Consume raw grads through the split and both adaptor steps. The
+    /// hidden-matrix partition goes to the optimizer named by [`OptimConfig`]
+    /// (Muon today); everything else rides AdamW. Each adaptor only receives
+    /// the ids it owns, so neither touches the other's parameters.
+    ///
+    /// The LR schedulers advance exactly once here — one call per optimizer
+    /// step. Advancing per micro-batch would stretch a `warmup_steps: 200`
+    /// ramp across `accum_steps` times as many updates.
     pub fn optimizer_step(&mut self, grads: GradientsParams) {
-        let (muon_grads, adamw_grads) = split_grads::<B>(&self.muon_ids, grads);
-        self.precond.maybe_refresh();
-        let (muon_grads, leftover) =
-            precondition_grads::<B>(&self.precond, &self.roles, muon_grads);
-        assert!(leftover.is_empty(), "muon grad without precond role");
-
+        let (lr_muon, lr_adamw) = self.lrs.step();
+        let (hidden_grads, adamw_grads) = split_grads::<B>(&self.muon_ids, grads);
         let model = self.model.clone();
-        self.model = self.muon.step(self.lr_muon, model, muon_grads);
+        self.model = self.muon.step(lr_muon, model, hidden_grads);
         let model = self.model.clone();
-        self.model = self.adamw.step(self.lr_adamw, model, adamw_grads);
+        self.model = self.adamw.step(lr_adamw, model, adamw_grads);
     }
 
     pub fn train_step(&mut self, batch: &[&Instance]) -> StepInfo {
@@ -421,7 +429,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 TensorData::new(flat, [g, tmax]),
                 &self.device,
             );
-            let res = model.forward(tokens, &self.config, StopMode::Act, &lens, order);
+            let res = model.forward(tokens, &self.config, self.stop, &lens, order);
             steps_sum += res.steps_used;
             halt_sum += res.mean_halt;
             if block_sums.len() < res.block_halts.len() {
@@ -563,6 +571,12 @@ fn vram_mb() -> Option<u64> {
 /// Run one manifest end to end: pool -> train loop -> evals -> checkpoints.
 /// Shared by single-manifest runs and curriculum stages. `init_from` chains
 /// onto a previous stage's checkpoint (optimizer states restart fresh).
+///
+/// # Panics
+/// Panics if `run` fails validation. Manifest loaders call
+/// [`crate::harness::RunConfig::validate`] first, so by the time a `RunConfig`
+/// reaches here it is already known good; a programmatic caller that skipped
+/// that gets every problem listed at once rather than the first.
 pub fn run_stage<B: AutodiffBackend>(
     run: &crate::harness::RunConfig,
     device: &B::Device,
@@ -571,6 +585,10 @@ pub fn run_stage<B: AutodiffBackend>(
 ) -> StageOutcome {
     use crate::harness::{generate, summarize};
     use crate::tasks::TaskRegistry;
+
+    // Cheap insurance for the programmatic path. The loader already ran it.
+    let problems = run.validate();
+    assert!(problems.is_empty(), "invalid run config:\n  - {}", problems.join("\n  - "));
 
     std::fs::create_dir_all(&run.train.ckpt_dir).expect("ckpt dir");
     let registry = TaskRegistry::builtin();
@@ -586,24 +604,16 @@ pub fn run_stage<B: AutodiffBackend>(
     let mut train_pool = pool;
     train_pool.sort_by_key(|i| i.prompt.len() + i.target.len());
 
-    let nm = NewtonMuonConfig::new()
-        .with_precond_ewma(run.optim.precond_ewma)
-        .with_refresh_every(run.optim.refresh_every)
-        .with_ridge_mult(run.optim.ridge_mult)
-        .with_eps(run.optim.eps)
-        .with_init_diag(run.optim.init_diag)
-        .with_ns_steps(run.optim.ns_steps);
-    let train_cfg = TrainConfig::new()
-        .with_lr_muon(run.train.lr_muon)
-        .with_lr_adamw(run.train.lr_adamw)
-        .with_batch_size(run.train.batch_size)
-        .with_steps(run.train.steps)
-        .with_log_every(run.train.log_every)
-        .with_eval_every(run.train.eval_every)
-        .with_eval_max_new(run.train.eval_max_new)
-        .with_seed(run.train.seed)
-        .with_ckpt_dir(run.train.ckpt_dir.clone());
-    let mut trainer = Trainer::<B>::new(&run.model, &nm, &train_cfg, device, init_from);
+    // `run.train` is passed straight through. A previous version rebuilt a
+    // partial `TrainConfig` here, which was both redundant and a trap: the
+    // Trainer read only `seed` and the two learning rates, so the other six
+    // copied fields were dead, and any *new* field read off that local would
+    // have silently taken its struct default rather than the manifest value.
+    // The loop below already reads `run.train.*` directly, so the manifest is
+    // the single source of truth for every knob.
+    println!("optimizer: {} | stop: {}", run.optim.name(), run.stop.kind_name());
+    let mut trainer =
+        Trainer::<B>::new(&run.model, &run.optim, run.stop, &run.train, device, init_from);
     let mut rng = HarnessRng::new(run.train.seed ^ 0x9E37_79B9_7F4A_7C15);
     let watchdog = crate::fail_fast::Watchdog::spawn(run.train.stuck_timeout_secs);
     // Ponder warmup base: ramped per step via the setter below.
@@ -672,7 +682,7 @@ pub fn run_stage<B: AutodiffBackend>(
         // a fresh page no longer fits in 4GB (death: 61.77MB page at ~3.7GB
         // used, mid-train, before any eval). Releasing after every optimizer
         // step bounds retention to one step's families plus persistent state
-        // (params/optimizer/precond, ~100MB). Allocator-only: no math,
+        // (params/optimizer, ~100MB). Allocator-only: no math,
         // batch-composition, or dynamics change. Costs some re-alloc churn
         // versus the old never-release policy; correctness first.
         B::memory_cleanup(device);
@@ -696,10 +706,21 @@ pub fn run_stage<B: AutodiffBackend>(
             let dt = now.duration_since(last_log.0).as_secs_f64().max(1e-6);
             let rate = (step - last_log.1) as f64 / dt;
             last_log = (now, step);
+            // `loops` and `halt` are ACT quantities. Under fixed depth the
+            // loop count is the config, and `ponder` is a constant offset
+            // rather than a per-token cost, so printing all three every run
+            // invites comparing numbers that no longer mean what they did.
+            let depth = match run.stop {
+                StopConfig::Act => format!(
+                    "ponder {:.2} loops {} halt {:.2}",
+                    info.ponder, info.steps_used, info.mean_halt
+                ),
+                StopConfig::Fixed { .. } => String::new(),
+                StopConfig::Converge => format!("halt {:.2}", info.mean_halt),
+            };
             println!(
-                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) ponder {:.2} loops {} halt {:.2} free {} {vram} {:.2} st/s",
-                info.loss, info.ce_answer, info.ce_eos,
-                info.ponder, info.steps_used, info.mean_halt, trainer.free_k, rate
+                "step {step:>5} loss {:.4} (ans {:.3} eos {:.3}) {depth} free {} {vram} {:.2} st/s",
+                info.loss, info.ce_answer, info.ce_eos, trainer.free_k, rate
             );
         }
         if step % run.train.ckpt_every == 0 {
@@ -870,7 +891,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::{Experiment, generate},
-        optim::NewtonMuonConfig,
+        optim::{OptimConfig, MuonTuning},
         tasks::TaskRegistry,
         test_backend::{TestBackend, test_device},
     };
@@ -879,6 +900,7 @@ mod tests {
     type IB = <TestBackend as AutodiffBackend>::InnerBackend;
 
     fn tiny_trainer() -> Trainer<TestBackend> {
+        let optim = OptimConfig::Muon(MuonTuning::new());
         let model_cfg = LoopedConfig::new()
             .with_vocab_size(256)
             .with_d_model(32)
@@ -890,7 +912,8 @@ mod tests {
         let train_cfg = TrainConfig::new();
         Trainer::<TestBackend>::new(
             &model_cfg,
-            &NewtonMuonConfig::new(),
+            &optim,
+            crate::model::StopConfig::Act,
             &train_cfg,
             &test_device(),
             None,
@@ -945,11 +968,9 @@ mod tests {
         let mut trainer = tiny_trainer();
         let batch: Vec<Instance> = pool.iter().take(4).cloned().collect();
         let col = collate(&batch, &test_device());
-        let (out, _) = trainer.model.forward_act_with_stats(
-            col.tokens,
-            &trainer.config,
-            &col.lengths,
-        );
+        let out = trainer
+            .model
+            .forward_act(col.tokens, &trainer.config, &col.lengths, None);
         let loss = lm_loss(
             out.logits,
             col.targets,
@@ -983,6 +1004,192 @@ mod tests {
         let after_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
         assert_ne!(before, after, "muon param frozen after a step");
         assert_ne!(before_head, after_head, "adamw param frozen after a step");
+    }
+
+    /// A fixed-depth run must not report ACT quantities. The regression this
+    /// guards: `forward_act` was hardcoded in two places, so a fixed-depth
+    /// manifest would have silently trained with a learned halt.
+    /// The manifest must be the single source of truth for training knobs.
+    ///
+    /// Regression guard for a removed footgun: `run_stage` used to rebuild a
+    /// partial `TrainConfig` from `run.train`, copying nine fields of which
+    /// the Trainer read three. Any field not copied took its struct default,
+    /// so a new knob added to the manifest could be silently ignored. This
+    /// pins the values the Trainer actually consumes.
+    #[test]
+    fn trainer_uses_the_manifests_own_values() {
+        let mut cfg = TrainConfig::new();
+        cfg.seed = 4242;
+        cfg.lr_muon = LrConfig::Constant { lr: 0.011 };
+        cfg.lr_adamw = LrConfig::Constant { lr: 0.022 };
+        let model_cfg = LoopedConfig::new()
+            .with_d_model(32)
+            .with_n_heads(2)
+            .with_head_dim(16)
+            .with_ffn_hidden(64)
+            .with_max_loops(2)
+            .with_max_seq_len(256);
+        let mut trainer = Trainer::<TestBackend>::new(
+            &model_cfg,
+            &OptimConfig::Muon(MuonTuning::new()),
+            StopConfig::Act,
+            &cfg,
+            &test_device(),
+            None,
+        );
+        // The rates came from `cfg`, not from TrainConfig's defaults.
+        assert_eq!(trainer.lrs.step(), (0.011, 0.022));
+    }
+
+    /// A run whose learning rates do not match its manifest is a silent
+    /// correctness problem, so the round-trip through the loader is checked:
+    /// the numbers in a manifest must be the numbers the trainer applies.
+    #[test]
+    fn manifest_learning_rates_reach_the_trainer() {
+        use crate::harness::{load_run, RunConfig};
+        let base = RunConfig::smoke();
+        let value = serde_json::to_value(&base).expect("serialize");
+        let path = std::env::temp_dir().join("generalist-lr-through-loader.json");
+        std::fs::write(&path, value.to_string()).expect("write");
+        let cfg = load_run(&path).expect("load");
+        std::fs::remove_file(&path).ok();
+
+        // Deliberately the manifest's own model config, not a tiny stand-in:
+        // this is a loader round-trip, so the model block is exercised too.
+        let mut trainer = Trainer::<TestBackend>::new(
+            &cfg.model,
+            &cfg.optim,
+            cfg.stop,
+            &cfg.train,
+            &test_device(),
+            None,
+        );
+        let (muon, adamw) = trainer.lrs.step();
+        let (want_muon, want_adamw) = match (&cfg.train.lr_muon, &cfg.train.lr_adamw) {
+            (LrConfig::Constant { lr: m }, LrConfig::Constant { lr: a }) => (*m, *a),
+            other => panic!("expected constant LRs in the smoke default, got {other:?}"),
+        };
+        assert_eq!((muon, adamw), (want_muon, want_adamw));
+    }
+
+    #[test]
+    fn stop_mode_actually_reaches_the_forward() {
+        let trainer = tiny_trainer();
+        // ACT: the step count is data-dependent and within the config's range.
+        let act = trainer
+            .model
+            .forward_act(
+                burn::tensor::Tensor::zeros([2, 4], &test_device()),
+                &trainer.config,
+                &[4, 4],
+                None,
+            );
+        assert!(act.steps_used >= 1 && act.steps_used <= 4);
+
+        // Fixed: the step count is exactly what was asked for, at every
+        // iteration, because nothing consults the halt head.
+        for loops in 1..=4 {
+            let out = trainer.model.forward_fixed(
+                burn::tensor::Tensor::zeros([2, 4], &test_device()),
+                &[4, 4],
+                loops,
+            );
+            assert_eq!(out.steps_used, loops);
+            assert_eq!(out.mean_halt, loops as f32);
+            assert_eq!(out.block_halts, vec![loops as f32]);
+            // Zero ponder: a fixed run has no per-token step count to charge.
+            assert_eq!(scalar_of(&out.ponder), 0.0);
+        }
+    }
+
+    #[test]
+    fn trainer_runs_under_each_stop_mode() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 8,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        for stop in [
+            StopConfig::Act,
+            StopConfig::Fixed { loops: 2 },
+            StopConfig::Converge,
+        ] {
+            let model_cfg = LoopedConfig::new()
+                .with_d_model(32)
+                .with_n_heads(2)
+                .with_head_dim(16)
+                .with_ffn_hidden(64)
+                .with_max_loops(2)
+                .with_max_seq_len(256)
+                // Ponder is meaningless without ACT; matches what the loader
+                // requires of a real manifest.
+                .with_ponder_weight(if matches!(stop, StopConfig::Act) { 1e-3 } else { 0.0 });
+            let optim = OptimConfig::Muon(MuonTuning::new());
+            let mut trainer = Trainer::<TestBackend>::new(
+                &model_cfg,
+                &optim,
+                stop,
+                &TrainConfig::new(),
+                &test_device(),
+                None,
+            );
+            let mut rng = HarnessRng::new(11);
+            let batch = Trainer::<TestBackend>::sample_batch(&mut rng, &pool, 4);
+            let info = trainer.train_step(&batch);
+            assert!(info.loss.is_finite(), "loss NaN under {stop:?}");
+            let records = trainer.evaluate(&pool[..4], 8, None);
+            assert_eq!(records.len(), 4, "decode failed under {stop:?}");
+        }
+    }
+
+    #[test]
+    fn lr_schedule_advances_once_per_optimizer_step() {
+        // Guards the accumulation trap: advancing per micro-batch would
+        // stretch a warmup across accum_steps times as many updates.
+        let model_cfg = LoopedConfig::new()
+            .with_d_model(32)
+            .with_n_heads(2)
+            .with_head_dim(16)
+            .with_ffn_hidden(64)
+            .with_max_loops(2)
+            .with_max_seq_len(256);
+        let train_cfg = TrainConfig::new().with_lr_muon(LrConfig::Linear {
+            lr: 1e-4,
+            max_lr: 1e-2,
+            warmup_steps: 10,
+        });
+        let mut trainer = Trainer::<TestBackend>::new(
+            &model_cfg,
+            &OptimConfig::Muon(MuonTuning::new()),
+            StopConfig::Act,
+            &train_cfg,
+            &test_device(),
+            None,
+        );
+        // burn's linear scheduler counts down from `warmup_steps + 1` and
+        // returns `final - step_size * remaining`, so the first call yields
+        // `lr` and the peak lands on call `warmup_steps + 1`. Walk the whole
+        // ramp and assert that shape rather than a guessed off-by-one.
+        // 12 calls: the peak lands on call 11, leaving a call to confirm the hold.
+        let mut seen = vec![trainer.lrs.step().0];
+        for _ in 0..11 {
+            seen.push(trainer.lrs.step().0);
+        }
+        assert!((seen[0] - 1e-4).abs() < 1e-12, "ramp did not start at lr: {seen:?}");
+        // Monotonic non-decreasing; the ramp is strictly rising until it
+        // saturates at the peak, then flat.
+        for w in seen.windows(2) {
+            assert!(w[1] >= w[0], "ramp decreased: {seen:?}");
+        }
+        assert!(
+            (seen[10] - 1e-2).abs() < 1e-9,
+            "peak not reached on call warmup_steps+1: {seen:?}"
+        );
+        // And it holds at the peak thereafter.
+        assert!((seen[10] - seen[11]).abs() < 1e-12, "did not hold: {seen:?}");
     }
 
     #[test]
