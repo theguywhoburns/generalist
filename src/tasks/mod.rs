@@ -5,12 +5,12 @@
 //! regime separation, layout randomization, corruption, copy-rate) lives in
 //! [`demo`] and applies uniformly.
 
+pub mod copy;
 pub mod demo;
 pub mod dyck;
 pub mod fst;
 pub mod parity;
 pub mod periodic;
-pub mod copy;
 pub mod rng;
 pub mod scan;
 
@@ -165,7 +165,10 @@ impl TaskRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Task> {
-        self.tasks.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+        self.tasks
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
     }
 
     pub fn names(&self) -> Vec<&'static str> {

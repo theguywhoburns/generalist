@@ -98,8 +98,7 @@ mod tests {
         // `LoopedConfig`/`TrainConfig`, and it means a checked-in manifest
         // fully determines the run. To get a block to edit, round-trip a
         // complete config through `RunConfig::save_json`.
-        let err =
-            serde_json::from_str::<OptimConfig>(r#"{"kind":"muon","ns_steps":3}"#);
+        let err = serde_json::from_str::<OptimConfig>(r#"{"kind":"muon","ns_steps":3}"#);
         assert!(err.is_err(), "partial optim block was silently accepted");
     }
 

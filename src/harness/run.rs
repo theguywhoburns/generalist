@@ -259,8 +259,8 @@ mod manifest_tests {
             let path = dir().join(&name);
             let (merged, _) = resolve(&path, &mut Vec::new())
                 .unwrap_or_else(|e| panic!("configs/{name} did not resolve:\n{e}"));
-            let from_file = load_run(&path)
-                .unwrap_or_else(|e| panic!("configs/{name} did not load:\n{e}"));
+            let from_file =
+                load_run(&path).unwrap_or_else(|e| panic!("configs/{name} did not load:\n{e}"));
 
             // The typed parse and a fresh serialize must agree with the file's
             // own resolution, or `extends` is doing something invisible.
@@ -275,8 +275,7 @@ mod manifest_tests {
             // "complete, self-contained" output trustworthy.
             let round = serde_json::to_value(&from_file).expect("serialize");
             assert_eq!(
-                round,
-                expect,
+                round, expect,
                 "configs/{name}: save_run output would not match its own input"
             );
         }
@@ -301,9 +300,16 @@ mod manifest_tests {
                 .unwrap_or_else(|e| panic!("configs/{child}: {e}"));
             // Every child declares its parent, and is otherwise small: the
             // point of the refactor is that variations are cheap to write.
-            assert!(v.get("extends").is_some(), "{child} does not extend the base");
-            let own: Vec<&String> =
-                v.as_object().unwrap().keys().filter(|k| *k != "extends" && *k != "_comment").collect();
+            assert!(
+                v.get("extends").is_some(),
+                "{child} does not extend the base"
+            );
+            let own: Vec<&String> = v
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k != "extends" && *k != "_comment")
+                .collect();
             assert!(
                 own.len() <= 4,
                 "configs/{child} overrides {} top-level keys ({own:?}); it should be a thin variation",
@@ -327,7 +333,10 @@ mod manifest_tests {
         assert_eq!(fixed.stop, StopConfig::Fixed { loops: 4 });
         // Fixed depth has no learned step count, so a ponder penalty would be
         // a constant loss offset. The manifest must zero it.
-        assert_eq!(fixed.model.ponder_weight, 0.0, "fixed4 kept a ponder weight");
+        assert_eq!(
+            fixed.model.ponder_weight, 0.0,
+            "fixed4 kept a ponder weight"
+        );
 
         let conv = load_run(&dir().join("stage0-converge.json")).expect("converge loads");
         assert_eq!(conv.stop, StopConfig::Converge);
@@ -364,8 +373,8 @@ mod manifest_tests {
     fn checked_in_chain_loads_and_every_manifest_resolves() {
         use crate::harness::config::load_chain;
         let path = dir().join("chain.json");
-        let (plan, runs) = load_chain(&path)
-            .unwrap_or_else(|e| panic!("configs/chain.json failed to load:\n{e}"));
+        let (plan, runs) =
+            load_chain(&path).unwrap_or_else(|e| panic!("configs/chain.json failed to load:\n{e}"));
         assert!(!plan.experiments.is_empty());
         assert_eq!(plan.experiments.len(), runs.len());
         for ((name, cfg), exp) in runs.iter().zip(&plan.experiments) {
@@ -422,7 +431,10 @@ mod manifest_tests {
         match crate::harness::config::load_chain(&bad.join("plan.json")) {
             Err(crate::harness::ConfigError::Invalid { path, problems }) => {
                 assert!(path.ends_with("broken.json"), "blamed {path:?}");
-                assert!(problems.iter().any(|p| p.contains("n_stages")), "{problems:?}");
+                assert!(
+                    problems.iter().any(|p| p.contains("n_stages")),
+                    "{problems:?}"
+                );
             }
             other => panic!("expected Invalid for the broken stage, got {other:?}"),
         }
@@ -481,7 +493,11 @@ mod tests {
 
     #[test]
     fn every_variant_roundtrips_through_json() {
-        for stop in [StopConfig::Act, StopConfig::Fixed { loops: 4 }, StopConfig::Converge] {
+        for stop in [
+            StopConfig::Act,
+            StopConfig::Fixed { loops: 4 },
+            StopConfig::Converge,
+        ] {
             let mut c = valid();
             c.stop = stop;
             let text = serde_json::to_string(&c).unwrap();
@@ -511,7 +527,10 @@ mod tests {
         c.train.eval_every = 0;
         c.train.accum_steps = 0;
         let problems = c.validate();
-        assert!(problems.len() >= 5, "expected many problems, got {problems:?}");
+        assert!(
+            problems.len() >= 5,
+            "expected many problems, got {problems:?}"
+        );
         let joined = problems.join("\n");
         for needle in [
             "d_model",
@@ -561,10 +580,11 @@ mod tests {
         let mut c = valid();
         c.train.steps = 10;
         c.train.ponder_warmup_steps = 100;
-        assert!(c
-            .validate()
-            .join("\n")
-            .contains("never reaches its configured value"));
+        assert!(
+            c.validate()
+                .join("\n")
+                .contains("never reaches its configured value")
+        );
     }
 
     #[test]

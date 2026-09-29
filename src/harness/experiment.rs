@@ -54,7 +54,8 @@ impl Experiment {
             );
         }
         if self.tracks.is_empty() {
-            problems.push("experiment: tracks is empty; the run would generate nothing".to_string());
+            problems
+                .push("experiment: tracks is empty; the run would generate nothing".to_string());
         }
         if self.seeds.is_empty() {
             problems.push("experiment: seeds is empty; the run would generate nothing".to_string());

@@ -52,11 +52,7 @@
 
 use burn::{
     config::Config,
-    optim::{
-        AdjustLrFn, MuonConfig,
-        decay::WeightDecayConfig,
-        momentum::MomentumConfig,
-    },
+    optim::{AdjustLrFn, MuonConfig, decay::WeightDecayConfig, momentum::MomentumConfig},
 };
 
 /// The Muon knobs a run manifest may set. Everything else — the quintic
@@ -101,10 +97,9 @@ impl MuonTuning {
         };
         // `then_some` is eager, but the payload is a single f32 copy — the
         // `then(|| ..)` closure that would defer it buys nothing here.
-        let weight_decay = (self.weight_decay > 0.0)
-            .then_some(WeightDecayConfig {
-                penalty: self.weight_decay,
-            });
+        let weight_decay = (self.weight_decay > 0.0).then_some(WeightDecayConfig {
+            penalty: self.weight_decay,
+        });
         MuonConfig::new()
             .with_momentum(momentum)
             .with_ns_steps(self.ns_steps)

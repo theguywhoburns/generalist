@@ -9,7 +9,12 @@
 
 use super::{Demo, HarnessRng, Query, Rule, Task, Track};
 
-const PRIMS: &[(&str, &str)] = &[("jump", "J"), ("walk", "W"), ("turn left", "L"), ("turn right", "R")];
+const PRIMS: &[(&str, &str)] = &[
+    ("jump", "J"),
+    ("walk", "W"),
+    ("turn left", "L"),
+    ("turn right", "R"),
+];
 
 pub struct ScanTask;
 
@@ -49,7 +54,11 @@ impl ScanRule {
             // Track A: bare or twice. Track B: also thrice.
             let reps = match self.track {
                 Track::A => {
-                    if rng.prob(0.4) { 2 } else { 1 }
+                    if rng.prob(0.4) {
+                        2
+                    } else {
+                        1
+                    }
                 }
                 Track::B => match rng.below(3) {
                     0 => 1,
@@ -143,15 +152,24 @@ mod tests {
         let mut rng = HarnessRng::new(61);
         for _ in 0..200 {
             let q = rule.render_query(&mut rng);
-            assert_eq!(ScanRule::execute(&q.input).as_deref(), Some(q.target.as_str()));
+            assert_eq!(
+                ScanRule::execute(&q.input).as_deref(),
+                Some(q.target.as_str())
+            );
             assert!(rule.verify(&q.input, &q.target));
         }
     }
 
     #[test]
     fn executor_reference_cases() {
-        assert_eq!(ScanRule::execute("jump twice and walk").as_deref(), Some("JJW"));
-        assert_eq!(ScanRule::execute("turn left thrice").as_deref(), Some("LLL"));
+        assert_eq!(
+            ScanRule::execute("jump twice and walk").as_deref(),
+            Some("JJW")
+        );
+        assert_eq!(
+            ScanRule::execute("turn left thrice").as_deref(),
+            Some("LLL")
+        );
         assert_eq!(ScanRule::execute("walk").as_deref(), Some("W"));
         assert_eq!(ScanRule::execute("bogus").as_deref(), None);
     }

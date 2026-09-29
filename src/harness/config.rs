@@ -46,15 +46,27 @@ use super::run::{ExperimentPlan, RunConfig};
 #[derive(Debug)]
 pub enum ConfigError {
     /// The file could not be read.
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// The bytes were not valid JSON.
-    Parse { path: PathBuf, source: serde_json::Error },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     /// Valid JSON, wrong shape: a missing or mistyped field.
-    Schema { path: PathBuf, source: serde_json::Error },
+    Schema {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     /// `extends` formed a loop.
     Cycle { path: PathBuf, chain: Vec<PathBuf> },
     /// Every problem found by validation, not just the first.
-    Invalid { path: PathBuf, problems: Vec<String> },
+    Invalid {
+        path: PathBuf,
+        problems: Vec<String>,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -65,12 +77,20 @@ impl fmt::Display for ConfigError {
                 write!(f, "{}: invalid JSON: {source}", path.display())
             }
             ConfigError::Schema { path, source } => {
-                write!(f, "{}: does not match the manifest schema: {source}", path.display())
+                write!(
+                    f,
+                    "{}: does not match the manifest schema: {source}",
+                    path.display()
+                )
             }
             ConfigError::Cycle { path, chain } => {
-                let names: Vec<String> =
-                    chain.iter().map(|p| p.display().to_string()).collect();
-                write!(f, "{}: extends cycle: {}", path.display(), names.join(" -> "))
+                let names: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
+                write!(
+                    f,
+                    "{}: extends cycle: {}",
+                    path.display(),
+                    names.join(" -> ")
+                )
             }
             ConfigError::Invalid { path, problems } => {
                 writeln!(f, "{}: {} problem(s):", path.display(), problems.len())?;
@@ -119,7 +139,10 @@ pub fn load_run(path: &Path) -> Result<RunConfig, ConfigError> {
     if problems.is_empty() {
         Ok(cfg)
     } else {
-        Err(ConfigError::Invalid { path: root, problems })
+        Err(ConfigError::Invalid {
+            path: root,
+            problems,
+        })
     }
 }
 
@@ -146,9 +169,13 @@ pub fn save_run(path: &Path, cfg: &RunConfig) -> Result<(), ConfigError> {
     })?;
     // The document is rebuilt from the typed config, so no `_comment` from a
     // source manifest survives into the output.
-    let text = format!("{}\n", serde_json::to_string_pretty(&value).map_err(
-        |source| ConfigError::Schema { path: path.to_path_buf(), source },
-    )?);
+    let text = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&value).map_err(|source| ConfigError::Schema {
+            path: path.to_path_buf(),
+            source
+        },)?
+    );
     std::fs::write(path, text).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -289,16 +316,15 @@ pub fn divergent_keys(values: &[Value]) -> BTreeSet<String> {
     for v in values {
         collect_leaves(v, String::new(), &mut seen);
     }
-    seen.into_iter().filter(|(_, v)| v.len() > 1).map(|(k, _)| k).collect()
+    seen.into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, _)| k)
+        .collect()
 }
 
 type BTreeMap<K, V> = std::collections::BTreeMap<K, V>;
 
-fn collect_leaves(
-    v: &Value,
-    prefix: String,
-    out: &mut BTreeMap<String, BTreeSet<String>>,
-) {
+fn collect_leaves(v: &Value, prefix: String, out: &mut BTreeMap<String, BTreeSet<String>>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
@@ -362,14 +388,20 @@ mod tests {
 
     #[test]
     fn extends_chain_merges_base_then_overrides() {
-        let base = write("merge-base.json", json!({
-            "model": {"d_model": 256, "n_heads": 4},
-            "train": {"batch_size": 6, "steps": 500}
-        }));
-        let child = write("merge-child.json", json!({
-            "extends": base.file_name().unwrap().to_str().unwrap(),
-            "train": {"steps": 50}
-        }));
+        let base = write(
+            "merge-base.json",
+            json!({
+                "model": {"d_model": 256, "n_heads": 4},
+                "train": {"batch_size": 6, "steps": 500}
+            }),
+        );
+        let child = write(
+            "merge-child.json",
+            json!({
+                "extends": base.file_name().unwrap().to_str().unwrap(),
+                "train": {"steps": 50}
+            }),
+        );
         let (merged, root) = resolve(&child, &mut Vec::new()).unwrap();
         assert_eq!(root, child);
         // Overridden leaf wins...
@@ -388,11 +420,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("base.json"), r#"{"train": {"steps": 7}}"#).unwrap();
         let child = dir.join("child.json");
-        std::fs::write(
-            &child,
-            r#"{"extends": "base.json", "train": {"steps": 9}}"#,
-        )
-        .unwrap();
+        std::fs::write(&child, r#"{"extends": "base.json", "train": {"steps": 9}}"#).unwrap();
         let (merged, _) = resolve(&child, &mut Vec::new()).unwrap();
         assert_eq!(merged["train"]["steps"], json!(9));
     }
@@ -463,12 +491,18 @@ mod tests {
         save_run(&out, &cfg).expect("save");
 
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(!text.contains("extends"), "saved output kept an extends key");
+        assert!(
+            !text.contains("extends"),
+            "saved output kept an extends key"
+        );
         assert!(!text.contains(COMMENT_KEY), "saved output kept a _comment");
 
         // Reloadable, and the reload is a fixed point under re-serialization.
         let back = load_run(&out).expect("reload standalone");
-        assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&cfg).unwrap());
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&cfg).unwrap()
+        );
         // And the substantive fields survived.
         assert_eq!(back.model.param_count(), cfg.model.param_count());
         assert_eq!(back.stop, cfg.stop);
@@ -495,8 +529,8 @@ mod tests {
         std::fs::write(dir.join("b.json"), r#"{"extends": "base.json"}"#).unwrap();
 
         for name in ["a.json", "b.json"] {
-            let (merged, _) = resolve(&dir.join(name), &mut Vec::new())
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (merged, _) =
+                resolve(&dir.join(name), &mut Vec::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(
                 merged.get(COMMENT_KEY).is_none(),
                 "{name} leaked a comment: {merged}"
@@ -526,7 +560,10 @@ mod tests {
         let b = json!({"train": {"steps": 2, "seed": 0}});
         let d = divergent_keys(&[a, b]);
         assert!(d.contains("train.steps"), "{d:?}");
-        assert!(!d.contains("train.seed"), "seed agreed, should not be reported: {d:?}");
+        assert!(
+            !d.contains("train.seed"),
+            "seed agreed, should not be reported: {d:?}"
+        );
     }
 
     #[test]

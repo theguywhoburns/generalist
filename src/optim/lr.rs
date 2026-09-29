@@ -22,13 +22,9 @@
 //! micro-batch. Advancing per micro-batch would silently stretch a
 //! `warmup_steps: 200` ramp across `accum_steps` times as many updates.
 
-use burn::{
-    lr_scheduler::{
-        LrScheduler,
-        cosine::CosineAnnealingLrSchedulerConfig,
-        linear::LinearLrSchedulerConfig,
-        step::StepLrSchedulerConfig,
-    },
+use burn::lr_scheduler::{
+    LrScheduler, cosine::CosineAnnealingLrSchedulerConfig, linear::LinearLrSchedulerConfig,
+    step::StepLrSchedulerConfig,
 };
 
 /// The one method a run needs from a schedule: the rate for the next step.
@@ -109,25 +105,33 @@ impl LrConfig {
                 }
                 Box::new(burn::lr_scheduler::constant::ConstantLr::from(*lr)) as Box<dyn LrCurve>
             }
-            LrConfig::Linear { lr, max_lr, warmup_steps } => {
+            LrConfig::Linear {
+                lr,
+                max_lr,
+                warmup_steps,
+            } => {
                 // burn's `Config` derive makes fields without a `#[config(default)]`
                 // positional args on `new`, and defaulted ones into `with_*`.
                 LinearLrSchedulerConfig::new(*lr, *max_lr, *warmup_steps)
                     .init()
                     .map(|s| Box::new(s) as Box<dyn LrCurve>)?
             }
-            LrConfig::Cosine { lr, min_lr, total_steps } => {
-                CosineAnnealingLrSchedulerConfig::new(*lr, *total_steps)
-                    .with_min_lr(*min_lr)
-                    .init()
-                    .map(|s| Box::new(s) as Box<dyn LrCurve>)?
-            }
-            LrConfig::Step { lr, step_size, gamma } => {
-                StepLrSchedulerConfig::new(*lr, *step_size)
-                    .with_gamma(*gamma)
-                    .init()
-                    .map(|s| Box::new(s) as Box<dyn LrCurve>)?
-            }
+            LrConfig::Cosine {
+                lr,
+                min_lr,
+                total_steps,
+            } => CosineAnnealingLrSchedulerConfig::new(*lr, *total_steps)
+                .with_min_lr(*min_lr)
+                .init()
+                .map(|s| Box::new(s) as Box<dyn LrCurve>)?,
+            LrConfig::Step {
+                lr,
+                step_size,
+                gamma,
+            } => StepLrSchedulerConfig::new(*lr, *step_size)
+                .with_gamma(*gamma)
+                .init()
+                .map(|s| Box::new(s) as Box<dyn LrCurve>)?,
         })
     }
 
@@ -143,7 +147,11 @@ impl LrConfig {
                     vec![]
                 }
             }
-            LrConfig::Linear { lr, max_lr, warmup_steps } => {
+            LrConfig::Linear {
+                lr,
+                max_lr,
+                warmup_steps,
+            } => {
                 let mut e = Vec::new();
                 if *lr <= 0.0 {
                     e.push(at(format!("linear lr must be > 0, got {lr}")));
@@ -156,7 +164,11 @@ impl LrConfig {
                 }
                 e
             }
-            LrConfig::Cosine { lr, min_lr, total_steps } => {
+            LrConfig::Cosine {
+                lr,
+                min_lr,
+                total_steps,
+            } => {
                 let mut e = Vec::new();
                 if *lr <= 0.0 {
                     e.push(at(format!("cosine lr must be > 0, got {lr}")));
@@ -174,7 +186,11 @@ impl LrConfig {
                 }
                 e
             }
-            LrConfig::Step { lr, step_size, gamma } => {
+            LrConfig::Step {
+                lr,
+                step_size,
+                gamma,
+            } => {
                 let mut e = Vec::new();
                 if *lr <= 0.0 {
                     e.push(at(format!("step lr must be > 0, got {lr}")));
@@ -200,10 +216,7 @@ pub struct LrPair {
 impl LrPair {
     /// Build both schedulers. `Err` names the offending field so the loader
     /// can attribute it to `lr_muon` or `lr_adamw`.
-    pub fn new(
-        muon: &LrConfig,
-        adamw: &LrConfig,
-    ) -> Result<Self, (String, String)> {
+    pub fn new(muon: &LrConfig, adamw: &LrConfig) -> Result<Self, (String, String)> {
         let m = muon.build().map_err(|e| ("lr_muon".to_string(), e))?;
         let a = adamw.build().map_err(|e| ("lr_adamw".to_string(), e))?;
         Ok(Self { muon: m, adamw: a })
@@ -235,7 +248,11 @@ mod tests {
 
     #[test]
     fn linear_ramps_up_then_holds() {
-        let c = LrConfig::Linear { lr: 1e-4, max_lr: 5e-3, warmup_steps: 4 };
+        let c = LrConfig::Linear {
+            lr: 1e-4,
+            max_lr: 5e-3,
+            warmup_steps: 4,
+        };
         let s = seq(&c, 6);
         // Strictly increasing over the ramp...
         assert!(s[0] < s[1] && s[1] < s[2] && s[2] < s[3], "no ramp: {s:?}");
@@ -250,7 +267,11 @@ mod tests {
         // does not hold at `min_lr`. Pinned here so the behavior is a
         // documented choice rather than a surprise: for a single-cycle run it
         // reads as a decay, and for longer runs it is warm restarts.
-        let c = LrConfig::Cosine { lr: 5e-3, min_lr: 1e-4, total_steps: 4 };
+        let c = LrConfig::Cosine {
+            lr: 5e-3,
+            min_lr: 1e-4,
+            total_steps: 4,
+        };
         // 5 values span one full 4-step cycle: it emits `lr` first, reaches
         // `min_lr` last, and restarts on the following call.
         let s = seq(&c, 7);
@@ -258,7 +279,10 @@ mod tests {
         for w in cycle.windows(2) {
             assert!(w[1] <= w[0] + 1e-12, "cosine increased in-cycle: {s:?}");
         }
-        assert!((cycle[4] - 1e-4).abs() < 1e-9, "did not reach min_lr: {s:?}");
+        assert!(
+            (cycle[4] - 1e-4).abs() < 1e-9,
+            "did not reach min_lr: {s:?}"
+        );
         // The next step restarts at the peak.
         assert!((s[5] - 5e-3).abs() < 1e-9, "no restart at cycle end: {s:?}");
         assert!(c.validate("lr_muon").is_empty());
@@ -266,7 +290,11 @@ mod tests {
 
     #[test]
     fn step_drops_by_gamma_each_interval() {
-        let c = LrConfig::Step { lr: 0.01, step_size: 2, gamma: 0.5 };
+        let c = LrConfig::Step {
+            lr: 0.01,
+            step_size: 2,
+            gamma: 0.5,
+        };
         let s = seq(&c, 5);
         assert!(s[0] > s[2], "no drop after step_size: {s:?}");
         assert!(s[2] > s[4], "no second drop: {s:?}");
@@ -281,13 +309,41 @@ mod tests {
         let cases: Vec<LrConfig> = vec![
             LrConfig::Constant { lr: 0.0 },
             LrConfig::Constant { lr: -1.0 },
-            LrConfig::Linear { lr: 0.0, max_lr: 0.01, warmup_steps: 1 },
-            LrConfig::Linear { lr: 0.01, max_lr: 0.01, warmup_steps: 0 },
-            LrConfig::Cosine { lr: 0.01, min_lr: 0.02, total_steps: 4 },
-            LrConfig::Cosine { lr: 0.01, min_lr: -1.0, total_steps: 4 },
-            LrConfig::Cosine { lr: 0.01, min_lr: 0.0, total_steps: 0 },
-            LrConfig::Step { lr: 0.01, step_size: 0, gamma: 0.5 },
-            LrConfig::Step { lr: 0.01, step_size: 1, gamma: 0.0 },
+            LrConfig::Linear {
+                lr: 0.0,
+                max_lr: 0.01,
+                warmup_steps: 1,
+            },
+            LrConfig::Linear {
+                lr: 0.01,
+                max_lr: 0.01,
+                warmup_steps: 0,
+            },
+            LrConfig::Cosine {
+                lr: 0.01,
+                min_lr: 0.02,
+                total_steps: 4,
+            },
+            LrConfig::Cosine {
+                lr: 0.01,
+                min_lr: -1.0,
+                total_steps: 4,
+            },
+            LrConfig::Cosine {
+                lr: 0.01,
+                min_lr: 0.0,
+                total_steps: 0,
+            },
+            LrConfig::Step {
+                lr: 0.01,
+                step_size: 0,
+                gamma: 0.5,
+            },
+            LrConfig::Step {
+                lr: 0.01,
+                step_size: 1,
+                gamma: 0.0,
+            },
         ];
         for c in &cases {
             let errs = c.validate("lr_muon");

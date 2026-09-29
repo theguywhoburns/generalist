@@ -41,7 +41,11 @@ pub struct ParityRule {
 impl ParityRule {
     fn parity(&self, input: &str) -> String {
         let n = input.bytes().filter(|b| *b == self.symbol).count();
-        if n % 2 == 1 { "1".to_string() } else { "0".to_string() }
+        if n % 2 == 1 {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        }
     }
 }
 

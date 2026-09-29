@@ -81,11 +81,17 @@ mod tests {
 
     #[test]
     fn ops_apply_and_verify() {
-        let r = CopyRule { op: CopyOp::Reverse, alphabet: b"abc".to_vec() };
+        let r = CopyRule {
+            op: CopyOp::Reverse,
+            alphabet: b"abc".to_vec(),
+        };
         assert_eq!(r.apply("abca"), "acba");
         assert!(r.verify("abca", "acba"));
         assert!(!r.verify("abca", "abca"));
-        let r = CopyRule { op: CopyOp::Repeat, alphabet: b"xy".to_vec() };
+        let r = CopyRule {
+            op: CopyOp::Repeat,
+            alphabet: b"xy".to_vec(),
+        };
         assert_eq!(r.apply("xy"), "xyxy");
     }
 

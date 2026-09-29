@@ -58,7 +58,10 @@ impl Default for DemoProtocol {
             k_set: vec![0, 1, 2, 3, 5, 8],
             k0_rate: 0.15,
             corrupt_rate: 0.05,
-            seps: ["->", ":", "=", "|"].iter().map(|s| s.to_string()).collect(),
+            seps: ["->", ":", "=", "|"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -408,8 +411,14 @@ mod tests {
     #[test]
     fn copy_rate_counts_verbatim() {
         let demos = vec![
-            Demo { input: "x".into(), output: "aa".into() },
-            Demo { input: "y".into(), output: "bb".into() },
+            Demo {
+                input: "x".into(),
+                output: "aa".into(),
+            },
+            Demo {
+                input: "y".into(),
+                output: "bb".into(),
+            },
         ];
         assert!((DemoProtocol::copy_rate(&demos, &["aa", "zz"]) - 0.5).abs() < 1e-9);
         assert_eq!(DemoProtocol::copy_rate(&demos, &[]), 0.0);

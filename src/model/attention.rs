@@ -108,8 +108,12 @@ impl<B: Backend> MultiHeadAttention<B> {
     ) -> Tensor<B, 3> {
         let [b, t, _] = x.dims();
         let device = x.device();
-        let q = self.rope.forward(self.split_heads(self.q.forward(x.clone())));
-        let k = self.rope.forward(self.split_heads(self.k.forward(x.clone())));
+        let q = self
+            .rope
+            .forward(self.split_heads(self.q.forward(x.clone())));
+        let k = self
+            .rope
+            .forward(self.split_heads(self.k.forward(x.clone())));
         let v = self.split_heads(self.v.forward(x));
 
         // scores[b,h,i,j] = q[b,h,i] . k[b,h,j] / sqrt(head_dim)
@@ -168,8 +172,8 @@ mod tests {
     use super::*;
     use crate::model::pad_mask;
     use crate::test_backend::{TestBackend, test_device};
-    use burn::tensor::TensorData;
     use burn::tensor::Int;
+    use burn::tensor::TensorData;
 
     fn test_mha() -> MultiHeadAttention<TestBackend> {
         // Production head geometry: H=4, head_dim=64.
@@ -195,8 +199,7 @@ mod tests {
         let device = x.device();
         let split = |x: Tensor<TestBackend, 3>| {
             let [b, t, _] = x.dims();
-            x.reshape([b, t, mha.n_heads, mha.head_dim])
-                .swap_dims(1, 2)
+            x.reshape([b, t, mha.n_heads, mha.head_dim]).swap_dims(1, 2)
         };
         let q = mha.rope.forward(split(mha.q.forward(x.clone())));
         let k = mha.rope.forward(split(mha.k.forward(x.clone())));
@@ -217,14 +220,15 @@ mod tests {
         let scores = match key_pad {
             None => scores,
             Some(pad) => {
-                scores + pad
-                    .bool_not()
-                    .unsqueeze_dim::<3>(1)
-                    .unsqueeze_dim::<4>(2)
-                    .float()
-                    .mul_scalar(-1.0)
-                    .add_scalar(1.0)
-                    .mul_scalar(-1e30)
+                scores
+                    + pad
+                        .bool_not()
+                        .unsqueeze_dim::<3>(1)
+                        .unsqueeze_dim::<4>(2)
+                        .float()
+                        .mul_scalar(-1.0)
+                        .add_scalar(1.0)
+                        .mul_scalar(-1e30)
             }
         };
         let probs = burn::tensor::activation::softmax(scores, 3);
@@ -320,12 +324,7 @@ mod tests {
         let pad = Tensor::<TestBackend, 2, Bool>::from_data(TensorData::new(pad, [b, t]), &device);
         let got = mha.forward_masked(x.clone(), Some(pad.clone()));
         let want = reference_forward(&mha, x, Some(pad));
-        let gvals = got
-            .clone()
-            .into_data()
-            .as_slice::<f32>()
-            .unwrap()
-            .to_vec();
+        let gvals = got.clone().into_data().as_slice::<f32>().unwrap().to_vec();
         assert_finite(&gvals, "degenerate-pad output");
         let diff = max_abs_diff(got, want);
         assert!(diff <= FWD_TOL, "degenerate pad diff {diff} > {FWD_TOL}");
@@ -342,9 +341,7 @@ mod tests {
             let pad = pad_mask::<TestBackend>(&lengths, t, &device);
 
             let xc = test_input(b, t).require_grad();
-            let loss_c = mha
-                .forward_masked(xc.clone(), Some(pad.clone()))
-                .sum();
+            let loss_c = mha.forward_masked(xc.clone(), Some(pad.clone())).sum();
             let grads_c = loss_c.backward();
             let gc = xc
                 .grad(&grads_c)

@@ -27,7 +27,10 @@ impl Task for DyckTask {
             Track::A => 1,
             Track::B => 4,
         };
-        Box::new(DyckRule { max_depth, min_depth })
+        Box::new(DyckRule {
+            max_depth,
+            min_depth,
+        })
     }
 }
 
@@ -152,7 +155,10 @@ mod tests {
 
     #[test]
     fn completions_balance() {
-        let rule = DyckRule { max_depth: 3, min_depth: 1 };
+        let rule = DyckRule {
+            max_depth: 3,
+            min_depth: 1,
+        };
         let mut rng = HarnessRng::new(21);
         for _ in 0..200 {
             let q = rule.render_query(&mut rng);

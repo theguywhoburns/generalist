@@ -30,7 +30,12 @@ impl Record {
         let bh: Vec<String> = self.block_halt.iter().map(|v| format!("{v:.3}")).collect();
         format!(
             "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}]}}",
-            self.task, self.k, self.correct, self.copied, self.steps_used, self.mean_halt,
+            self.task,
+            self.k,
+            self.correct,
+            self.copied,
+            self.steps_used,
+            self.mean_halt,
             bh.join(","),
         )
     }
@@ -99,12 +104,23 @@ pub fn summarize(records: &[Record]) -> Summary {
         return Summary::default();
     }
     let n = records.len() as f64;
-    let width = records.iter().map(|r| r.block_halt.len()).max().unwrap_or(0);
+    let width = records
+        .iter()
+        .map(|r| r.block_halt.len())
+        .max()
+        .unwrap_or(0);
     let col = |i: usize| -> Vec<f64> {
-        records.iter().filter_map(|r| r.block_halt.get(i).map(|v| *v as f64)).collect()
+        records
+            .iter()
+            .filter_map(|r| r.block_halt.get(i).map(|v| *v as f64))
+            .collect()
     };
     let mean = |v: &[f64]| -> f64 {
-        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
     };
     let correct_col = |i: usize| -> Vec<f64> {
         records
@@ -215,7 +231,12 @@ mod tests {
 
     #[test]
     fn summary_math() {
-        let rs = vec![rec(true, false), rec(false, true), rec(true, false), rec(true, false)];
+        let rs = vec![
+            rec(true, false),
+            rec(false, true),
+            rec(true, false),
+            rec(true, false),
+        ];
         let s = summarize(&rs);
         assert_eq!(s.n, 4);
         assert!((s.accuracy - 0.75).abs() < 1e-9);

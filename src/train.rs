@@ -6,18 +6,18 @@
 //! (seeds, pools) is the caller's job; see `Experiment` for data dispatch.
 
 use std::collections::HashSet;
-use std::time::Instant;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use burn::{
     config::Config,
     module::{AutodiffModule, Module, ParamId},
-    optim::{
-        AdamW, AdamWConfig, GradientsParams, Muon, Optimizer,
-        adaptor::OptimizerAdaptor,
-    },
+    optim::{AdamW, AdamWConfig, GradientsParams, Muon, Optimizer, adaptor::OptimizerAdaptor},
     record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder},
-    tensor::{Int, Tensor, TensorData, backend::{AutodiffBackend, Backend}},
+    tensor::{
+        Int, Tensor, TensorData,
+        backend::{AutodiffBackend, Backend},
+    },
 };
 
 use crate::{
@@ -244,25 +244,19 @@ impl<B: AutodiffBackend> Trainer<B> {
         // Targets and mask ALWAYS come from unpatched truth: scoring patched
         // positions against patched targets is circular (self-agreement
         // drives loss to 0 regardless of correctness).
-        let truth = crate::harness::collate_seqs(
-            base_seqs.clone(),
-            prompt_lens.clone(),
-            &self.device,
-        );
+        let truth =
+            crate::harness::collate_seqs(base_seqs.clone(), prompt_lens.clone(), &self.device);
         let tokens = if free_k == 0 {
             truth.tokens.clone()
         } else {
             let tokens_inner = truth.tokens.clone().inner();
             let lens = truth.lengths.clone();
             let valid = self.model.valid();
-            let logits = valid.forward(tokens_inner, &self.config, self.stop, &lens, None).logits;
+            let logits = valid
+                .forward(tokens_inner, &self.config, self.stop, &lens, None)
+                .logits;
             let [b2, t2, _] = logits.dims();
-            let pred = int_vec(
-                &logits
-                    .argmax(2)
-                    .reshape([b2 * t2])
-                    .into_data(),
-            );
+            let pred = int_vec(&logits.argmax(2).reshape([b2 * t2]).into_data());
             let patched = patch_free_inputs(&base_seqs, &prompt_lens, &pred, t2, free_k);
             crate::harness::collate_seqs(patched, prompt_lens, &self.device).tokens
         };
@@ -281,7 +275,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         );
         let out = self
             .model
-            .forward_act(col.tokens, &self.config, &col.lengths, None);        let (ce_answer, ce_eos) = crate::model::ce_split(
+            .forward_act(col.tokens, &self.config, &col.lengths, None);
+        let (ce_answer, ce_eos) = crate::model::ce_split(
             out.logits.clone(),
             col.targets.clone(),
             col.loss_mask.clone(),
@@ -447,7 +442,12 @@ impl<B: AutodiffBackend> Trainer<B> {
                     continue;
                 }
                 let t = row.len() + 1;
-                let next = res.logits.clone().slice([i..i + 1, t - 1..t, 0..v]).reshape([v]).argmax(0);
+                let next = res
+                    .logits
+                    .clone()
+                    .slice([i..i + 1, t - 1..t, 0..v])
+                    .reshape([v])
+                    .argmax(0);
                 let next_id = int_scalar(&next.into_data());
                 if next_id == crate::harness::EOS as i64 {
                     got_eos[i] = true;
@@ -484,7 +484,10 @@ impl<B: AutodiffBackend> Trainer<B> {
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
-                    block_halt: block_sums.iter().map(|s| s / n_decode.max(1) as f32).collect(),
+                    block_halt: block_sums
+                        .iter()
+                        .map(|s| s / n_decode.max(1) as f32)
+                        .collect(),
                 }
             })
             .collect()
@@ -543,7 +546,10 @@ pub fn final_eval_passes(n_stages: usize, shuffle: bool) -> Vec<(String, Option<
 
 /// Space-joined 2dp rendering for eval summary vectors.
 fn fmt2(vals: &[f64]) -> String {
-    vals.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>().join(" ")
+    vals.iter()
+        .map(|v| format!("{v:.2}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Outcome of one stage: last checkpoint path for `$prev` chaining.
@@ -588,7 +594,11 @@ pub fn run_stage<B: AutodiffBackend>(
 
     // Cheap insurance for the programmatic path. The loader already ran it.
     let problems = run.validate();
-    assert!(problems.is_empty(), "invalid run config:\n  - {}", problems.join("\n  - "));
+    assert!(
+        problems.is_empty(),
+        "invalid run config:\n  - {}",
+        problems.join("\n  - ")
+    );
 
     std::fs::create_dir_all(&run.train.ckpt_dir).expect("ckpt dir");
     let registry = TaskRegistry::builtin();
@@ -611,9 +621,14 @@ pub fn run_stage<B: AutodiffBackend>(
     // have silently taken its struct default rather than the manifest value.
     // The loop below already reads `run.train.*` directly, so the manifest is
     // the single source of truth for every knob.
-    println!("optimizer: {} | stop: {}", run.optim.name(), run.stop.kind_name());
-    let mut trainer =
-        Trainer::<B>::new(&run.model, &run.optim, run.stop, &run.train, device, init_from);
+    println!(
+        "optimizer: {} | stop: {}",
+        run.optim.name(),
+        run.stop.kind_name()
+    );
+    let mut trainer = Trainer::<B>::new(
+        &run.model, &run.optim, run.stop, &run.train, device, init_from,
+    );
     let mut rng = HarnessRng::new(run.train.seed ^ 0x9E37_79B9_7F4A_7C15);
     let watchdog = crate::fail_fast::Watchdog::spawn(run.train.stuck_timeout_secs);
     // Ponder warmup base: ramped per step via the setter below.
@@ -738,8 +753,10 @@ pub fn run_stage<B: AutodiffBackend>(
             }
             for (label, set) in evals {
                 let records = trainer.evaluate(set, run.train.eval_max_new, None);
-                let mut cells: std::collections::BTreeMap<(String, String), Vec<crate::harness::Record>> =
-                    std::collections::BTreeMap::new();
+                let mut cells: std::collections::BTreeMap<
+                    (String, String),
+                    Vec<crate::harness::Record>,
+                > = std::collections::BTreeMap::new();
                 for r in records {
                     cells
                         .entry((r.task.clone(), format!("{:?}", r.track)))
@@ -754,7 +771,11 @@ pub fn run_stage<B: AutodiffBackend>(
                     };
                     println!(
                         "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] (n={}) {vram}",
-                        s.accuracy, s.copy_rate, s.mean_halt, fmt2(&s.mean_block_halt), s.n
+                        s.accuracy,
+                        s.copy_rate,
+                        s.mean_halt,
+                        fmt2(&s.mean_block_halt),
+                        s.n
                     );
                     watchdog.ping_step(step);
                     for r in rs.iter() {
@@ -835,7 +856,10 @@ pub fn run_stage<B: AutodiffBackend>(
     }
     std::fs::write(&log_path, log).expect("write log");
     println!("wrote {log_path}; last ckpt {last_ckpt}");
-    StageOutcome { last_ckpt, log_path }
+    StageOutcome {
+        last_ckpt,
+        log_path,
+    }
 }
 
 fn scalar_of<B: Backend>(t: &Tensor<B, 1>) -> f32 {
@@ -881,7 +905,12 @@ fn int_scalar(data: &TensorData) -> i64 {
 fn int_vec(data: &TensorData) -> Vec<i64> {
     match data.dtype {
         burn::tensor::DType::I64 => data.as_slice::<i64>().unwrap().to_vec(),
-        burn::tensor::DType::I32 => data.as_slice::<i32>().unwrap().iter().map(|v| *v as i64).collect(),
+        burn::tensor::DType::I32 => data
+            .as_slice::<i32>()
+            .unwrap()
+            .iter()
+            .map(|v| *v as i64)
+            .collect(),
         d => panic!("unexpected int dtype {d:?}"),
     }
 }
@@ -891,7 +920,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::{Experiment, generate},
-        optim::{OptimConfig, MuonTuning},
+        optim::{MuonTuning, OptimConfig},
         tasks::TaskRegistry,
         test_backend::{TestBackend, test_device},
     };
@@ -954,8 +983,8 @@ mod tests {
 
     #[test]
     fn grads_flow_and_weights_move() {
-        use burn::optim::GradientsParams;
         use crate::harness::collate;
+        use burn::optim::GradientsParams;
 
         let registry = TaskRegistry::builtin();
         let exp = Experiment {
@@ -987,8 +1016,22 @@ mod tests {
         let mut zero = vec![];
         for (name, id, rank) in &named {
             let n: f32 = match rank {
-                2 => gp.remove::<IB, 2>(*id).unwrap().abs().sum().into_data().as_slice::<f32>().unwrap()[0],
-                _ => gp.remove::<IB, 1>(*id).unwrap().abs().sum().into_data().as_slice::<f32>().unwrap()[0],
+                2 => gp
+                    .remove::<IB, 2>(*id)
+                    .unwrap()
+                    .abs()
+                    .sum()
+                    .into_data()
+                    .as_slice::<f32>()
+                    .unwrap()[0],
+                _ => gp
+                    .remove::<IB, 1>(*id)
+                    .unwrap()
+                    .abs()
+                    .sum()
+                    .into_data()
+                    .as_slice::<f32>()
+                    .unwrap()[0],
             };
             if n == 0.0 {
                 zero.push(name.clone());
@@ -996,12 +1039,44 @@ mod tests {
         }
         assert!(zero.is_empty(), "params with zero grad: {zero:?}");
         // Weights must actually move after a step.
-        let before = trainer.model.stages[0].blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
-        let before_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let before = trainer.model.stages[0].blocks[0]
+            .attn
+            .q
+            .weight
+            .val()
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let before_head = trainer
+            .model
+            .head
+            .weight
+            .val()
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
         let refs: Vec<&Instance> = batch.iter().collect();
         trainer.train_step(&refs);
-        let after = trainer.model.stages[0].blocks[0].attn.q.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
-        let after_head = trainer.model.head.weight.val().into_data().as_slice::<f32>().unwrap().to_vec();
+        let after = trainer.model.stages[0].blocks[0]
+            .attn
+            .q
+            .weight
+            .val()
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let after_head = trainer
+            .model
+            .head
+            .weight
+            .val()
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
         assert_ne!(before, after, "muon param frozen after a step");
         assert_ne!(before_head, after_head, "adamw param frozen after a step");
     }
@@ -1046,7 +1121,7 @@ mod tests {
     /// the numbers in a manifest must be the numbers the trainer applies.
     #[test]
     fn manifest_learning_rates_reach_the_trainer() {
-        use crate::harness::{load_run, RunConfig};
+        use crate::harness::{RunConfig, load_run};
         let base = RunConfig::smoke();
         let value = serde_json::to_value(&base).expect("serialize");
         let path = std::env::temp_dir().join("generalist-lr-through-loader.json");
@@ -1076,14 +1151,12 @@ mod tests {
     fn stop_mode_actually_reaches_the_forward() {
         let trainer = tiny_trainer();
         // ACT: the step count is data-dependent and within the config's range.
-        let act = trainer
-            .model
-            .forward_act(
-                burn::tensor::Tensor::zeros([2, 4], &test_device()),
-                &trainer.config,
-                &[4, 4],
-                None,
-            );
+        let act = trainer.model.forward_act(
+            burn::tensor::Tensor::zeros([2, 4], &test_device()),
+            &trainer.config,
+            &[4, 4],
+            None,
+        );
         assert!(act.steps_used >= 1 && act.steps_used <= 4);
 
         // Fixed: the step count is exactly what was asked for, at every
@@ -1126,7 +1199,11 @@ mod tests {
                 .with_max_seq_len(256)
                 // Ponder is meaningless without ACT; matches what the loader
                 // requires of a real manifest.
-                .with_ponder_weight(if matches!(stop, StopConfig::Act) { 1e-3 } else { 0.0 });
+                .with_ponder_weight(if matches!(stop, StopConfig::Act) {
+                    1e-3
+                } else {
+                    0.0
+                });
             let optim = OptimConfig::Muon(MuonTuning::new());
             let mut trainer = Trainer::<TestBackend>::new(
                 &model_cfg,
@@ -1178,7 +1255,10 @@ mod tests {
         for _ in 0..11 {
             seen.push(trainer.lrs.step().0);
         }
-        assert!((seen[0] - 1e-4).abs() < 1e-12, "ramp did not start at lr: {seen:?}");
+        assert!(
+            (seen[0] - 1e-4).abs() < 1e-12,
+            "ramp did not start at lr: {seen:?}"
+        );
         // Monotonic non-decreasing; the ramp is strictly rising until it
         // saturates at the peak, then flat.
         for w in seen.windows(2) {
@@ -1189,7 +1269,10 @@ mod tests {
             "peak not reached on call warmup_steps+1: {seen:?}"
         );
         // And it holds at the peak thereafter.
-        assert!((seen[10] - seen[11]).abs() < 1e-12, "did not hold: {seen:?}");
+        assert!(
+            (seen[10] - seen[11]).abs() < 1e-12,
+            "did not hold: {seen:?}"
+        );
     }
 
     #[test]
@@ -1208,8 +1291,10 @@ mod tests {
             let batch = Trainer::<TestBackend>::sample_banded_batch(&mut rng, &pool, 8);
             assert_eq!(batch.len(), 8);
             // Contiguous in the sorted pool: lengths non-decreasing.
-            let lens: Vec<usize> =
-                batch.iter().map(|i| i.prompt.len() + i.target.len()).collect();
+            let lens: Vec<usize> = batch
+                .iter()
+                .map(|i| i.prompt.len() + i.target.len())
+                .collect();
             assert!(lens.windows(2).all(|w| w[0] <= w[1]));
             // Tight band: window span small relative to pool range.
             assert!(*lens.last().unwrap() - lens[0] <= 200);
@@ -1287,11 +1372,8 @@ mod tests {
         let path = dir.join("model.mpk");
         trainer.save_checkpoint(&path);
         assert!(path.exists());
-        let _loaded = Trainer::<TestBackend>::load_checkpoint(
-            &trainer.config,
-            &path,
-            &test_device(),
-        );
+        let _loaded =
+            Trainer::<TestBackend>::load_checkpoint(&trainer.config, &path, &test_device());
         std::fs::remove_file(&path).ok();
     }
 
@@ -1305,7 +1387,8 @@ mod tests {
     }
 
     #[test]
-    fn final_eval_passes_gate_shuffle() {        let off = final_eval_passes(4, false);
+    fn final_eval_passes_gate_shuffle() {
+        let off = final_eval_passes(4, false);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].0, "final");
         assert!(off[0].1.is_none());

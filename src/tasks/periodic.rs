@@ -27,7 +27,13 @@ impl Task for PeriodicTask {
         let mut motif: Vec<u8> = (0..period).map(|_| *rng.pick(alphabet)).collect();
         if motif.iter().all(|c| *c == motif[0]) {
             let last = motif.len() - 1;
-            motif[last] = *rng.pick(&alphabet.iter().filter(|c| **c != motif[0]).copied().collect::<Vec<_>>());
+            motif[last] = *rng.pick(
+                &alphabet
+                    .iter()
+                    .filter(|c| **c != motif[0])
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
         }
         Box::new(PeriodicRule { motif })
     }

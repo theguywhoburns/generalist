@@ -21,11 +21,7 @@
 
 use std::collections::HashSet;
 
-use burn::{
-    module::ParamId,
-    optim::GradientsParams,
-    tensor::backend::AutodiffBackend,
-};
+use burn::{module::ParamId, optim::GradientsParams, tensor::backend::AutodiffBackend};
 
 /// Split into (hidden-matrix grads, everything-else grads). Missing ids are
 /// skipped, so a parameter that received no gradient this step is simply not

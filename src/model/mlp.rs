@@ -17,11 +17,7 @@ pub struct SwiGluMlp<B: Backend> {
 
 impl<B: Backend> SwiGluMlp<B> {
     pub fn new(d_model: usize, hidden: usize, device: &B::Device) -> Self {
-        let proj = |d_in, d_out| {
-            LinearConfig::new(d_in, d_out)
-                .with_bias(false)
-                .init(device)
-        };
+        let proj = |d_in, d_out| LinearConfig::new(d_in, d_out).with_bias(false).init(device);
         Self {
             gate: proj(d_model, hidden),
             up: proj(d_model, hidden),

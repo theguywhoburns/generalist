@@ -38,7 +38,10 @@ impl ParamKind {
     /// Muon-routed classes: 2D hidden matrices with curvature worth
     /// orthogonalizing. Everything else rides AdamW.
     pub fn muon_routed(&self) -> bool {
-        matches!(self, ParamKind::Attention | ParamKind::MlpIn | ParamKind::MlpDown)
+        matches!(
+            self,
+            ParamKind::Attention | ParamKind::MlpIn | ParamKind::MlpDown
+        )
     }
 }
 
@@ -54,7 +57,12 @@ pub struct ParamSpec {
 
 impl ParamSpec {
     pub fn new(id: ParamId, rank: usize, kind: ParamKind, label: String) -> Self {
-        Self { id, rank, kind, label }
+        Self {
+            id,
+            rank,
+            kind,
+            label,
+        }
     }
 }
 
@@ -101,11 +109,7 @@ impl<B: Backend> LoopedStage<B> {
     }
 
     /// One full pass through this stage's stack.
-    fn iterate(
-        &self,
-        x: Tensor<B, 3>,
-        key_pad: &Tensor<B, 2, burn::tensor::Bool>,
-    ) -> Tensor<B, 3> {
+    fn iterate(&self, x: Tensor<B, 3>, key_pad: &Tensor<B, 2, burn::tensor::Bool>) -> Tensor<B, 3> {
         let mut x = x;
         for block in &self.blocks {
             x = block.forward_masked(x, Some(key_pad.clone()));
@@ -147,11 +151,7 @@ impl<B: Backend> LoopedTransformer<B> {
     }
 
     /// One full pass through all stages (one loop iteration).
-    fn iterate(
-        &self,
-        x: Tensor<B, 3>,
-        key_pad: &Tensor<B, 2, burn::tensor::Bool>,
-    ) -> Tensor<B, 3> {
+    fn iterate(&self, x: Tensor<B, 3>, key_pad: &Tensor<B, 2, burn::tensor::Bool>) -> Tensor<B, 3> {
         let mut x = x;
         for stage in &self.stages {
             x = stage.iterate(x, key_pad);
@@ -234,10 +234,7 @@ impl<B: Backend> LoopedTransformer<B> {
             None => (0..n).collect(),
             Some(o) => {
                 assert_eq!(o.len(), n, "stage order length {} != n_stages {n}", o.len());
-                assert!(
-                    o.iter().all(|&i| i < n),
-                    "stage order index out of range"
-                );
+                assert!(o.iter().all(|&i| i < n), "stage order index out of range");
                 o.to_vec()
             }
         };
@@ -290,8 +287,9 @@ impl<B: Backend> LoopedTransformer<B> {
                 if s == max {
                     // Force-halt everything still running: remainder weight.
                     // Maxed-out tokens pay the full ponder price.
-                    let rem =
-                        zeros_bt.clone().mask_where(still.clone(), ones_bt.clone() - cum.clone());
+                    let rem = zeros_bt
+                        .clone()
+                        .mask_where(still.clone(), ones_bt.clone() - cum.clone());
                     out = out + rem.clone().unsqueeze_dim::<3>(2) * x.clone();
                     cum = cum + rem.clone();
                     ponder = ponder + still_f.clone() + rem.clone();
@@ -324,7 +322,11 @@ impl<B: Backend> LoopedTransformer<B> {
             }
             // This stage's readout seeds the next stage (in execution order).
             // `block_halts[si]` always refers to stage `si` (`bh[i]` = Bi).
-            block_halts[si] = scalar_of(&(halt_step.clone() * keep_f.clone()).sum().div(denom.clone()));
+            block_halts[si] = scalar_of(
+                &(halt_step.clone() * keep_f.clone())
+                    .sum()
+                    .div(denom.clone()),
+            );
             total_ponder = total_ponder + ponder;
             total_halt = total_halt + halt_step;
             steps_used += used;
@@ -360,11 +362,7 @@ impl<B: Backend> LoopedTransformer<B> {
         let mut steps_used = config.max_loops;
         for s in 1..=config.max_loops {
             let x_new = self.iterate(x.clone(), &key_pad);
-            let num = scalar_of(
-                &(x_new.clone() - x.clone())
-                    .powf_scalar(2.0)
-                    .mean(),
-            );
+            let num = scalar_of(&(x_new.clone() - x.clone()).powf_scalar(2.0).mean());
             let den = scalar_of(&x.clone().powf_scalar(2.0).mean()) + 1e-8;
             x = x_new;
             if (num.sqrt() / den.sqrt()) < config.conv_tol as f32 {
@@ -387,7 +385,7 @@ impl<B: Backend> LoopedTransformer<B> {
         }
     }
 
-/// 2D hidden-matrix ids routed to Muon, derived from
+    /// 2D hidden-matrix ids routed to Muon, derived from
     /// [`Self::param_specs`] by semantic class — not by name strings and not
     /// by enumeration — so new modules with classified 2D matrices need zero
     /// optimizer changes. Muon paper recipe: embedding, LM head, norms,
@@ -441,9 +439,24 @@ impl<B: Backend> LoopedTransformer<B> {
                 for (label, id) in mlp_in {
                     specs.push(ParamSpec::new(id, 2, MlpIn, label));
                 }
-                specs.push(ParamSpec::new(b.mlp.down.weight.id, 2, MlpDown, format!("down{i}")));
-                specs.push(ParamSpec::new(b.norm1.gamma.id, 1, Norm, format!("norm1_{i}")));
-                specs.push(ParamSpec::new(b.norm2.gamma.id, 1, Norm, format!("norm2_{i}")));
+                specs.push(ParamSpec::new(
+                    b.mlp.down.weight.id,
+                    2,
+                    MlpDown,
+                    format!("down{i}"),
+                ));
+                specs.push(ParamSpec::new(
+                    b.norm1.gamma.id,
+                    1,
+                    Norm,
+                    format!("norm1_{i}"),
+                ));
+                specs.push(ParamSpec::new(
+                    b.norm2.gamma.id,
+                    1,
+                    Norm,
+                    format!("norm2_{i}"),
+                ));
                 i += 1;
             }
             specs.push(ParamSpec::new(
@@ -459,8 +472,18 @@ impl<B: Backend> LoopedTransformer<B> {
                 format!("halt_b{s}"),
             ));
         }
-        specs.push(ParamSpec::new(self.norm_f.gamma.id, 1, Norm, "norm_f".to_string()));
-        specs.push(ParamSpec::new(self.head.weight.id, 2, Output, "head".to_string()));
+        specs.push(ParamSpec::new(
+            self.norm_f.gamma.id,
+            1,
+            Norm,
+            "norm_f".to_string(),
+        ));
+        specs.push(ParamSpec::new(
+            self.head.weight.id,
+            2,
+            Output,
+            "head".to_string(),
+        ));
         specs
     }
 }
@@ -572,18 +595,12 @@ mod loss_tests {
     use crate::test_backend::{TestBackend, test_device};
     use burn::nn::LinearConfig;
     use burn::optim::GradientsParams;
-    use burn::tensor::{Int, Tensor, TensorData};
     use burn::tensor::backend::AutodiffBackend;
+    use burn::tensor::{Int, Tensor, TensorData};
 
     type IB = <TestBackend as AutodiffBackend>::InnerBackend;
 
-    fn grad_norm_of_head(
-        b: usize,
-        t: usize,
-        v: usize,
-        d: usize,
-        n_scored_per_row: usize,
-    ) -> f32 {
+    fn grad_norm_of_head(b: usize, t: usize, v: usize, d: usize, n_scored_per_row: usize) -> f32 {
         let device = test_device();
         let lin = LinearConfig::new(d, v)
             .with_bias(false)
@@ -601,8 +618,7 @@ mod loss_tests {
         }
         let targets =
             Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(tgt, [b, t]), &device);
-        let mask =
-            Tensor::<TestBackend, 2>::from_data(TensorData::new(msk, [b, t]), &device);
+        let mask = Tensor::<TestBackend, 2>::from_data(TensorData::new(msk, [b, t]), &device);
         let ponder = Tensor::<TestBackend, 1>::zeros([1], &device);
         let loss = lm_loss(logits, targets, mask, ponder, 0.0);
         let mut gp = GradientsParams::from_grads(loss.backward(), &lin);
@@ -633,9 +649,7 @@ mod loss_tests {
         assert!(lv > 0.5 && lv < 3.0, "unexpected loss value {lv}");
         let mut gp = GradientsParams::from_grads(loss.backward(), &lin);
         assert_eq!(gp.len(), 1);
-        let g = gp
-            .remove::<IB, 2>(lin.weight.id)
-            .unwrap();
+        let g = gp.remove::<IB, 2>(lin.weight.id).unwrap();
         let n: f32 = g.abs().sum().into_data().as_slice::<f32>().unwrap()[0];
         assert!(n > 0.0, "lm_loss CE grad is zero in isolation");
     }
@@ -697,7 +711,13 @@ mod tests {
         let p = scalar_of(&out.ponder);
         assert!((0.0..=5.0).contains(&p), "ponder {p} out of range");
         // graph is trainable
-        let loss = lm_loss(out.logits, tokens(), full_mask(), out.ponder, cfg.ponder_weight);
+        let loss = lm_loss(
+            out.logits,
+            tokens(),
+            full_mask(),
+            out.ponder,
+            cfg.ponder_weight,
+        );
         let _grads = loss.backward();
     }
 
@@ -802,7 +822,12 @@ mod tests {
         let full = model.forward_fixed(row.clone(), &[4, 4], 2);
         let padded = model.forward_fixed(row, &[4, 1], 2);
         let a = full.logits.into_data().as_slice::<f32>().unwrap().to_vec();
-        let b = padded.logits.into_data().as_slice::<f32>().unwrap().to_vec();
+        let b = padded
+            .logits
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
         // Row 0 identical across runs (no cross-batch leakage, deterministic).
         assert_eq!(&a[..1024], &b[..1024]);
         // Row 1 differs: full causal context vs pos0-only keys.
@@ -827,14 +852,36 @@ mod tests {
             .with_max_seq_len(128);
         let model = LoopedTransformer::<TestBackend>::new(&cfg, &device);
         let row: Vec<i64> = (0..20).map(|i| 5 + (i % 20)).collect();
-        let t64: Vec<i64> = row.iter().cloned().chain(std::iter::repeat(0)).take(64).collect();
-        let t128: Vec<i64> = row.iter().cloned().chain(std::iter::repeat(0)).take(128).collect();
+        let t64: Vec<i64> = row
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat(0))
+            .take(64)
+            .collect();
+        let t128: Vec<i64> = row
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat(0))
+            .take(128)
+            .collect();
         let a = Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(t64, [1, 64]), &device);
         let b = Tensor::<TestBackend, 2, Int>::from_data(TensorData::new(t128, [1, 128]), &device);
         let oa = model.forward_fixed(a, &[20], 2);
         let ob = model.forward_fixed(b, &[20], 2);
-        let va = oa.logits.slice([0..1, 0..20, 0..256]).into_data().as_slice::<f32>().unwrap().to_vec();
-        let vb = ob.logits.slice([0..1, 0..20, 0..256]).into_data().as_slice::<f32>().unwrap().to_vec();
+        let va = oa
+            .logits
+            .slice([0..1, 0..20, 0..256])
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let vb = ob
+            .logits
+            .slice([0..1, 0..20, 0..256])
+            .into_data()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
         assert_eq!(va.len(), vb.len());
         for (x, y) in va.iter().zip(vb.iter()) {
             assert!((x - y).abs() < 1e-3, "T-bucket dependence: {x} vs {y}");
@@ -853,8 +900,7 @@ mod tests {
                 (0..4).flat_map(move |t| (0..8).map(move |v| (100 * b + 10 * t + v) as f32))
             })
             .collect();
-        let x =
-            Tensor::<TestBackend, 3>::from_data(TensorData::new(flat, [2, 4, 8]), &device);
+        let x = Tensor::<TestBackend, 3>::from_data(TensorData::new(flat, [2, 4, 8]), &device);
         let s = x.slice([0..2, 1..3, 2..5]);
         assert_eq!(s.dims(), [2, 2, 3]);
         let v = s.into_data().as_slice::<f32>().unwrap().to_vec();
@@ -869,7 +915,10 @@ mod tests {
         assert_eq!(v, expected);
         // Single-row single-position slice as used in greedy decode.
         let x2 = Tensor::<TestBackend, 3>::from_data(
-            TensorData::new((0..2 * 4 * 8).map(|i| i as f32).collect::<Vec<_>>(), [2, 4, 8]),
+            TensorData::new(
+                (0..2 * 4 * 8).map(|i| i as f32).collect::<Vec<_>>(),
+                [2, 4, 8],
+            ),
             &device,
         );
         let one = x2.slice([1..2, 3..4, 0..8]).reshape([8]);

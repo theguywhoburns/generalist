@@ -125,10 +125,7 @@ mod tests {
     #[test]
     fn collate_masks_prompt_and_pad() {
         let device = test_device();
-        let batch = collate::<TestBackend>(
-            &[inst(b"ab->", b"cd"), inst(b"abc->", b"d")],
-            &device,
-        );
+        let batch = collate::<TestBackend>(&[inst(b"ab->", b"cd"), inst(b"abc->", b"d")], &device);
         // Bucketed to edge 64; real lengths recorded exactly.
         assert_eq!(batch.tokens.dims(), [2, 64]);
         assert_eq!(batch.lengths, vec![7, 7]);
@@ -154,7 +151,12 @@ mod tests {
         fn ints(data: &TensorData) -> Vec<i64> {
             match data.dtype {
                 DType::I64 => data.as_slice::<i64>().unwrap().to_vec(),
-                DType::I32 => data.as_slice::<i32>().unwrap().iter().map(|v| *v as i64).collect(),
+                DType::I32 => data
+                    .as_slice::<i32>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| *v as i64)
+                    .collect(),
                 d => panic!("{d:?}"),
             }
         }
