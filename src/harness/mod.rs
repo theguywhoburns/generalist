@@ -5,11 +5,13 @@
 //! [`Record`]s via [`Jsonl`]. New metric = one function over `Record`s.
 
 pub mod batch;
+pub mod config;
 pub mod experiment;
 pub mod metrics;
 pub mod run;
 
 pub use batch::{BUCKET_EDGES, Collated, EOS, PAD, bucket_len, collate, collate_seqs};
+pub use config::{ConfigError, load_chain, load_plan, load_run, save_run};
 pub use experiment::{Experiment, generate};
 pub use run::{ExperimentPlan, PlannedExperiment, RunConfig};
 pub use metrics::{Jsonl, Record, summarize};

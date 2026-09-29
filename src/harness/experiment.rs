@@ -40,6 +40,31 @@ impl Experiment {
             ..Default::default()
         }
     }
+
+    /// Cross-field problems, all at once. A manifest is user input, so these
+    /// are reported rather than asserted: an empty `k_set` or a task name
+    /// that does not exist is a typo, not a bug to crash on.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.tasks.is_empty() {
+            problems.push(
+                "experiment: tasks is empty (an empty list means \"all builtin\", \
+                 which a manifest almost certainly did not intend)"
+                    .to_string(),
+            );
+        }
+        if self.tracks.is_empty() {
+            problems.push("experiment: tracks is empty; the run would generate nothing".to_string());
+        }
+        if self.seeds.is_empty() {
+            problems.push("experiment: seeds is empty; the run would generate nothing".to_string());
+        }
+        if self.per_cell == 0 {
+            problems.push("experiment: per_cell must be >= 1".to_string());
+        }
+        problems.extend(self.protocol.validate());
+        problems
+    }
 }
 
 /// Generate every instance for the experiment. Deterministic in

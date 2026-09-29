@@ -35,6 +35,11 @@ impl InstanceInfo {
     }
 }
 
+/// Ceiling on demonstrations per instance, from the context budget. The
+/// protocol is free to sample any k, but a k above this will not fit in the
+/// sequence, so manifests get it flagged rather than a runtime OOM.
+pub const MAX_K: usize = 16;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DemoProtocol {
     /// k values sampled per instance.
@@ -59,6 +64,45 @@ impl Default for DemoProtocol {
 }
 
 impl DemoProtocol {
+    /// Cross-field problems, all at once. Reported rather than asserted
+    /// because a protocol block is manifest input.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.k_set.is_empty() {
+            problems.push(
+                "experiment.protocol: k_set is empty; every instance would have zero demos, \
+                 which silently turns the run into a weights-only experiment"
+                    .to_string(),
+            );
+        }
+        if self.k_set.iter().any(|k| *k > MAX_K) {
+            problems.push(format!(
+                "experiment.protocol: k_set contains a k above the context budget {MAX_K}; \
+                 those instances will not fit in the sequence"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.k0_rate) {
+            problems.push(format!(
+                "experiment.protocol: k0_rate must be in [0, 1], got {}",
+                self.k0_rate
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.corrupt_rate) {
+            problems.push(format!(
+                "experiment.protocol: corrupt_rate must be in [0, 1], got {}",
+                self.corrupt_rate
+            ));
+        }
+        if self.seps.is_empty() {
+            problems.push(
+                "experiment.protocol: seps is empty; no prompt would carry a separator, \
+                 so demos and the query would run together"
+                    .to_string(),
+            );
+        }
+        problems
+    }
+
     /// Bounded resample tries per demo slot. Large enough that exclusion /
     /// balancing always succeeds on real tasks (output spaces are far from
     /// singleton); on exhaustion the last render is kept so build can never
