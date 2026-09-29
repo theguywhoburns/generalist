@@ -19,6 +19,12 @@ pub struct Record {
     pub mean_halt: f32,
     /// Mean halt steps per block (where the compute happened).
     pub block_halt: Vec<f32>,
+    /// The run's training seed.
+    ///
+    /// Carried per-record because a comparison across seeds is the whole
+    /// point of a seed sweep, and a log where the seed lives only in the
+    /// filename cannot be aggregated without re-joining on string parsing.
+    pub seed: u64,
 }
 
 impl Record {
@@ -29,7 +35,7 @@ impl Record {
         };
         let bh: Vec<String> = self.block_halt.iter().map(|v| format!("{v:.3}")).collect();
         format!(
-            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}]}}",
+            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
             self.task,
             self.k,
             self.correct,
@@ -37,6 +43,7 @@ impl Record {
             self.steps_used,
             self.mean_halt,
             bh.join(","),
+            self.seed,
         )
     }
 }
@@ -226,6 +233,7 @@ mod tests {
             steps_used: 6,
             mean_halt: 4.5,
             block_halt: vec![1.0, 1.5, 1.0, 1.0],
+            seed: 0,
         }
     }
 
@@ -308,5 +316,34 @@ mod tests {
         j.push(&rec(false, false));
         assert_eq!(j.text().lines().count(), 2);
         assert!(j.text().contains("\"track\":\"B\""));
+    }
+
+    /// A seed sweep has to be aggregatable from the log alone. The seed
+    /// therefore rides on every record rather than living only in the run's
+    /// ckpt_dir name, which a multi-run aggregation cannot join on cheaply.
+    #[test]
+    fn records_carry_their_seed_into_json() {
+        let mut r = rec(true, false);
+        r.seed = 7;
+        let text = r.to_json();
+        assert!(text.contains("\"seed\":7"), "seed missing from {text}");
+        // And it parses, so the field is not just textually present.
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["seed"], serde_json::json!(7));
+        // Grouping by seed across records is then a plain filter.
+        let mut j = Jsonl::default();
+        j.push(&r);
+        r.seed = 8;
+        j.push(&r);
+        let seeds: Vec<u64> = j
+            .text()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["seed"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seeds, vec![7, 8]);
     }
 }

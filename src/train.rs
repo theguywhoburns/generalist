@@ -152,6 +152,9 @@ pub struct Trainer<B: AutodiffBackend> {
     stop: StopMode,
     /// Advanced once per optimizer step, never per micro-batch.
     lrs: LrPair,
+    /// The run's training seed, stamped onto every eval record so a multi-seed
+    /// comparison is aggregatable from the log alone.
+    pub seed: u64,
     device: B::Device,
     /// Current scheduled-sampling depth (see `free_schedule`).
     pub free_k: usize,
@@ -191,6 +194,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             config: model_config.clone(),
             stop: stop.to_mode(),
             lrs,
+            seed: train.seed,
             device: device.clone(),
             free_k: 0,
         }
@@ -515,6 +519,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                         .iter()
                         .map(|s| s / n_decode.max(1) as f32)
                         .collect(),
+                    seed: self.seed,
                 }
             })
             .collect()
