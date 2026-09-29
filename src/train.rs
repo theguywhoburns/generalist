@@ -446,18 +446,42 @@ impl<B: AutodiffBackend> Trainer<B> {
             let v = self.config.vocab_size;
             let mut next_ids = vec![0i64; g];
             let mut got_eos = vec![false; g];
+            // One argmax over the whole batch instead of one per row. Each
+            // row's next byte is the argmax at ITS OWN last position, and the
+            // rows finish at different times, so the positions are gathered
+            // into a `[g, V]` tensor and the reduction runs once. The old
+            // per-row `slice + argmax` was B kernel launches and B host
+            // readbacks per decode step; at max_new=64 and chunk 8 that is
+            // 512 launches per chunk, and each readback is a pipeline stall.
+            //
+            // Inactive rows index position 0 with a clamped value: they are
+            // skipped below, so their argmax is never read.
+            let mut positions: Vec<usize> = Vec::with_capacity(g);
             for (i, row) in ids.iter().enumerate() {
+                let t = if active[i] { row.len() } else { 0 };
+                positions.push(t.min(tmax.saturating_sub(1)));
+            }
+            // Flatten (row, time) into one axis and gather each row's own last
+            // position with a single `select`. `take` would insert the index
+            // axis into the shape ([B, g, V]) rather than removing it, so a
+            // flat `select` on `[B*T, V]` is the shape-clean route: the result
+            // is exactly `[g, V]`, one row per gathered position.
+            let flat: Vec<i64> = positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i * tmax + p) as i64)
+                .collect();
+            let index = Tensor::<B::InnerBackend, 1, Int>::from_data(
+                TensorData::new(flat, [g]),
+                &self.device,
+            );
+            let gathered = res.logits.clone().reshape([g * tmax, v]).select(0, index);
+            let preds = int_vec(&gathered.argmax(1).into_data());
+            for i in 0..g {
                 if !active[i] {
                     continue;
                 }
-                let t = row.len() + 1;
-                let next = res
-                    .logits
-                    .clone()
-                    .slice([i..i + 1, t - 1..t, 0..v])
-                    .reshape([v])
-                    .argmax(0);
-                let next_id = int_scalar(&next.into_data());
+                let next_id = preds[i];
                 if next_id == crate::harness::EOS as i64 {
                     got_eos[i] = true;
                 } else {
@@ -827,7 +851,14 @@ pub fn run_stage<B: AutodiffBackend>(
                 info.loss, info.ce_answer, info.ce_eos, trainer.free_k, rate
             );
         }
-        if step % run.train.ckpt_every == 0 {
+        // Skip the in-loop save on the final step: the post-loop snapshot
+        // writes the same `step{steps}.mpk` path moments later. With the
+        // shipped manifests (steps 500, ckpt_every 100) that was a duplicate
+        // write of a 3.5M-param record on every run. The final path is still
+        // written exactly once, by the post-loop snapshot, so a chain's
+        // `init_from: $prev` is unaffected.
+        let is_final_step = step + 1 == run.train.steps;
+        if !is_final_step && step % run.train.ckpt_every == 0 {
             last_ckpt = format!("{}/step{:06}.mpk", run.train.ckpt_dir, step);
             trainer.save_checkpoint(Path::new(&last_ckpt));
         }
@@ -986,11 +1017,9 @@ pub fn patch_free_inputs(
         .collect()
 }
 
-/// Backend-agnostic Int readback (NdArray uses i64, CUDA uses i32).
-fn int_scalar(data: &TensorData) -> i64 {
-    int_vec(data).into_iter().next().unwrap_or(-1)
-}
-
+/// Backend-agnostic Int readback (NdArray uses i64, CUDA uses i32). Always a
+/// batched readback: the per-row `int_scalar` this replaced cost one host sync
+/// per row per decode step.
 fn int_vec(data: &TensorData) -> Vec<i64> {
     match data.dtype {
         burn::tensor::DType::I64 => data.as_slice::<i64>().unwrap().to_vec(),
@@ -1492,6 +1521,104 @@ mod tests {
             (seen[10] - seen[11]).abs() < 1e-12,
             "did not hold: {seen:?}"
         );
+    }
+
+    /// The run must end with the final-step checkpoint on disk, exactly once,
+    /// and the path must be the one a chain's `init_from: $prev` picks up.
+    /// The in-loop cadence skips the final step, so this is the only place
+    /// that file is written.
+    #[test]
+    fn final_checkpoint_is_written_once_and_named_for_chaining() {
+        // `run_stage` generates the pool itself, so this drives it through the
+        // real entry point rather than assembling instances by hand.
+        let dir = std::env::temp_dir().join("generalist-final-ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut run = crate::harness::RunConfig::smoke();
+        run.experiment.per_cell = 8;
+        run.experiment.seeds = vec![0];
+        run.train.steps = 4;
+        run.train.ckpt_every = 2; // divides steps, so the naive code double-writes
+        run.train.eval_every = 100; // no mid-run eval
+        run.train.eval_max_new = 2;
+        run.train.ckpt_dir = dir.display().to_string();
+        run.train.eval_holdout = 0.25;
+
+        let outcome = run_stage::<TestBackend>(&run, &test_device(), None, &[]);
+        let expected = format!("{}/step{:06}.mpk", dir.display(), run.train.steps);
+        assert_eq!(outcome.last_ckpt, expected, "chaining path changed");
+        assert!(
+            std::path::Path::new(&expected).exists(),
+            "no final checkpoint"
+        );
+        // The in-loop saves before it still happened.
+        assert!(std::path::Path::new(&format!("{}/step000000.mpk", dir.display())).exists());
+        assert!(std::path::Path::new(&format!("{}/step000002.mpk", dir.display())).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eval decode must be invariant to chunk size, and chunk-independent
+    /// per-row accuracy is what the batched argmax has to preserve.
+    ///
+    /// The gather replaced a per-row `slice + argmax + into_data` with one
+    /// flat `select` plus one batched argmax. That is only sound if every row
+    /// still reads ITS OWN last position, which a shape mix-up would hide:
+    /// wrong values can still decode to plausible strings. So the batched
+    /// path is checked against chunk size 1, where the old per-row structure
+    /// was unambiguous.
+    #[test]
+    fn batched_decode_matches_single_row_decode() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["parity".to_string()],
+            per_cell: 16,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let eval: Vec<Instance> = pool.iter().take(8).cloned().collect();
+        let trainer = tiny_trainer();
+
+        // Chunk 1: each row decodes in its own forward.
+        let one = trainer.evaluate_batched(&eval, 12, 1, None);
+        // Chunk 8: all rows decode in lockstep through the batched gather.
+        let all = trainer.evaluate_batched(&eval, 12, 8, None);
+
+        assert_eq!(one.len(), eval.len());
+        assert_eq!(all.len(), eval.len());
+        for (a, b) in one.iter().zip(all.iter()) {
+            assert_eq!(a.correct, b.correct, "correctness flipped with chunk size");
+            assert_eq!(a.copied, b.copied);
+            assert_eq!(a.k, b.k);
+            // steps/halt are batch means and legitimately differ; per-row
+            // verdict equality is the invariant.
+        }
+    }
+
+    /// Rows that finish at different steps must each read their own last
+    /// position, including a row that hits the `max_new` cap rather than EOS.
+    /// Short and long targets in one chunk is exactly the case a positional
+    /// mix-up would corrupt.
+    #[test]
+    fn decode_handles_mixed_row_lengths() {
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["subst-fst".to_string()],
+            per_cell: 32,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        // Sort by target length so the chunk spans a wide range of finish times.
+        let mut eval: Vec<Instance> = pool.iter().take(8).cloned().collect();
+        eval.sort_by_key(|i| i.target.len());
+        let trainer = tiny_trainer();
+        let one = trainer.evaluate_batched(&eval, 6, 1, None);
+        let all = trainer.evaluate_batched(&eval, 6, 8, None);
+        for (a, b) in one.iter().zip(all.iter()) {
+            assert_eq!(a.correct, b.correct);
+            assert_eq!(a.copied, b.copied);
+        }
     }
 
     #[test]

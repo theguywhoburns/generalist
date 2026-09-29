@@ -348,6 +348,13 @@ impl<B: Backend> LoopedTransformer<B> {
     /// Latent-convergence loop (RD-VLA style): run until the relative state
     /// change stays below `conv_tol` for `conv_patience` steps. No halt head.
     /// Ponder is the constant step count (no gradient; CE carries training).
+    ///
+    /// The convergence test needs a scalar on the host, so it forces a
+    /// readback and a pipeline stall. ACT amortizes this by testing only every
+    /// second step; here the test is load-bearing at every step, so the stall
+    /// is inherent. What is not inherent is spending two readbacks per step on
+    /// one comparison, so the relative change is computed on-device as a single
+    /// expression and read back once.
     pub fn forward_converge(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -362,10 +369,14 @@ impl<B: Backend> LoopedTransformer<B> {
         let mut steps_used = config.max_loops;
         for s in 1..=config.max_loops {
             let x_new = self.iterate(x.clone(), &key_pad);
-            let num = scalar_of(&(x_new.clone() - x.clone()).powf_scalar(2.0).mean());
-            let den = scalar_of(&x.clone().powf_scalar(2.0).mean()) + 1e-8;
+            // One host readback: relative RMS change.
+            let rel = scalar_of(
+                &((x_new.clone() - x.clone()).powf_scalar(2.0).mean()
+                    / (x.clone().powf_scalar(2.0).mean() + 1e-8))
+                    .sqrt(),
+            );
             x = x_new;
-            if (num.sqrt() / den.sqrt()) < config.conv_tol as f32 {
+            if rel < config.conv_tol as f32 {
                 calm += 1;
                 if calm >= config.conv_patience {
                     steps_used = s;
