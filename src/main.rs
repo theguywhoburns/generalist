@@ -6,7 +6,7 @@ use burn::{
 };
 use generalist::{
     model::{LoopedConfig, LoopedTransformer, StopMode},
-    optim::NewtonMuonConfig,
+    optim::MuonTuning,
 };
 
 type B = Autodiff<NdArray>;
@@ -27,7 +27,10 @@ fn main() {
         out.steps_used
     );
 
-    let nm_cfg = NewtonMuonConfig::new();
-    let _muon = nm_cfg.muon_config();
-    println!("newton-muon ready (refresh every {})", nm_cfg.refresh_every);
+    let tuning = MuonTuning::new();
+    let _muon = tuning.to_muon_config();
+    println!(
+        "stock muon ready (ns_steps {}, adjust {:?})",
+        tuning.ns_steps, tuning.adjust_lr_fn
+    );
 }
