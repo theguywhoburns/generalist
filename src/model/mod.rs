@@ -13,5 +13,5 @@ pub use halting::HaltingHead;
 pub use masking::{causal_bias, key_bias, pad_mask};
 pub use mlp::SwiGluMlp;
 pub use transformer::{
-    LoopOutput, LoopedStage, LoopedTransformer, ParamKind, ParamSpec, ce_split, lm_loss,
+    LoopOutput, LoopedStage, LoopedTransformer, MaskedCe, ParamKind, ParamSpec, lm_loss, masked_ce,
 };

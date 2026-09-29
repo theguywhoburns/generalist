@@ -22,7 +22,7 @@ use burn::{
 
 use crate::{
     harness::Record as MetricRecord,
-    model::{LoopedConfig, LoopedTransformer, StopConfig, StopMode, lm_loss},
+    model::{LoopedConfig, LoopedTransformer, StopConfig, StopMode, masked_ce},
     optim::{LrConfig, LrPair, OptimConfig, merge_grads, split_grads},
     tasks::{HarnessRng, Instance},
 };
@@ -285,18 +285,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         let out = self
             .model
             .forward_act(col.tokens, &self.config, &col.lengths, None);
-        let (ce_answer, ce_eos) = crate::model::ce_split(
-            out.logits.clone(),
-            col.targets.clone(),
-            col.loss_mask.clone(),
-        );
-        let loss = lm_loss(
-            out.logits,
-            col.targets,
-            col.loss_mask,
-            out.ponder.clone(),
-            self.config.ponder_weight,
-        );
+        // One log_softmax and one mask readback serve the loss and the
+        // answer/EOS split. `ce_answer` drives the free_schedule threshold, so
+        // it is computed every step rather than gated behind log_every.
+        let ce = masked_ce(out.logits, col.targets, col.loss_mask);
+        let (ce_answer, ce_eos) = ce.split();
+        let loss = ce.with_ponder(out.ponder.clone(), self.config.ponder_weight);
         let info = StepInfo {
             loss: scalar_of(&loss),
             ponder: scalar_of(&out.ponder),
@@ -1118,13 +1112,8 @@ mod tests {
         let out = trainer
             .model
             .forward_act(col.tokens, &trainer.config, &col.lengths, None);
-        let loss = lm_loss(
-            out.logits,
-            col.targets,
-            col.loss_mask,
-            out.ponder,
-            trainer.config.ponder_weight,
-        );
+        let loss = masked_ce(out.logits, col.targets, col.loss_mask)
+            .with_ponder(out.ponder, trainer.config.ponder_weight);
         // Every param must get a nonzero grad. An inverted pad mask zeroes
         // all but the halt grads, so this is the tripwire for that bug class
         // (pad_mask values are pinned in model tests too).

@@ -541,38 +541,71 @@ fn scored_bounds(data: &TensorData) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Causal LM loss with ponder penalty: `CE + ponder_weight * ponder`.
-/// `tok_mask` (1.0 = scored position) masks prompt bytes and pads, so only
-/// target bytes train the LM head.
-pub fn lm_loss<B: Backend>(
-    logits: Tensor<B, 3>,
+/// Masked CE and its answer/EOS split, sharing ONE `log_softmax` and ONE mask
+/// readback. This is the whole causal-LM loss, in the pieces the trainer needs.
+///
+/// It used to be two functions called back to back on identical inputs:
+/// `lm_loss` and `ce_split` each ran `scored_slice` — a host readback of the
+/// B×T mask — and each recomputed `log_softmax` over the scored window. Every
+/// training micro-batch paid two GEMMs and two pipeline stalls to produce one
+/// number and two diagnostics.
+///
+/// `ce_answer` is not purely diagnostic: it drives the `free_schedule`
+/// threshold. So the split is always computed; the saving is computing it
+/// once. The ponder term is added by the caller, which knows its warmup ramp.
+pub struct MaskedCe<B: Backend> {
+    /// `CE + ponder_weight * ponder`: the scalar to backward.
+    pub total: Tensor<B, 1>,
+    /// Mean CE over scored positions, no ponder term.
+    pub ce: Tensor<B, 1>,
+    /// Per-position negative log-likelihood, already sliced and flattened.
+    /// Retained so the answer/EOS split can reuse it instead of recomputing.
+    nll: Tensor<B, 1>,
     targets: Tensor<B, 2, Int>,
-    tok_mask: Tensor<B, 2>,
-    ponder: Tensor<B, 1>,
-    ponder_weight: f64,
-) -> Tensor<B, 1> {
-    let v = logits.dims()[2];
-    let (logits, targets, tok_mask) = scored_slice(logits, &targets, &tok_mask);
-    let [b, ts, _] = logits.dims();
-    let n = b * ts;
-    let logp = burn::tensor::activation::log_softmax(logits.reshape([n, v]), 1);
-    let nll = logp
-        .gather(1, targets.reshape([n, 1]))
-        .reshape([n])
-        .mul_scalar(-1.0);
-    let m = tok_mask.reshape([b * ts]);
-    let ce = (nll * m.clone()).sum().div(m.sum().clamp_min(1.0));
-    ce + ponder.mul_scalar(ponder_weight)
+    mask: Tensor<B, 2>,
 }
 
-/// Split CE into answer-byte vs EOS-byte means (diagnostic only: aggregate
-/// CE hides the split — EOS slots learn in minutes, answer slots carry the
-/// actual task signal). Returns `(ce_answer, ce_eos)` as host floats.
-pub fn ce_split<B: Backend>(
+impl<B: Backend> MaskedCe<B> {
+    /// Add the ponder penalty. Separate from the constructor because
+    /// `ponder_weight` is ramped per step while the CE does not depend on it.
+    pub fn with_ponder(self, ponder: Tensor<B, 1>, weight: f64) -> Tensor<B, 1> {
+        self.total + ponder.mul_scalar(weight)
+    }
+
+    /// `(ce_answer, ce_eos)`. Either is `0.0` if that class is absent.
+    ///
+    /// Diagnostic split: aggregate CE hides it — EOS slots learn in minutes,
+    /// answer slots carry the actual task signal.
+    pub fn split(&self) -> (f32, f32) {
+        let [b, ts] = self.targets.dims();
+        let n = b * ts;
+        let m = self.mask.clone().reshape([n]);
+        let is_eos = self
+            .targets
+            .clone()
+            .reshape([n])
+            .equal_elem(crate::harness::EOS as i64)
+            .float();
+        let w_eos = m.clone() * is_eos;
+        let w_ans = m - w_eos.clone();
+        let ce_ans = (self.nll.clone() * w_ans.clone())
+            .sum()
+            .div(w_ans.sum().clamp_min(1.0));
+        let ce_eos = (self.nll.clone() * w_eos.clone())
+            .sum()
+            .div(w_eos.sum().clamp_min(1.0));
+        (scalar_of(&ce_ans), scalar_of(&ce_eos))
+    }
+}
+
+/// Build the masked CE on `[B, T, V]` logits, `target` bytes, and a 1.0-on-
+/// scored-position mask. Prompt bytes and pads score 0, so only target bytes
+/// train the LM head.
+pub fn masked_ce<B: Backend>(
     logits: Tensor<B, 3>,
     targets: Tensor<B, 2, Int>,
     tok_mask: Tensor<B, 2>,
-) -> (f32, f32) {
+) -> MaskedCe<B> {
     let v = logits.dims()[2];
     let (logits, targets, tok_mask) = scored_slice(logits, &targets, &tok_mask);
     let [b, ts, _] = logits.dims();
@@ -582,18 +615,27 @@ pub fn ce_split<B: Backend>(
         .gather(1, targets.clone().reshape([n, 1]))
         .reshape([n])
         .mul_scalar(-1.0);
-    let m = tok_mask.reshape([n]);
-    let is_eos = targets
-        .reshape([n])
-        .equal_elem(crate::harness::EOS as i64)
-        .float();
-    let w_eos = m.clone() * is_eos;
-    let w_ans = m - w_eos.clone();
-    let ce_ans = (nll.clone() * w_ans.clone())
-        .sum()
-        .div(w_ans.sum().clamp_min(1.0));
-    let ce_eos = (nll * w_eos.clone()).sum().div(w_eos.sum().clamp_min(1.0));
-    (scalar_of(&ce_ans), scalar_of(&ce_eos))
+    let m = tok_mask.clone().reshape([n]);
+    let ce = nll.clone().mul(m.clone()).sum().div(m.sum().clamp_min(1.0));
+    MaskedCe {
+        total: ce.clone(),
+        ce,
+        nll,
+        targets,
+        mask: tok_mask,
+    }
+}
+
+/// Causal LM loss with ponder penalty: `CE + ponder_weight * ponder`.
+/// Thin wrapper over [`masked_ce`] for callers that do not need the split.
+pub fn lm_loss<B: Backend>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    tok_mask: Tensor<B, 2>,
+    ponder: Tensor<B, 1>,
+    ponder_weight: f64,
+) -> Tensor<B, 1> {
+    masked_ce(logits, targets, tok_mask).with_ponder(ponder, ponder_weight)
 }
 
 fn scalar_of<B: Backend>(t: &Tensor<B, 1>) -> f32 {
@@ -635,6 +677,86 @@ mod loss_tests {
         let mut gp = GradientsParams::from_grads(loss.backward(), &lin);
         let g = gp.remove::<IB, 2>(lin.weight.id).unwrap();
         g.abs().sum().into_data().as_slice::<f32>().unwrap()[0]
+    }
+
+    /// The shared-CE refactor must not change the loss. `lm_loss` and
+    /// `ce_split` used to be computed independently; now one `log_softmax`
+    /// serves both. This checks the combined API reproduces the old
+    /// `lm_loss` value exactly, and that the split sums back to it.
+    #[test]
+    fn masked_ce_matches_lm_loss_and_split_sums_to_total() {
+        let device = test_device();
+        let lin = LinearConfig::new(8, 8)
+            .with_bias(false)
+            .init::<TestBackend>(&device);
+        let h = Tensor::<TestBackend, 3>::ones([2, 5, 8], &device);
+        let logits = lin.forward(h);
+        // 3 targets per row, one of them EOS (id 1), rest arbitrary.
+        let tgt = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![3i64, 4, 1, 5, 6, 1, 7, 1, 2, 3], [2, 5]),
+            &device,
+        );
+        // Score the last 3 positions of each row.
+        let msk = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(vec![0.0f32, 0., 1., 1., 1., 0., 0., 1., 1., 1.], [2, 5]),
+            &device,
+        );
+        let ponder = Tensor::<TestBackend, 1>::zeros([1], &device);
+
+        let via_wrapper = lm_loss(
+            logits.clone(),
+            tgt.clone(),
+            msk.clone(),
+            ponder.clone(),
+            0.5,
+        );
+        let parts = masked_ce(logits, tgt.clone(), msk);
+        // Read the split and CE first, then consume `parts` for the total:
+        // `with_ponder` takes self, so the borrow has to end before it.
+        let (ce_ans, ce_eos) = parts.split();
+        let ce: f32 = parts.ce.clone().into_data().as_slice::<f32>().unwrap()[0];
+        let via_parts = parts.with_ponder(ponder, 0.5);
+        let a: f32 = via_wrapper.clone().into_data().as_slice::<f32>().unwrap()[0];
+        let b: f32 = via_parts.clone().into_data().as_slice::<f32>().unwrap()[0];
+        assert!((a - b).abs() < 1e-6, "wrapper {a} vs combined {b}");
+
+        // The two split means average back to the overall CE when weighted by
+        // their class counts: 2 answer bytes and 1 EOS byte per row, so
+        // ce = (2*ce_answer + 1*ce_eos) / 3.
+        let reconstructed = (2.0 * ce_ans + ce_eos) / 3.0;
+        assert!(
+            (reconstructed - ce).abs() < 1e-4,
+            "split does not reconstruct CE: {reconstructed} vs {ce}"
+        );
+        // Ponder weight 0.5 on a zero ponder leaves the total equal to the CE.
+        assert!((b - ce).abs() < 1e-6, "ponder term corrupted the total");
+    }
+
+    /// A class absent from the batch must report 0.0, not NaN — a division by
+    /// an empty class sum would otherwise poison a log line.
+    #[test]
+    fn split_reports_zero_for_an_absent_class() {
+        let device = test_device();
+        let lin = LinearConfig::new(8, 8)
+            .with_bias(false)
+            .init::<TestBackend>(&device);
+        let logits = lin.forward(Tensor::<TestBackend, 3>::ones([1, 4, 8], &device));
+        let tgt = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![2i64, 3, 4, 5], [1, 4]),
+            &device,
+        );
+        // No EOS anywhere in the scored region.
+        let msk = Tensor::<TestBackend, 2>::ones([1, 4], &device);
+        let (ce_ans, ce_eos) = masked_ce(logits, tgt, msk).split();
+        assert!(ce_ans.is_finite() && ce_ans > 0.0, "ce_answer {ce_ans}");
+        assert!(
+            ce_eos.is_finite(),
+            "absent EOS class produced a non-finite value: {ce_eos}"
+        );
+        assert!(
+            (ce_eos - 0.0).abs() < 1e-6,
+            "ce_eos should be 0, got {ce_eos}"
+        );
     }
 
     #[test]
