@@ -92,6 +92,37 @@ pub struct TrainConfig {
     /// because such a number does not measure generalization.
     #[config(default = 0.1)]
     pub eval_holdout: f64,
+    /// Also evaluate a sample of the TRAINING pool, logged separately as
+    /// `*-indist`.
+    ///
+    /// This is the second half of the memorization measurement. Generalization
+    /// alone cannot say where memorization begins, because held-out accuracy
+    /// saturating is ambiguous between "solved the task" and "stopped
+    /// benefiting". The train/held-out **divergence** is the signal, and it
+    /// needs both numbers from the same run.
+    ///
+    /// Kept small on purpose: it is a diagnostic, and eval decode is the
+    /// slowest part of a run.
+    #[config(default = true)]
+    pub eval_in_distribution: bool,
+    /// Instances sampled from the training pool for that diagnostic.
+    #[config(default = 48)]
+    pub indist_eval_per_cell: usize,
+    /// Cap on training instances, applied AFTER the holdout split. `0` = no
+    /// cap.
+    ///
+    /// This is the data-scaling knob, deliberately separate from
+    /// `experiment.per_cell`. Varying `per_cell` moves the training pool AND
+    /// the eval set together, so held-out accuracy at each point is measured
+    /// on a different split and the curve is not comparable across points.
+    /// Capping after the holdout keeps the eval set fixed, which is what a
+    /// learning curve needs: the only thing that changes along the axis is
+    /// how much the model trained on.
+    ///
+    /// The cap takes a deterministic stride over the length-sorted pool, so
+    /// the subset spans the length range rather than being all-shortest.
+    #[config(default = 0)]
+    pub max_train_instances: usize,
 }
 
 pub struct StepInfo {
@@ -895,6 +926,47 @@ pub fn run_stage<B: AutodiffBackend>(
     let mut train_pool = train_pool;
     train_pool.sort_by_key(|i| i.prompt.len() + i.target.len());
 
+    // Data-scaling cap, after the holdout split so the eval set is fixed.
+    // A stride over the length-sorted pool keeps the subset representative of
+    // the length range; taking a prefix would select only the shortest rows.
+    if run.train.max_train_instances > 0 && train_pool.len() > run.train.max_train_instances {
+        let cap = run.train.max_train_instances;
+        let stride = (train_pool.len() / cap).max(1);
+        let capped: Vec<Instance> = train_pool
+            .iter()
+            .step_by(stride)
+            .take(cap)
+            .cloned()
+            .collect();
+        println!(
+            "data cap: {} -> {} training instances (stride {stride}, eval set unchanged)",
+            train_pool.len(),
+            capped.len()
+        );
+        train_pool = capped;
+    }
+
+    // The in-distribution half of the memorization measurement: a sample of
+    // instances the model DID train on, evaluated with the same decoder and
+    // the same limit as the held-out split.
+    //
+    // Taken AFTER the data cap, deliberately: it must measure what the model
+    // actually saw. Sampled before, a capped run would score instances it
+    // never trained on and report them as in-distribution — which would make
+    // the gap collapse to zero at exactly the points where memorization
+    // matters most.
+    let indist_set = if run.train.eval_in_distribution {
+        let s = eval_split(&train_pool, run.train.indist_eval_per_cell);
+        println!(
+            "in-dist eval: {} instances (from the {} the model trains on)",
+            s.len(),
+            train_pool.len()
+        );
+        s
+    } else {
+        Vec::new()
+    };
+
     // `run.train` is passed straight through. A previous version rebuilt a
     // partial `TrainConfig` here, which was both redundant and a trap: the
     // Trainer read only `seed` and the two learning rates, so the other six
@@ -1193,6 +1265,40 @@ pub fn run_stage<B: AutodiffBackend>(
         } else {
             trained_shuffled = Some(pool_acc);
         }
+    }
+
+    // Memorization onset: the train/held-out divergence, from the same run.
+    //
+    // Held-out accuracy on its own cannot locate the onset: it saturates
+    // identically whether the model solved the task or merely stopped
+    // benefiting from more data. The GAP between a training-pool sample and
+    // the held-out set is the signal, and both halves must come from one run
+    // to be comparable at all.
+    if !indist_set.is_empty() {
+        let records = trainer.evaluate_watched(&indist_set, run.train.eval_max_new, None, &|| {
+            watchdog.ping_step(run.train.steps)
+        });
+        let ind = crate::harness::summarize(&records);
+        let held_acc = trained_order.unwrap_or(0.0);
+        let gap = held_acc - ind.accuracy;
+        println!(
+            "  memorization: train-pool acc {:.3} | held-out acc {:.3} | gap {:+.3} (n_train={} n_held={})",
+            ind.accuracy,
+            held_acc,
+            gap,
+            ind.n,
+            final_set.len()
+        );
+        log.push_str(&format!(
+            "{{\"eval\":\"memorization\",\"indist_accuracy\":{:.6},\"heldout_accuracy\":{:.6},\
+             \"gap\":{:.6},\"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
+            ind.accuracy,
+            held_acc,
+            gap,
+            ind.n,
+            final_set.len(),
+            run.train.seed
+        ));
     }
 
     // The role diagnostic, read against its floor.
