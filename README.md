@@ -120,9 +120,58 @@ string.
 Logged per run (`run.jsonl`, one JSON object per evaluated instance): task,
 track, k, `correct`, `copied`, `steps`, `halt`, per-stage `bh`, and the run
 `seed` — so a multi-seed comparison is a filter, not a string join. Final-eval
-summaries additionally carry per-stage p50/p90/std, utilization shares, and
-between-stage halt correlations (≈1.0 everywhere means the per-stage gates are
-one global head in disguise).
+summaries additionally carry per-stage p50/p90/std, utilization shares,
+between-stage halt correlations, and — see "Reading the stages" below — the
+profile evidence and the shuffle control.
+
+## Reading the stages
+
+**The stage-order shuffle is a weak test, and is not the one to rely on.**
+Reversing stage order collapses accuracy *by construction*: stages run
+sequentially, so reversal reverses the data flow, and the same collapse
+appears for random weights. A collapse on its own is *necessary* for role
+specialization but nowhere near sufficient.
+
+Three measurements carry the claim instead, weakest to strongest:
+
+1. **Profile evidence** (`src/harness/role_evidence.rs`) — needs no control
+   and no intervention, so it works on every rung. If stages do different
+   jobs, then (a) the compute split is non-uniform — normalized entropy of the
+   per-stage halt shares below 1.0 — and (b) the gates are not one head in
+   four costumes — mean off-diagonal correlation of the per-stage halt
+   vectors near 0. Four profiles are distinguished, and the reading is
+   refused entirely below 2.0 mean halt steps, which is the
+   degenerate-early-halting case the `1.5e-2` arm exhibited (profile
+   `5.2 / 1.6 / 1.0 / 1.0` — a collapse to shallow, not differentiated depth).
+2. **Random-weight control** — measures how much reversal costs a model that
+   cannot do the task. `run_stage` runs it whenever `shuffle_eval` is set:
+
+   ```text
+     trained_gap = trained_order_acc - trained_shuffled_acc      (observed)
+     control_gap = control_order_acc - control_shuffled_acc      (floor)
+     excess      = trained_gap - control_gap
+   ```
+
+   **This control is degenerate on weights-only rungs.** The untrained model
+   scores 0.000 in *both* orders, so `control_gap` is 0, `excess` collapses to
+   the raw gap, and the verdict reduces to the original confound. So
+   `roles_supported` is emitted as JSON `null` with `control_informative:
+   false` whenever the control sits within 3× of chance: "the control could
+   not measure the floor" and "the stages are interchangeable" are different
+   findings, and collapsing them is how the degenerate case first looked like
+   a positive result.
+3. **Order-augmented training** (`configs/stage0-orderaug.json`) — the causal
+   test. `stop.act.shuffle_train` resamples the stage order every training
+   step; read against `stage0-4block.json` it isolates that one variable. If
+   an order-augmented model *still* collapses under eval-time reversal,
+   order-dependence is structural. If it does not, order-dependence was
+   learned and is therefore avoidable — which is the claim the diagnostic
+   exists to make. The order-augmented run's training loss is **not**
+   comparable to the ordered run's: it solves a different,
+   permutation-robust function.
+
+All three land in `run.jsonl` (`*-roles` and `shuffle-control` records) so a
+sweep can aggregate them without scraping stdout.
 
 ## In-context demonstration protocol
 
@@ -223,6 +272,8 @@ measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
   `stage0-4block.json` (ACT) vs `stage0-fixed4.json` (fixed ×4) differ only
   in `stop` plus the `ponder_weight` zeroing that fixed depth requires and
   the `ckpt_dir`; `stage0-converge.json` covers the convergence control.
+- the order axis: `stage0-orderaug.json` sets `stop.act.shuffle_train`, and
+  differs from `stage0-4block.json` in that key plus its `ckpt_dir`.
 - the size axis, by editing `model.d_model` / `ffn_hidden` / `n_stages`.
 - the context axis, by editing `protocol.k_set`.
 - the seed axis, by editing `train.seed` or `--seeds=` on the sweep tool.
@@ -301,27 +352,25 @@ Listed with what would change the conclusion, strongest first.
    still not rule-level. **Holding out rule classes is not implemented.** This
    is the single biggest caveat on every number above, and it means the sweep
    says nothing about the Goal's questions 1 and 3.
-2. **The stage-order shuffle diagnostic is currently uninformative.**
+2. **The stage-order shuffle diagnostic is weak, and the control behind it is
+   degenerate at the current operating point.**
    Reversing stage order collapses accuracy *by construction* — stages are
-   sequential, so reversal reverses the data flow. A random-weight control was
-   added (`src/harness/shuffle_control.rs`) to give a floor:
+   sequential, so reversal reverses the data flow. The random-weight control
+   added to give a floor (`src/harness/shuffle_control.rs`) returns 0.000 in
+   *both* orders on weights-only rungs, so `control_gap` is 0.000 and
+   `excess == trained_gap`: the control contributes nothing and the verdict
+   reduces to the original unconfounded claim. The checked-in
+   `checkpoints-fixed/run.jsonl` (pre-holdout, written before the control
+   existed) makes this concrete: 0.771 trained-order vs 0.000 shuffled against
+   a floor of 0.000 — an "excess" of exactly the whole collapse.
 
-   ```text
-     trained_order_acc  - trained_shuffled_acc      (observed collapse)
-     control_order_acc  - control_shuffled_acc      (floor: reversal alone)
-     excess             = trained_gap - control_gap
-   ```
-
-   But an untrained model scores **0.000 in both orders**, so
-   `control_gap` is always 0.000, `excess == trained_gap`, and the
-   `roles_supported: true` verdict degenerates to the original unconfounded
-   claim. The checked-in `checkpoints-fixed/run.jsonl` (pre-holdout, and
-   written before the control existed) makes this concrete: 0.771
-   trained-order vs 0.000 shuffled against a floor of 0.000 — an "excess" of
-   exactly the whole collapse. **Do not present the shuffle result as evidence
-   of role specialization.** The control is only informative on a rung where
-   the control model scores above chance. The code is right; the *instrument*
-   is blind at the current operating point.
+   The code now *refuses* to answer rather than answering wrongly: on that
+   data `roles_supported` serializes as `null` with `control_informative:
+   false`, and the human line says `roles UNKNOWN`. But an honest `UNKNOWN` is
+   not a measurement. See "Reading the stages" for the two instruments that
+   do work here — profile shape (no control needed) and order-augmented
+   training (causal) — and note that the order-augmented arm has been
+   **specified but not yet run**.
 3. **Single task, three seeds, n = 96.** Binomial SE at n = 96, p = 0.7 is
    ~0.047, and seed-to-seed variance is larger still. A 0.01 difference is
    about one instance. No effect smaller than ~0.1 is resolvable at this
@@ -332,7 +381,8 @@ Listed with what would change the conclusion, strongest first.
    that decides whether depth is doing anything at all — do not exist.
 5. **`examples/lr_sweep.rs` is the only sweep tool.** It is two-axis (LR ×
    seed), reports held-out accuracy, and prints the single-seed caveat. It
-   cannot sweep a model or stop-mode axis; those are hand-written manifests.
+   cannot sweep a model, stop-mode, or order axis; those are hand-written
+   manifests, and the depth axis in particular has no tool at all.
 
 Also worth stating plainly: the depth axis has **not** been run. There is no
 `fixed {1,2,4,8,16}` sweep, no ACT-vs-fixed comparison at matched compute,
@@ -343,12 +393,21 @@ behind them.
 
 Ordered by how much each would reduce uncertainty.
 
+0. **Run the order-augmented arm** (`stage0-orderaug.json` vs
+   `stage0-4block.json`, 3 seeds each). Both instruments for reading the
+   stages now exist and neither has been used at scale: this is the cheapest
+   test of whether the 4-stage structure means anything, it costs two runs per
+   seed, and it is the one cell where a *negative* result is genuinely
+   informative — if an order-augmented model still collapses under reversal,
+   the sequential dependency is structural and the whole "learned roles"
+   framing needs replacing. Do this before any depth sweep, because it decides
+   what a depth sweep would even be measuring.
 1. **Extend the sweep to the k>0 and oracle rungs** (`stage0-oracle`,
    `stage0-4block`, `subst-fst`). This does two things at once: it moves the
    headline number onto a task where the rule is genuinely held out
    (limitation 1), and it puts the model on a rung where the random-weight
-   control scores above chance, which is what makes the shuffle diagnostic
-   non-degenerate (limitation 2). Highest value per GPU-hour.
+   control scores above chance, which is what makes the shuffle control
+   non-degenerate (limitation 2). Highest value per GPU-hour after item 0.
 2. **Run the depth axis properly**: `fixed {1,2,4,8,16}` and ACT, at fixed
    parameters and fixed data, 3+ seeds per point (raising `max_loops` alongside
    `loops` for the 16 point). This is the actual compute-depth scaling curve
@@ -404,7 +463,7 @@ Natural language. Scale.
 - `src/tasks/` — harness core (registry, demo protocol, seeded RNG) + the 8
   Stage-0 tasks
 - `src/harness/` — experiment dispatch, batch collator, JSONL metrics,
-  manifest loader, shuffle control
+  manifest loader, role evidence + shuffle control
 - `src/train.rs` — manifest-driven training loop (ACT + Muon/AdamW, holdout
   split, eval, checkpoints)
 - `src/test_backend.rs` — single swap point for the test-suite backend
@@ -478,7 +537,7 @@ Variations are internally tagged enums, so each is a manifest edit:
 | key | variants |
 |---|---|
 | `optim` | `{"kind": "muon", ...}` |
-| `stop` | `{"kind": "act"}` · `{"kind": "fixed", "loops": 4}` · `{"kind": "converge"}` |
+| `stop` | `{"kind": "act"}` · `{"kind": "act", "shuffle_train": true}` · `{"kind": "fixed", "loops": 4}` · `{"kind": "converge"}` |
 | `train.lr_muon` / `lr_adamw` | `{"kind": "constant", "lr": …}` · `linear` (warmup) · `cosine` · `step` |
 | `train.eval_holdout` | float in `[0, 1)`; `0` is rejected as in-distribution |
 | `experiment.protocol.k_set` | array, **replaces** rather than unions |
