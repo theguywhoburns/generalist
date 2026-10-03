@@ -18,13 +18,22 @@ The question is not "can a transformer do in-context learning". It is:
 |---|---|---|
 | model size | `model.d_model` / `ffn_hidden` / `n_stages` | 256 (984,065 params) … 4 stages (3,542,276) … |
 | compute depth `L` | `stop`, `model.max_loops` | `act` (learned), `fixed {1,2,4,8,16}`, `converge` |
-| data | `experiment.per_cell`, `task` | 8 tasks, both tracks |
+| data | `train.max_train_instances`, `task` | any cap ≥ 0, 8 tasks, both tracks |
 | context `k` | `experiment.protocol.k_set`, `k0_rate` | `{0,1,2,3,5,8}`, k=0 at 15% |
 | optimization | `train.lr_muon` / `lr_adamw` schedules | `constant` / `linear` / `cosine` / `step` |
 
-**Dependent variable:** held-out exact-match accuracy (plus copy-rate and the
-per-stage halt profile). Every accuracy is measured on instances the model
-never trained on — see "Eval" below.
+The data axis is `train.max_train_instances`, **not** `experiment.per_cell`.
+Varying `per_cell` moves the training pool and the eval set together, so each
+point's held-out accuracy is measured on a different split and the curve is not
+comparable across points. The cap is applied after the holdout split, so the
+eval set is identical at every point and the only thing that changes along the
+axis is how much the model trained on. See "Measuring the gap".
+
+**Dependent variable:** held-out accuracy — exact-match **and** byte accuracy —
+plus the train/held-out gap, copy-rate, and the per-stage halt profile. Every
+held-out accuracy is measured on instances the model never trained on (see
+"Eval"), and every accuracy is reported next to the in-distribution number it
+should be compared against (see "Measuring the gap").
 
 **The four questions:**
 
@@ -41,7 +50,8 @@ never trained on — see "Eval" below.
    in-distribution accuracy — the two curves diverge, or held-out accuracy
    saturates while in-distribution accuracy keeps climbing. The crossover
    location and the *form* of the law on either side of it is the headline
-   result.
+   result. This is measured as the gap between the two halves of a single run,
+   not inferred from held-out accuracy alone; see "Measuring the gap".
 4. **Weight scale vs. compute depth.** This model has two escape routes to
    more effective capacity: a bigger `d_model` at fixed depth, or more loop
    iterations at fixed size. If the scaling law has a different shape along
@@ -72,6 +82,10 @@ classic single-gate ACT.
 - The shipped `configs/stage0-base.json` uses `n_stages = 4`, so **the
   default run is 3,542,276 parameters, not 1M**. "base_1m" names the
   single-stage layout only.
+- The scaling runs in "Current results" use a deliberately smaller model —
+  `d_model` 128, `n_stages` 2, `max_loops` 4, **492,418 parameters** — so that
+  600 steps is enough to fit anything at all on a 4 GB laptop. It is the
+  smallest point on the size axis, which is not yet swept.
 - Halt gates deep-start at `halt_bias_init = -3.0` (~4.7% halt probability),
   so training begins near max depth and ponder pressure shortens it — the
   shallow-halt trap is the failure mode this avoids.
@@ -96,9 +110,10 @@ Byte-level, shifted-causal LM over a 256-symbol byte vocabulary (`PAD = 0x00`,
 `EOS = 0x01`; task alphabets are printable ASCII, so 0x00/0x01 are free).
 Training scores target bytes + the EOS terminator only — prompt bytes and pads
 are masked out. Eval decodes greedily until EOS (capped by
-`train.eval_max_new`) and scores **exact string equality with the target**;
-the EOS byte terminates the row and is not itself part of the compared
-string.
+`train.eval_max_new`) and scores **exact string equality with the target**,
+plus the fraction of target bytes correct; the EOS byte terminates the row and
+is not itself part of the compared string. Both accuracies are logged, for
+reasons given under "Measuring the gap".
 
 - `train.eval_holdout` (default `0.1`) splits each pool **inside `run_stage`,
   before anything samples from it**. No reported accuracy is measured on
@@ -116,13 +131,26 @@ string.
 - Re-run all earlier stages after each new stage; the chain runner
   re-evaluates every earlier split, so forgetting shows up as a drop in a
   `previous-N` eval row.
+- `train.eval_in_distribution` (default on) additionally scores
+  `train.indist_eval_per_cell` instances drawn from the **training** pool,
+  through the same decoder and the same `eval_max_new` limit as the held-out
+  split, and logs both halves as a `memorization` record. It is a diagnostic,
+  not a second headline metric, so it is kept small: eval decode is the slowest
+  part of a run.
+- The in-distribution sample is drawn **after** `max_train_instances` is
+  applied. Sampled before the cap, a capped run would score instances it never
+  trained on and report them as in-distribution, collapsing the gap at exactly
+  the points where memorization matters most.
 
 Logged per run (`run.jsonl`, one JSON object per evaluated instance): task,
-track, k, `correct`, `copied`, `steps`, `halt`, per-stage `bh`, and the run
-`seed` — so a multi-seed comparison is a filter, not a string join. Final-eval
-summaries additionally carry per-stage p50/p90/std, utilization shares,
-between-stage halt correlations, and — see "Reading the stages" below — the
-profile evidence and the shuffle control.
+track, k, `correct`, `byte_hits`, `byte_total`, `copied`, `steps`, `halt`,
+per-stage `bh`, and the run `seed` — so a multi-seed comparison is a filter,
+not a string join. Final-eval summaries additionally carry per-stage
+p50/p90/std, utilization shares, between-stage halt correlations, and — see
+"Reading the stages" below — the profile evidence and the shuffle control. The
+`memorization` record carries `indist_accuracy`, `heldout_accuracy`, `gap`, and
+the byte-accuracy variant of each, so no run needs to be re-scraped from
+stdout to answer a scaling question.
 
 ## Reading the stages
 
@@ -172,6 +200,55 @@ Three measurements carry the claim instead, weakest to strongest:
 
 All three land in `run.jsonl` (`*-roles` and `shuffle-control` records) so a
 sweep can aggregate them without scraping stdout.
+
+**Scope.** These three answer one question — *do the stages do different jobs* —
+and every one of them is about role specialization. They say nothing about
+whether an accuracy number is generalization, which is what the next section is
+for. A clean role reading on a model that memorizes is still a model that
+memorizes, so the two instruments are never substitutes for each other.
+
+## Measuring the gap
+
+Two instruments, both in every run's log, and both there because the obvious
+proxy for each was measured first and found unable to carry the claim.
+
+**1. Byte accuracy.** Exact-match is a conjunction over every target byte. On
+the ~20-byte targets here it reports 0.000 identically for "19 of 20 right" and
+for "nothing right", so it cannot rank a model that is partially correct, and
+it cannot show a trend in the number of errors. `Record.byte_hits /
+byte_total` and `Summary::byte_accuracy` report **micro-averaged** byte
+accuracy: hits and total summed over all instances, then divided. The
+micro-average is the one that matters — a per-instance mean weights a 20-byte
+target the same as a 200-byte target and overstates the short-target score by
+up to 4.6× on this pool, which is enough to invert any gap computed from it.
+
+This is not a hypothetical fix. The depth axis below scored **0.000 exact-match
+on both halves at every depth** while training CE sat at 0.45. On exact-match
+alone the axis reads "depth does nothing"; it is the metric that could not see
+the effect, not an absence of one. Exact-match stays in the log as the headline
+number because it is the operative definition of a correct answer — but byte
+accuracy is what a sweep ranks on.
+
+**2. The train/held-out gap.** Held-out accuracy alone **cannot locate
+memorization onset**, because it saturates the same way whether the model solved
+the task or stopped benefiting from more data. The signal is the divergence, and
+the divergence needs both halves from one run. So each run logs a
+`memorization` record with `indist_accuracy`, `heldout_accuracy`, and their
+`gap`, plus the byte-accuracy variant of each.
+
+The reason to prefer the gap over a falling held-out number is that they mean
+different things. Held-out accuracy can fall because the task got harder along
+the axis, because the training budget bought less, or because the model
+overfit; the gap only moves for the last of those. It is also a difference of
+two accuracies, so **its variance exceeds either half's** — `scaling_sweep.rs`
+prints per-seed detail whenever more than one seed is requested, and a gap
+reported without its spread is not a measurement.
+
+```text
+  indist_accuracy, indist_byte_accuracy   — from the training pool
+  heldout_accuracy, heldout_byte_accuracy — from the holdout split
+  gap = heldout - indist                  (negative: the model is behind out of sample)
+```
 
 ## In-context demonstration protocol
 
@@ -274,17 +351,115 @@ measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
   the `ckpt_dir`; `stage0-converge.json` covers the convergence control.
 - the order axis: `stage0-orderaug.json` sets `stop.act.shuffle_train`, and
   differs from `stage0-4block.json` in that key plus its `ckpt_dir`.
+- the data axis, by `train.max_train_instances` (cap the pool after the
+  holdout, eval set held fixed). `experiment.per_cell` also varies the pool but
+  moves the eval set with it, so it is not a sweep axis.
 - the size axis, by editing `model.d_model` / `ffn_hidden` / `n_stages`.
 - the context axis, by editing `protocol.k_set`.
 - the seed axis, by editing `train.seed` or `--seeds=` on the sweep tool.
+
+`examples/scaling_sweep.rs` drives the named axes (`data` | `depth` |
+`params`) over a base manifest, reads both accuracies and the gap out of each
+run's `run.jsonl`, and reports mean halt and the profile reading at every point
+so a fixed-depth win stays distinguishable from a degenerate-halting artifact.
 
 **Not implemented:** the non-looped columns (param-matched and
 compute-matched), and any manifest knob for them.
 
 ## Current results
 
-One measurement exists. It is a Muon learning-rate sweep, and it is reported
-here with its caveats rather than as a finding.
+Three measurements exist, plus a throughput note. All of them are on
+`subst-fst-fixed`, the weights-only rung, and all are reported here with the
+caveats that keep them honest rather than as findings. The LR sweep came first
+and is the weakest of the three; the two scaling axes are first passes, not
+curves.
+
+### Data axis: the memorization-onset curve
+
+The instrument is the train/held-out gap ("Measuring the gap"), and the axis is
+`train.max_train_instances`, so the eval set is the same ~29 held-out instances
+at every point. 492,418-parameter model (`d_model` 128, `n_stages` 2,
+`max_loops` 4), 600 steps, auto-batch on, 3 seeds per point, RTX 3050 4 GB.
+
+| train N | byte-in | byte-out | gap | exact-in | exact-out |
+|---|---|---|---|---|---|
+| 16 | 0.944 | 0.329 | -0.614 | 0.688 | 0.000 |
+| 48 | 0.988 | 0.433 | -0.555 | 0.885 | 0.000 |
+| 128 | 0.985 | 0.704 | -0.281 | 0.906 | 0.312 |
+| 288 | 0.977 | 0.850 | -0.127 | 0.938 | 0.478 |
+
+In-distribution accuracy is 0.95–0.99 at every data size, and **the gap narrows
+monotonically as data grows**. More data buys transfer here, not memorization —
+the opposite sign to what a pure-memorization account predicts.
+
+**Onset was not observed.** The held-out curve is still rising at 288
+instances and the gap is still -0.127, so the crossover lies beyond the right
+edge of this sweep and the axis has *not bracketed* the onset. A gap of 0.127
+with held-out byte accuracy at 0.850 is not a saturated model. What the table
+does fix is the direction of travel; extending the axis is the open item, not
+this table.
+
+**This refutes the earlier reading of the same axis.** A fixed-batch run at 300
+steps and batch 6 put held-out exact-match at 0.000 at the two smallest data
+sizes and 0.079 / 0.111 at the two largest, which was read as "onset lies
+below 16 instances" and "the model is in the pure-memorization regime
+throughout". That run was badly undertrained. The confound was the ordinary one
+— at a fixed step count, more data is fewer epochs — and the artifact is
+visible in that same table, where in-distribution accuracy *fell* as N rose
+(0.708 → 0.500), which is a budget effect, not a law. The rerun with the budget
+and the card fixed does not reproduce it. Anyone re-deriving the old numbers
+from commit `8bcffc6` should read this table instead.
+
+```bash
+cargo run --release --example scaling_sweep -- configs/<base>.json data gpu 16 48 128 288 --seeds=0,1,2 --auto-batch
+```
+
+### Compute-depth axis: a first pass, not a curve
+
+Fixed batches (no auto-batch), 600 steps, same model and task, `stop.fixed`
+with `loops` as the axis, 3 seeds per point.
+
+| depth | byte-in | byte-out | gap |
+|---|---|---|---|
+| 1 | 0.201 | 0.134 | -0.067 |
+| 2 | 0.406 | 0.324 | -0.082 |
+| 4 | 0.444 | 0.403 | -0.041 |
+| 8 | 0.405 | 0.387 | -0.018 |
+
+Depth helps, and **the gap narrows with it** (-0.067 → -0.018): extra compute
+buys transfer rather than memorization. That is the direction Goal question 2
+asks for, and it is the first non-zero evidence on the axis.
+
+**Exact-match was 0.000 on both halves at every depth.** On exact-match alone
+this table reads "depth does nothing" — which is the metric failure described
+under "Measuring the gap", not a null result. Nothing else about the axis would
+have survived without byte accuracy.
+
+**"Saturates by 4" is not resolved.** Within-seed spread at every depth exceeds
+the between-depth differences (depth=8 seeds span 0.265–0.495 byte-out), so
+three seeds cannot separate depth 4 from depth 8 or speak to where the knee is.
+The profile reading was "uniform" at every depth, so this says nothing about
+stage roles — see "Reading the stages". It also says nothing about ACT: the axis
+is `fixed` only, so no point here is compute-matched to any other.
+
+```bash
+cargo run --release --example scaling_sweep -- configs/<base>.json depth gpu 1 2 4 8 --seeds=0,1,2
+```
+
+### Throughput, and why the batch tuner exists
+
+| batch | steps/s | instances/s | memory used |
+|---|---|---|---|
+| fixed 8 | 16.8 | 134 | 190 MB |
+| auto (B×T 8192, window 128) | 7.8 | 998 | 1470 MB |
+
+7.4× the data per second for 7.7× the memory. Steps per second *drops* — from
+16.8 to 7.8 — because each step is now 16× the work, so **throughput is not
+comparable at fixed step counts** and two runs are only comparable at equal
+instances seen. That is the same confound as the undertrained data sweep above,
+and it is why the data-axis result is stated in instances rather than steps.
+
+### Optimization: a Muon learning-rate sweep
 
 Task `subst-fst-fixed` (weights-only rung: constant substitution, `k_set: [0]`
 → zero demonstrations), `configs/stage0-fixed.json`: 500 steps, 4 stages × 8
@@ -351,8 +526,26 @@ Listed with what would change the conclusion, strongest first.
    the same procedure over unseen symbols (Track B), which is stronger but
    still not rule-level. **Holding out rule classes is not implemented.** This
    is the single biggest caveat on every number above, and it means the sweep
-   says nothing about the Goal's questions 1 and 3.
-2. **The stage-order shuffle diagnostic is weak, and the control behind it is
+   says nothing about the Goal's questions 1 and 3. Measuring the gap does not
+   soften it: a gap between two accuracies on the *same* constant rule is still
+   a gap measured on one rule, and the data-axis result above is a claim about
+   transfer on the easiest possible axis.
+2. **Memorization onset has not been bracketed.** The data axis stops at 288
+   training instances with the held-out curve still rising and the gap still
+   open at -0.127, so the crossover is beyond the right edge of the measured
+   range. What the table does establish is the *sign* — more data closes the
+   gap on this rung — not where the sign would flip. Onset also needs the other
+   two axes first, because onset in (params × depth × data) space is a joint
+   location and only one coordinate has been swept.
+3. **The depth axis has one pass, at one operating point.** 492,418 params,
+   fixed batches, `fixed {1,2,4,8}` only, 3 seeds. No ACT point and therefore
+   no compute-matched ACT-vs-fixed comparison, no `loops: 16`, one model size,
+   one task, one rung. Within-seed spread exceeds every between-depth
+   difference at n=3, so the apparent saturation is not resolved. And because
+   the profile read "uniform" at every depth, the axis as measured says nothing
+   about whether stages take on different roles with depth — which is the part
+   of Goal question 2 the LR sweep above flagged as the central confound.
+4. **The stage-order shuffle diagnostic is weak, and the control behind it is
    degenerate at the current operating point.**
    Reversing stage order collapses accuracy *by construction* — stages are
    sequential, so reversal reverses the data flow. The random-weight control
@@ -371,27 +564,29 @@ Listed with what would change the conclusion, strongest first.
    do work here — profile shape (no control needed) and order-augmented
    training (causal) — and note that the order-augmented arm has been
    **specified but not yet run**.
-3. **Single task, three seeds, n = 96.** Binomial SE at n = 96, p = 0.7 is
-   ~0.047, and seed-to-seed variance is larger still. A 0.01 difference is
-   about one instance. No effect smaller than ~0.1 is resolvable at this
-   sample size.
-4. **The non-looped columns of the comparison grid are not implemented.** Only
+5. **Single task, three seeds, and a smaller eval split than the LR sweep.**
+   The scaling runs use ~29 held-out instances, so the binomial SE there is
+   ~0.09 at p = 0.7 before seed variance, and the gap is a difference of two
+   such numbers. No effect smaller than ~0.1 in byte accuracy is resolvable,
+   which is the same threshold at which the depth axis stops being legible.
+6. **The non-looped columns of the comparison grid are not implemented.** Only
    the stop-mode axis (and, by editing the model block, the size axis) is
    reachable from manifests. Compute-matched non-looped baselines — the thing
    that decides whether depth is doing anything at all — do not exist.
-5. **`examples/lr_sweep.rs` is the only sweep tool.** It is two-axis (LR ×
-   seed), reports held-out accuracy, and prints the single-seed caveat. It
-   cannot sweep a model, stop-mode, or order axis; those are hand-written
-   manifests, and the depth axis in particular has no tool at all.
+7. **The size axis is unmeasured.** `scaling_sweep.rs` takes a `params` axis,
+   but no `d_model` sweep has been run. Goal questions 1 and 4 have no numbers
+   behind them at all.
 
-Also worth stating plainly: the depth axis has **not** been run. There is no
-`fixed {1,2,4,8,16}` sweep, no ACT-vs-fixed comparison at matched compute,
-and no size sweep. The Goal's questions 2 and 4 have **zero** measurements
-behind them.
+Also worth stating plainly: what "the depth axis has not been run" used to mean
+is now narrower. There is a first pass over `fixed {1,2,4,8}` with real
+numbers and a real gap, and it is legible only because of byte accuracy. There
+is still **no ACT-vs-fixed comparison at matched compute**, **no size sweep**,
+and no point in the depth sweep where the held-out curve turns over.
 
 ## Next experiments
 
-Ordered by how much each would reduce uncertainty.
+Ordered by how much each would reduce uncertainty. Items marked *(partly done)*
+were started and the remainder is stated explicitly.
 
 0. **Run the order-augmented arm** (`stage0-orderaug.json` vs
    `stage0-4block.json`, 3 seeds each). Both instruments for reading the
@@ -400,39 +595,46 @@ Ordered by how much each would reduce uncertainty.
    seed, and it is the one cell where a *negative* result is genuinely
    informative — if an order-augmented model still collapses under reversal,
    the sequential dependency is structural and the whole "learned roles"
-   framing needs replacing. Do this before any depth sweep, because it decides
-   what a depth sweep would even be measuring.
+   framing needs replacing. Do this before any further depth work, because it
+   decides what a depth sweep would even be measuring.
 1. **Extend the sweep to the k>0 and oracle rungs** (`stage0-oracle`,
    `stage0-4block`, `subst-fst`). This does two things at once: it moves the
    headline number onto a task where the rule is genuinely held out
    (limitation 1), and it puts the model on a rung where the random-weight
    control scores above chance, which is what makes the shuffle control
-   non-degenerate (limitation 2). Highest value per GPU-hour after item 0.
-2. **Run the depth axis properly**: `fixed {1,2,4,8,16}` and ACT, at fixed
-   parameters and fixed data, 3+ seeds per point (raising `max_loops` alongside
-   `loops` for the 16 point). This is the actual compute-depth scaling curve
-   and it is simply missing. Report the per-stage halt profile alongside
-   accuracy for every point, so a fixed-depth win and a degenerate-halting
-   artifact are distinguishable — the current sweep shows exactly how easy that
-   is to get wrong.
-3. **Run the size axis**: param-matched models at several `d_model`
-   (128 / 256 / 384 / 512, with `n_heads × head_dim` kept consistent and
-   `vocab_size ≥ 256` for byte level), fixed depth, fixed data. Fit
-   held-out accuracy against log-params and check whether the Track A and
-   Track B slopes differ. This is what "scaling with size" means as a
-   measurement rather than a plan.
-4. **Enough seeds to resolve ~0.1 effects.** Three seeds cannot; the
-   within-arm spread in the table above is 0.177. Either 8–10 seeds per cell
-   or a larger eval split (`eval_split` takes the first 48 per cell —
-   raising it trades eval time for resolution directly).
-5. **Measure memorization onset.** Requires (2) and (3) first. Operational
-   definition to be fixed in advance: the point where train and held-out
-   curves diverge, or where held-out accuracy saturates while in-distribution
-   accuracy keeps climbing. Needs an in-distribution eval path that is
-   *explicitly* separate from the generalization number — `eval_holdout: 0`
-   exists for that and is loader-rejected everywhere else, which is the
-   right default and the wrong tool for this specific job. Worth a
-   deliberately named second metric rather than a config flip.
+   non-degenerate (limitation 4). Highest value per GPU-hour after item 0.
+2. **Finish the depth axis** *(partly done: a first pass over `fixed
+   {1,2,4,8}` exists)*. Still open, in order of value: add **ACT** as a
+   compute-matched point, which is the comparison Goal question 2 actually
+   asks; add `loops: 16` (raising `max_loops` alongside it); and enough seeds
+   to resolve the 4-vs-8 difference the current n=3 pass cannot. Keep reporting
+   byte accuracy, the gap, and the per-stage profile at every point — the
+   existing pass reads "uniform" at every depth, so nothing there distinguishes
+   a real depth effect from a wider-capacity effect, and that ambiguity is the
+   confound the LR sweep above already demonstrated.
+3. **Run the size axis** *(unmeasured; the tool supports it)*: param-matched
+   models at several `d_model` (128 / 256 / 384 / 512, with `n_heads × head_dim`
+   kept consistent and `vocab_size ≥ 256` for byte level), fixed depth, fixed
+   data. Fit held-out accuracy against log-params and check whether the Track A
+   and Track B slopes differ. This is what "scaling with size" means as a
+   measurement rather than a plan. Note that the model already measured on the
+   other two axes (d_model 128, 492,418 params) is the *smallest* point on this
+   curve, which is worth knowing when the two results are compared.
+4. **Enough seeds to resolve ~0.1 effects** *(partly quantified)*. Three seeds
+   cannot: the within-arm spread is 0.177 on the LR sweep and 0.265–0.495 on
+   the depth sweep's depth=8 point. Either 8–10 seeds per cell or a larger eval
+   split (`indist_eval_per_cell` / `eval_split` take the first N per cell —
+   raising them trades eval time for resolution directly, and the gap needs
+   both halves raised, not one).
+5. **Bracket memorization onset** *(instrument done, location not)*. The
+   in-distribution path exists as its own deliberately named metric
+   (`train.eval_in_distribution` → `memorization` record) rather than a config
+   flip, exactly as intended; `eval_holdout: 0` remains loader-rejected. What
+   is missing is the range: the axis has to be pushed past 288 instances, and
+   to be swept at two or more model sizes and depths so the crossover can be
+   located in more than one coordinate. Hold the instances-seen budget constant
+   along the axis — the earlier undertrained pass at a fixed step count is what
+   produced the refuted "onset below 16" reading.
 6. **Add the compute-matched non-looped baseline** so "depth" has something
    to be better than. Without it the depth axis measures only depth.
 
@@ -463,9 +665,10 @@ Natural language. Scale.
 - `src/tasks/` — harness core (registry, demo protocol, seeded RNG) + the 8
   Stage-0 tasks
 - `src/harness/` — experiment dispatch, batch collator, JSONL metrics,
-  manifest loader, role evidence + shuffle control
+  manifest loader, role evidence + shuffle control, batch tuner (decision
+  logic behind `train.auto_batch`)
 - `src/train.rs` — manifest-driven training loop (ACT + Muon/AdamW, holdout
-  split, eval, checkpoints)
+  split, in-distribution eval, auto-batch, checkpoints)
 - `src/test_backend.rs` — single swap point for the test-suite backend
 - `src/main.rs` — CPU smoke binary (param budget, forward shapes, optimizer
   build)
@@ -474,6 +677,8 @@ Natural language. Scale.
 - `examples/chain.rs` — chained experiments with checkpoint dependencies +
   forgetting evals
 - `examples/lr_sweep.rs` — two-axis (LR × seed) sweep over held-out accuracy
+- `examples/scaling_sweep.rs` — named-axis (`data` | `depth` | `params`) sweep
+  reporting both accuracies and the gap, with `--auto-batch`
 - `configs/` — run manifests + chains (JSON, no recompile to tweak)
 
 ## Optimizer
@@ -540,9 +745,59 @@ Variations are internally tagged enums, so each is a manifest edit:
 | `stop` | `{"kind": "act"}` · `{"kind": "act", "shuffle_train": true}` · `{"kind": "fixed", "loops": 4}` · `{"kind": "converge"}` |
 | `train.lr_muon` / `lr_adamw` | `{"kind": "constant", "lr": …}` · `linear` (warmup) · `cosine` · `step` |
 | `train.eval_holdout` | float in `[0, 1)`; `0` is rejected as in-distribution |
+| `train.eval_in_distribution` | bool, default on — logs the `memorization` record |
+| `train.indist_eval_per_cell` | instances drawn from the training pool for that record |
+| `train.max_train_instances` | cap on the training pool, applied **after** the holdout; `0` = no cap |
+| `train.auto_batch` | bool, default **off** — see "Auto-batch" below |
 | `experiment.protocol.k_set` | array, **replaces** rather than unions |
 
 The `model`, `optim`, and `train` blocks are **not** serde-defaulted: a
 partial block is a parse error by design, so a checked-in manifest fully
 determines the run. `stop` is the exception (`#[serde(default)]` → ACT), so
 older manifests keep working. Use `extends` to vary one block.
+
+## Auto-batch
+
+`train.auto_batch` grows the micro-batch to fill the GPU instead of leaving it
+at whatever a manifest hardcoded — the shipped `stage0-base.json` held 190 MB of
+4 GB. Three keys: `auto_batch` (off by default), `auto_batch_max` (the ceiling
+on the tuner's B×T budget) and `auto_batch_headroom` (the fraction of total
+device memory activations may occupy; the remainder absorbs fragmentation and
+the eval pass, which is sized separately and would otherwise OOM after tuning
+had already concluded).
+
+Two design points, both load-bearing:
+
+- **The effective batch is preserved.** The tuner holds
+  `batch_size × accum_steps` constant and moves `accum_steps` to compensate,
+  because the effective batch is what sets gradient noise. A tuner that varied
+  it would make runs on different cards non-comparable, which is the one thing
+  a sweep axis must not do. When rounding prevents exact restoration the run
+  says so rather than reporting a match that is not one, and the realized
+  `batch_size` and `accum_steps` are logged at the top of the run — without
+  that line an auto-tuned run is not reproducible, since the batch is a
+  function of the card it ran on.
+- **It measures by extrapolating, never by hitting the limit.** A CUDA OOM
+  aborts the process rather than raising a catchable error, so the limit cannot
+  be found by reaching it. The tuner measures a batch it has already survived,
+  extrapolates activation memory to a candidate, and grows only while the
+  prediction clears the budget. It also refuses to run on a non-CUDA backend
+  (device memory reads flat there, which looks like unlimited headroom), and
+  stops on a non-monotonic or flat reading, keeping the last trustworthy
+  budget rather than treating a held high-water mark as free space.
+
+The ladder's axis is the **B×T budget**, not `batch_size` alone: the banded
+sampler's row trim already caps rows per length band, so a larger `batch_size`
+at the default budget delivers no more rows and measures as a flat memory line.
+A knob that has stopped being connected to the thing it names is worse than no
+knob, because the tuner believes it is still growing something.
+
+**Why it is off by default.** The tuner compensates the effective batch by
+adjusting `accum_steps`, which cannot subdivide below one micro-batch: when the
+selected budget does not divide the target, the effective batch ends up
+*slightly* different from the manifest's. On a controlled sweep where the whole
+claim is that one variable moved, a batch that silently drifted is a second
+variable. Opt in per run — `scaling_sweep --auto-batch`, or `"auto_batch":
+true` in a manifest whose throughput matters more than an exactly pinned
+batch — and log the realized values with the result. Measured effect on the
+3050 is under "Throughput, and why the batch tuner exists".
