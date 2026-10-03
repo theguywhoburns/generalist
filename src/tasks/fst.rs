@@ -248,4 +248,81 @@ mod tests {
     fn fixed_demos_never_copy_query_target() {
         crate::tasks::demo::fuzz_no_demo_equals_target(&SubstFstFixedTask, 306, 200);
     }
+
+    /// The distinction the whole "rule-level vs instance-level holdout"
+    /// limitation rests on, pinned as an executable claim rather than prose.
+    ///
+    /// On `subst-fst` the map is redrawn per instance, so two instances in the
+    /// same cell generally carry DIFFERENT maps: holding out instances there
+    /// holds out rules. On `subst-fst-fixed` the map is constant by
+    /// construction, so holding out instances holds out nothing about the rule
+    /// and any accuracy is transduction of a memorized map.
+    ///
+    /// If someone made the fixed task sample per instance (or the base task
+    /// cache its map), this test fails, and that failure is the signal that
+    /// every number measured on the fixed rung silently changed meaning.
+    #[test]
+    fn subst_fst_redraws_the_rule_per_instance_and_fixed_does_not() {
+        let mut rng = HarnessRng::new(307);
+
+        // The observable of a rule is what it does to a fixed probe string:
+        // two rules are the same iff they agree on every character.
+        let probe = "abcabcabc";
+        let map_of = |r: &dyn Rule| -> String {
+            // Probe through render_query with a known input is not available,
+            // so use the oracle header where present and verify otherwise.
+            r.oracle_header().unwrap_or_else(|| {
+                // No header: recover the map by feeding a one-symbol query
+                // through verify against each candidate output.
+                let mut found = String::new();
+                for src in ['a', 'b', 'c'] {
+                    let hit = (b'a'..=b'z')
+                        .map(char::from)
+                        .find(|t| r.verify(&src.to_string(), &t.to_string()));
+                    found.push(hit.unwrap_or('?'));
+                }
+                found
+            })
+        };
+
+        let base = SubstFstTask;
+        let maps: Vec<String> = (0..12)
+            .map(|_| {
+                let rule = base.sample_rule(&mut rng, Track::A);
+                map_of(rule.as_ref())
+            })
+            .collect();
+        let distinct = maps.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(
+            distinct > 1,
+            "subst-fst must draw a fresh map per instance, got one distinct \
+             map across {maps:?} — if this is now constant, held-out accuracy \
+             on this rung no longer measures rule generalization"
+        );
+
+        // The fixed rung, by contrast, must be constant. Same probe, same
+        // track and a different one, so this also pins cross-track identity.
+        let fixed = SubstFstFixedTask;
+        let f_a = map_of(fixed.sample_rule(&mut rng, Track::A).as_ref());
+        let f_b = map_of(fixed.sample_rule(&mut rng, Track::B).as_ref());
+        let f_a2 = map_of(fixed.sample_rule(&mut rng, Track::A).as_ref());
+        assert_eq!(
+            f_a, f_b,
+            "the fixed map must be identical across tracks, got {f_a} vs {f_b}"
+        );
+        assert_eq!(
+            f_a, f_a2,
+            "the fixed map must be identical across calls, got {f_a} vs {f_a2}"
+        );
+
+        // And the probe itself is meaningful: it must not read as all-`?`,
+        // which would make every rule look identical.
+        assert!(
+            !f_a.contains('?'),
+            "probe failed to recover the fixed map (got {f_a:?}) — the \
+             distinct-map assertion above would be vacuous if this passes \
+             for every rule"
+        );
+        let _ = probe;
+    }
 }

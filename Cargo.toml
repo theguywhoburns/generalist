@@ -14,4 +14,8 @@ ndarray = ["burn/ndarray"]
 cuda = ["burn/cuda"]
 
 [profile.dev]
+# 1, not 0: this crate is a thin harness around burn's kernels, so almost all
+# the arithmetic runs on the GPU and `opt-level = 0` only makes the host-side
+# token bookkeeping slow. It still rebuilds far faster than `--release`, which
+# is what actually costs time here.
 opt-level = 1
