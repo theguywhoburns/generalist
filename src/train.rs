@@ -1563,6 +1563,17 @@ pub fn run_stage<B: AutodiffBackend>(
                 .expect("label serializes"),
                 ev.reading().is_some_and(|r| r.supports_roles()),
             ));
+            // The pool summary is logged, not just printed. It is the only
+            // line carrying ONE accuracy per eval pass over the whole eval
+            // set, which makes it the only place a cross-pass comparison (the
+            // ordered-vs-reversed collapse) can be read from a log without
+            // re-deriving it from 576 per-instance records. Anything that
+            // consumes a run.jsonl after the fact needs this line to exist.
+            log.push_str(&format!(
+                "{{\"eval\":\"{label}-pool\",\"accuracy\":{:.6},\"byte_accuracy\":{:.6},\
+                 \"copy_rate\":{:.6},\"mean_halt\":{:.6},\"n\":{}}}\n",
+                s.accuracy, pool_byte_acc, s.copy_rate, s.mean_halt, s.n,
+            ));
             (s.accuracy, pool_byte_acc)
         };
         if order.is_none() {
