@@ -687,6 +687,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                     correct: text == expected,
                     byte_hits,
                     byte_total: expected.chars().count(),
+                    echoed_query: text == inst.info.query_input,
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
@@ -1533,10 +1534,11 @@ pub fn run_stage<B: AutodiffBackend>(
                 ),
             };
             println!(
-                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} echo {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.byte_accuracy,
                 s.copy_rate,
+                s.query_echo_rate,
                 s.mean_halt,
                 fmt2(&s.mean_block_halt),
                 fmt2(&s.share_block_halt),
@@ -1571,8 +1573,8 @@ pub fn run_stage<B: AutodiffBackend>(
             // consumes a run.jsonl after the fact needs this line to exist.
             log.push_str(&format!(
                 "{{\"eval\":\"{label}-pool\",\"accuracy\":{:.6},\"byte_accuracy\":{:.6},\
-                 \"copy_rate\":{:.6},\"mean_halt\":{:.6},\"n\":{}}}\n",
-                s.accuracy, pool_byte_acc, s.copy_rate, s.mean_halt, s.n,
+                 \"copy_rate\":{:.6},\"query_echo_rate\":{:.6},\"mean_halt\":{:.6},\"n\":{}}}\n",
+                s.accuracy, pool_byte_acc, s.copy_rate, s.query_echo_rate, s.mean_halt, s.n,
             ));
             (s.accuracy, pool_byte_acc)
         };

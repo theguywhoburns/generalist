@@ -24,6 +24,16 @@ pub struct Record {
     /// region exact-match cannot see.
     pub byte_hits: usize,
     pub byte_total: usize,
+    /// Model output equalled the query **input** verbatim.
+    ///
+    /// Distinct from `copied`, which asks whether the output appeared among the
+    /// demo *outputs*. The two separate the two ways a model can dodge a rule:
+    /// replaying something it was shown versus echoing the question. For a
+    /// transduction task whose rule is a non-identity permutation, echoing the
+    /// input is guaranteed wrong, so a high value here names the failure
+    /// precisely instead of leaving it to be guessed at from a chance-rate
+    /// comparison.
+    pub echoed_query: bool,
     /// Model output appeared verbatim among demo outputs.
     pub copied: bool,
     pub steps_used: usize,
@@ -46,13 +56,14 @@ impl Record {
         };
         let bh: Vec<String> = self.block_halt.iter().map(|v| format!("{v:.3}")).collect();
         format!(
-            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"byte_hits\":{},\"byte_total\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
+            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"byte_hits\":{},\"byte_total\":{},\"copied\":{},\"echoed_query\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
             self.task,
             self.k,
             self.correct,
             self.byte_hits,
             self.byte_total,
             self.copied,
+            self.echoed_query,
             self.steps_used,
             self.mean_halt,
             bh.join(","),
@@ -65,6 +76,13 @@ impl Record {
 pub struct Summary {
     pub n: usize,
     pub accuracy: f64,
+    /// Fraction of instances where the output echoed the query input verbatim.
+    ///
+    /// Read against `copy_rate` (which asks about demo outputs) this separates
+    /// "replayed something shown" from "echoed the question", which is what
+    /// distinguishes a model that ignores the rule from one that never learned
+    /// to read it.
+    pub query_echo_rate: f64,
     /// Micro-averaged over all target bytes: `sum(hits) / sum(total)`.
     ///
     /// Micro rather than per-instance mean because instance lengths vary, and
@@ -235,6 +253,7 @@ pub fn summarize(records: &[Record]) -> Summary {
     Summary {
         n: records.len(),
         accuracy: records.iter().filter(|r| r.correct).count() as f64 / n,
+        query_echo_rate: records.iter().filter(|r| r.echoed_query).count() as f64 / n,
         byte_accuracy: {
             let hits: usize = records.iter().map(|r| r.byte_hits).sum();
             let total: usize = records.iter().map(|r| r.byte_total).sum();
@@ -310,6 +329,7 @@ mod tests {
             correct,
             byte_hits: usize::from(correct),
             byte_total: 1,
+            echoed_query: false,
             copied,
             steps_used: 6,
             mean_halt: 4.5,

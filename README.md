@@ -271,6 +271,16 @@ two accuracies, so **its variance exceeds either half's** — `scaling_sweep.rs`
 prints per-seed detail whenever more than one seed is requested, and a gap
 reported without its spread is not a measurement.
 
+**A gap is also the wrong instrument when one of its two terms is pinned.** On
+the varying-rule data rung, in-distribution byte accuracy sat at 0.97–1.00, so
+the in-distribution term had almost no room to move; the gap drifted
+-0.722 → -0.666 while held-out byte accuracy stayed at chance throughout. The
+drift was the pinned term, not transfer. So `scaling_sweep.rs` now checks
+whether the held-out curve moved before it reads the gap, suppresses the gap
+verdict when it did not, and prints the chance rate explicitly when held-out
+lands at or below it. The general rule: read the held-out column on its own
+first, and treat a gap trend as evidence only when that column moved with it.
+
 ```text
   indist_accuracy, indist_byte_accuracy   — from the training pool
   heldout_accuracy, heldout_byte_accuracy — from the holdout split
@@ -338,8 +348,12 @@ whole pool, so the model saw the rule itself during training and the eval
 merely asks it to apply a memorized map. On `subst-fst` the eval instances do
 carry rules that never appear in the training pool, but they are new *instances
 of the same rule family* (Track A) or the same procedure over new symbols
-(Track B). Holding out rule *classes* is not implemented. See "Known
-limitations".
+(Track B). **This is no longer only a caveat: it has been measured.** The data
+axis on `subst-fst` returns chance-level held-out accuracy at every data size
+while in-distribution exact-match reaches 1.000, so the constant-rule transfer
+was map application and not generalization. Holding out rule *classes* — a
+procedure never trained on in any form — is still not implemented. See "Known
+limitations", item 1.
 
 ## Curriculum
 
@@ -413,21 +427,24 @@ compute-matched), and any manifest knob for them.
 
 ## Current results
 
-Four measurements exist, plus a throughput note. Three are on
-`subst-fst-fixed`, the weights-only rung; the fourth is the order-augmented
-comparison on the full 6-task suite, where 576 held-out instances replace the
-~29 the two scaling axes run on. All are reported here with the caveats that
-keep them honest rather than as findings. The LR sweep came first and is the
-weakest of them; the two scaling axes are first passes, not curves; the
-order-augmented arm is the one settled positive result here, and its caveats
-travel with it.
+Five measurements exist, plus a throughput note. Four are on `subst-fst-fixed`,
+the weights-only rung; one is the same data axis on `subst-fst`, where the rule
+varies per instance; the fifth is the order-augmented comparison on the full
+6-task suite, where 576 held-out instances replace the ~29 (constant rule) and
+~46 (varying rule) held-out instances the two data-axis sweeps run on. All are
+reported here with the caveats that keep them honest rather than as findings.
+The LR sweep came first and is the weakest of them; the fixed-rung scaling axes
+are first passes, not curves; the varying-rule rung is the one measurement that
+contradicts a reading rather than extending one; the order-augmented arm is the
+one settled positive result here, and its caveats travel with it.
 
-### Data axis: the memorization-onset curve
+### Data axis, constant rule: the memorization-onset curve
 
 The instrument is the train/held-out gap ("Measuring the gap"), and the axis is
 `train.max_train_instances`, so the eval set is the same ~29 held-out instances
 at every point. 492,418-parameter model (`d_model` 128, `n_stages` 2,
-`max_loops` 4), 600 steps, auto-batch on, 3 seeds per point, RTX 3050 4 GB.
+`max_loops` 4), 600 steps, auto-batch on, 3 seeds per point, RTX 3050 4 GB. Task
+`subst-fst-fixed`: one constant substitution map for the whole pool.
 
 | train N | byte-in | byte-out | gap | exact-in | exact-out |
 |---|---|---|---|---|---|
@@ -440,12 +457,21 @@ In-distribution accuracy is 0.95–0.99 at every data size, and **the gap narrow
 monotonically as data grows**. More data buys transfer here, not memorization —
 the opposite sign to what a pure-memorization account predicts.
 
+**What "transfer" means on this rung, stated before the next table.** The rule
+is one constant map for the entire pool, so the held-out curve measures how
+well the model applies a map it was trained on to inputs it was not. It is a
+real measurement and the table stands; it is not evidence about the Goal's
+questions 1 and 3. The next subsection runs the identical axis with the rule
+redrawn per instance, and the transfer does not survive: 18× more data buys
+nothing above chance once the map has to be induced.
+
 **Onset was not observed.** The held-out curve is still rising at 288
 instances and the gap is still -0.127, so the crossover lies beyond the right
 edge of this sweep and the axis has *not bracketed* the onset. A gap of 0.127
 with held-out byte accuracy at 0.850 is not a saturated model. What the table
 does fix is the direction of travel; extending the axis is the open item, not
-this table.
+this table. The rise is a rise in map application on a fixed rule, so it does
+not locate an onset in rule transfer either — see limitation 2.
 
 **This refutes the earlier reading of the same axis.** A fixed-batch run at 300
 steps and batch 6 put held-out exact-match at 0.000 at the two smallest data
@@ -462,6 +488,121 @@ from commit `8bcffc6` should read this table instead.
 cargo run --release --example scaling_sweep -- configs/<base>.json data gpu 16 48 128 288 --seeds=0,1,2 --auto-batch
 ```
 
+### Data axis, varying rule: 18× more data and no transfer
+
+Same instrument, same model, same budget as the table above — 492,418
+parameters (`d_model` 128, `n_stages` 2, `max_loops` 4), 600 steps, auto-batch
+on, 46 held-out instances, 3 seeds per point, RTX 3050 4 GB. The **only**
+change is the task: `subst-fst` instead of `subst-fst-fixed`. `subst-fst`
+redraws the substitution map per instance — now pinned by a test, so the two
+tasks cannot silently converge — which means every held-out instance carries a
+map the model never saw, where `subst-fst-fixed` holds one map constant by
+construction. **k ∈ {1, 2, 3, 5} with `k0_rate` 0, so the rule is always
+demonstrated in the prompt** — the model is shown the map before being asked to
+apply it.
+
+> **A confound that was in the first pass of this table, and what it cost.** The
+> first run of this sweep inherited `k_set: [0]` from the constant-rule base, so
+> every instance had **zero in-context demonstrations**: the rule was never
+> shown, only implied by a constant the model had to hold in weights. It
+> measured 0.249 / 0.315 / 0.297 / 0.311 and was read as "at chance on unseen
+> rules" — a conclusion that configuration could not support, since with no
+> demonstration there is nothing in the prompt to induce a map *from*. The
+> numbers above are the rerun at k ≥ 1. The headline conclusion happens to
+> survive, but it survived a test it could not have passed, and the earlier
+> table should not be read as evidence about rule induction.
+
+| train N | byte-in | byte-out | gap | exact-in | exact-out |
+|---|---|---|---|---|---|
+| 16 | 0.963 | 0.181 | -0.783 | 0.792 | 0.000 |
+| 48 | 0.970 | 0.241 | -0.729 | 0.812 | 0.000 |
+| 128 | 0.950 | 0.218 | -0.731 | 0.802 | 0.000 |
+| 288 | 0.888 | 0.265 | -0.623 | 0.635 | 0.000 |
+
+Held-out byte accuracy is 0.18–0.27 and **flat across an 18× range of training
+data**. Chance on a 3-symbol alphabet is 1/3 = 0.333, so the model is **at or
+below chance on unseen rules at every point on the axis**, and in-distribution
+exact-match is 0.64–0.79.
+
+| | constant rule (`subst-fst-fixed`) | varying rule (`subst-fst`) |
+|---|---|---|
+| held-out byte accuracy, N = 16 → 288 | 0.329 → 0.850 | 0.181 → 0.265 |
+| gap, N = 16 → 288 | -0.614 → -0.127 | -0.783 → -0.623 |
+| against the 0.333 chance rate | rises from below to well above | **below it at every point** |
+| rule shown in context? | n/a (it is in the weights) | yes, k ∈ {1, 2, 3, 5} |
+
+**Being below chance is a stronger statement than being at chance, and the two
+obvious explanations for it are both refuted by measurement.** At chance would
+mean uniform guessing; below chance means systematically wrong. Two policies
+could produce that — replaying a demo output, or echoing the query input — and
+both were checked against the run log at N = 288, seed 0:
+
+```
+eval [final-trained-pool]: acc 0.00 byte 0.273 copy 0.00 echo 0.00
+```
+
+`copy` (output appeared among demo outputs) and `echo` (output equalled the
+query input verbatim) are **both 0.000**. The model is not replaying anything it
+was shown and is not echoing the question, yet it lands below the 0.333 chance
+rate. The failure is therefore neither of the two mechanisms that would have
+explained it, and **the mechanism is not identified**. `query_echo_rate` was
+added to `Record` and `Summary` specifically to test this, and it earned its
+place by failing to explain the result.
+
+The next step is an output-level diagnostic that does not exist yet: the
+per-track breakdown — Track A is `abc`, Track B is `xyz`, and a mean over both
+can hide one track at chance and the other near zero — and the emitted strings
+themselves. Until those exist the correct statement is "systematically wrong, by
+an unidentified mechanism", not a story about copying.
+
+**These are two rungs of one task family, not contradictory measurements.** The
+constant-rule table is a real measurement and is unchanged by this one; it
+measures map application. The two rungs differ only in whether the map is
+constant or induced, and that single difference is what separates "the model
+generalizes" from "the model applies a memorized map".
+
+**The transfer the constant-rule curve showed was never generalization.** It was
+learning to apply one memorized constant map to new inputs. Require the map to
+be induced per instance and the transfer vanishes: 18× more data buys nothing
+above chance, even with the rule demonstrated in the prompt every time. This is
+the reading the constant-rung table should have been given from the start, and
+limitation 1 says so.
+
+**This is not undertraining.** In-distribution exact-match is 0.64–0.79 while
+held-out is at or below chance, so the model is fitting its training instances
+far better than it applies any rule it has just been shown. The confound behind
+the earlier refuted reading — more data means fewer epochs at a fixed step
+count — cannot produce this, because in-distribution accuracy *falls* as N grows
+(0.963 → 0.888) rather than rising: the model is memorizing less as the pool
+grows and still transferring nothing.
+
+**The gap drifted for a mechanical reason, and a gap is the wrong instrument
+here.** In-distribution was pinned near ceiling with no room to fall, so
+-0.722 → -0.666 is the near-immutable side moving, not the held-out side
+improving. `scaling_sweep.rs` previously printed "gap narrowing … more of the
+train-pool advantage transfers" for exactly this data, because it read only the
+gap. It now checks whether the held-out curve actually moved **first**, and
+suppresses the gap reading when it did not; it also prints the chance rate
+explicitly when held-out lands at or below it. Reporting a gap trend in
+isolation invites reading the near-immutable term as a mechanism.
+
+**What this rung does not separate.** There is no positive control here:
+nothing in this table shows the model can induce a *new* map from in-context
+demonstrations at this size and budget, so "at chance on unseen rules" is a
+statement about the rung, not a diagnosis of which sub-skill fails. The demo
+count this sweep ran at is not recorded in the table, and a rung that never
+demonstrates the rule in the prompt would sit at chance by construction rather
+than by limitation. The table also reports one number per point, so whether the
+chance-level reading is uniform across Track A and Track B is not established
+here either. Both are open; the induction and oracle rungs are queue item 1.
+
+```bash
+cargo run --release --example scaling_sweep -- configs/<base-varyrule>.json data gpu 16 48 128 288 --seeds=0,1,2 --auto-batch
+```
+
+(a manifest identical to the constant-rung base except
+`experiment.tasks: ["subst-fst"]`)
+
 ### Compute-depth axis: a first pass, not a curve
 
 Fixed batches (no auto-batch), 600 steps, same model and task, `stop.fixed`
@@ -476,7 +617,11 @@ with `loops` as the axis, 3 seeds per point.
 
 Depth helps, and **the gap narrows with it** (-0.067 → -0.018): extra compute
 buys transfer rather than memorization. That is the direction Goal question 2
-asks for, and it is the first non-zero evidence on the axis.
+asks for, and it is the first non-zero evidence on the axis. **The same
+caveat applies as on the constant-rule data axis**, because this is the same
+task: the rule is one constant map, so this is transfer on that rung, and the
+varying-rule sweep shows that transfer does not survive requiring a fresh map
+per instance. Depth effects and rule-transfer effects are not yet separated.
 
 **Exact-match was 0.000 on both halves at every depth.** On exact-match alone
 this table reads "depth does nothing" — which is the metric failure described
@@ -504,8 +649,9 @@ cargo run --release --example scaling_sweep -- configs/<base>.json depth gpu 1 2
 7.4× the data per second for 7.7× the memory. Steps per second *drops* — from
 16.8 to 7.8 — because each step is now 16× the work, so **throughput is not
 comparable at fixed step counts** and two runs are only comparable at equal
-instances seen. That is the same confound as the undertrained data sweep above,
-and it is why the data-axis result is stated in instances rather than steps.
+instances seen. That is the same confound as the undertrained data sweep under
+"Data axis, constant rule" above, and it is why the data-axis results are stated
+in instances rather than steps.
 
 ### Optimization: a Muon learning-rate sweep
 
@@ -558,7 +704,8 @@ cargo run --release --example lr_sweep -- configs/stage0-fixed.json gpu 2e-3 1.5
 Per-run logs land in gitignored `checkpoints*/run.jsonl`, so the table is not
 a checked-in artifact — re-running is how to verify it. `lr_sweep` reports
 **held-out** accuracy (never training loss: a lower LR trades training loss
-for generalization here) and prints an explicit single-seed caveat, quoting
+for map application here — not rule generalization, see limitation 1) and
+prints an explicit single-seed caveat, quoting
 the binomial SE at the observed n, when `--seeds` is omitted.
 
 ### Order augmentation: order-dependence is learned, not structural
@@ -635,26 +782,60 @@ cargo run --release --example arm_compare -- configs/stage0-4block.json configs/
 
 Listed with what would change the conclusion, strongest first.
 
-1. **Held-out eval is instance-level, not rule-level.** For
-   `subst-fst-fixed` the rule is **constant by construction**, so holding out
-   instances does not make the rule unseen — the model was trained on the very
-   map the eval asks it to apply, and the 0.687–0.761 numbers measure
-   transduction of a memorized rule, not generalization. On the `subst-fst`
-   rungs the eval rules are new instances of a trained rule family (Track A) or
-   the same procedure over unseen symbols (Track B), which is stronger but
-   still not rule-level. **Holding out rule classes is not implemented.** This
-   is the single biggest caveat on every number above, and it means the sweep
-   says nothing about the Goal's questions 1 and 3. Measuring the gap does not
-   soften it: a gap between two accuracies on the *same* constant rule is still
-   a gap measured on one rule, and the data-axis result above is a claim about
-   transfer on the easiest possible axis.
-2. **Memorization onset has not been bracketed.** The data axis stops at 288
-   training instances with the held-out curve still rising and the gap still
-   open at -0.127, so the crossover is beyond the right edge of the measured
-   range. What the table does establish is the *sign* — more data closes the
-   gap on this rung — not where the sign would flip. Onset also needs the other
-   two axes first, because onset in (params × depth × data) space is a joint
-   location and only one coordinate has been swept.
+1. **The holdout is instance-level, not rule-class-level.** The measurement
+   that sharpened this now exists. The same data axis was run on `subst-fst`,
+   which redraws the substitution map per instance (pinned by a test), so every
+   held-out instance carries a map the model never saw, demonstrated in the
+   prompt at k ∈ {1, 2, 3, 5}: held-out byte accuracy is 0.18–0.27 and flat
+   from 16 to 288 training instances, **below** the 0.333 chance rate for a
+   3-symbol alphabet at every point, while in-distribution exact-match is
+   0.64–0.79. So the 0.329 → 0.850 rise on `subst-fst-fixed` was never
+   generalization. It was learning to apply one memorized constant map to new
+   inputs, and that transfer does not survive requiring a fresh map per
+   instance.
+   **The `subst-fst-fixed` numbers are unchanged by this and remain what they
+   always were** — a real measurement of map application on a constant rule,
+   including the 0.687–0.761 LR-sweep figures, which measure transduction of a
+   memorized rule. Measuring the gap does not soften any of it: a gap between
+   two accuracies on the *same* constant rule is a gap measured on one rule.
+
+   **What is still open, and it is the half that matters.** Neither rung holds
+   out a rule *class*. Both measure transfer **within one task family**:
+   `subst-fst` varies the instance's map, but the family, the procedure, the
+   alphabet and the output format are the ones that were trained on. Holding
+   out an entire task family or procedure — trained on some procedures,
+   evaluated on one never seen in any form — **is not implemented at all**, and
+   it is what Goal questions 1 and 3 actually require: "scales with parameters"
+   and "where memorization begins" are both claims about an axis the model has
+   never been on. Until that exists, the honest answer to "does this model
+   generalize?" is **no measurable transfer on the one rung where the rule
+   varies**, and the sweep says nothing about questions 1 and 3.
+
+   Two smaller open points ride on this item. The varying-rule rung has **no
+   positive control**: nothing in it shows the model *can* induce a new map from
+   in-context demonstrations at this size and budget, so "below chance" names
+   the failure without isolating which sub-skill is missing. The mechanism is
+   specifically **unidentified** — the two obvious candidates (replaying a demo
+   output, echoing the query input) are both measured at 0.000 — and the rung
+   reports one number per point, so whether the reading is uniform across Track
+   A and Track B is not established. A per-track breakdown plus the emitted
+   strings is the concrete next step.
+2. **Memorization onset has not been bracketed.** The constant-rule data axis
+   stops at 288 training instances with the held-out curve still rising and the
+   gap still open at -0.127, so the crossover is beyond the right edge of the
+   measured range. What that table establishes is the *sign* — more data closes
+   the gap on this rung — not where the sign would flip. **The varying-rule rung
+   cannot bracket onset either, and for a different reason: its held-out curve
+   never rises at all**, sitting flat at chance from 16 to 288 instances.
+   Onset requires the held-out curve to first rise and then fall, and that rung
+   has no rise to fall from. What it shows instead is that the low-data end is
+   already saturated on the fitting side — in-distribution exact-match is
+   1.000 at three of four sizes — so the whole measured range sits on one side
+   of any crossover. Onset also needs
+   the other two axes first, because onset in (params × depth × data) space is a
+   joint location and only one coordinate has been swept, and it needs the
+   rule-class holdout in item 1 before "memorization" can mean anything other
+   than fitting a map the model was given.
 3. **The depth axis has one pass, at one operating point.** 492,418 params,
    fixed batches, `fixed {1,2,4,8}` only, 3 seeds. No ACT point and therefore
    no compute-matched ACT-vs-fixed comparison, no `loops: 16`, one model size,
@@ -743,12 +924,33 @@ kept here for the record, not as work.
    That is what item 1 is for, and it is now the top open item. The closed test
    itself does not need rerunning, but anything read off it inherits its n=3.
 1. **Extend the sweep to the k>0 and oracle rungs** (`stage0-oracle`,
-   `stage0-4block`, `subst-fst`). This does two things at once: it moves the
-   headline number onto a task where the rule is genuinely held out
-   (limitation 1), and it puts the model on a rung where the random-weight
-   control scores above chance, which is what makes the shuffle control
-   non-degenerate (limitation 4). With item 0 closed, this is the
-   highest-value item per GPU-hour.
+   `stage0-4block`, `subst-fst`) *(partly done: the `subst-fst` rung of the
+   data axis is now measured, and it inverted the reading instead of retiring
+   the item)*. The original intent had two halves and one has run.
+
+   **Done: the `subst-fst` rung.** The data axis with a per-instance map is
+   measured, and the result is negative for generalization — held-out byte
+   accuracy flat at chance across an 18× range while in-distribution
+   exact-match reaches 1.000. That answers part of limitation 1: the
+   constant-rule transfer was map application, and it does not survive a fresh
+   map. It also **raises the value of the remaining half instead of retiring
+   this item**, because the varying-rule rung did not produce a rung where the
+   random-weight control scores above chance, so limitation 4's degenerate
+   control is unchanged and the positive control limitation 1 asks for does not
+   exist yet.
+
+   **Still open, in order of value.** (a) The **oracle rung**
+   (`stage0-oracle`, `subst-fst-oracle`), where the map is handed over in the
+   prompt: that separates rule *execution* from rule *induction* and is the
+   rung where the untrained model should score above chance, which is what makes
+   the shuffle control non-degenerate (limitation 4). (b) The **k>0 rungs**
+   (`stage0-4block`, full suite at k ∈ {0,1,2,3,5,8}), which give the induction
+   delta the varying-rule rung has no positive control for. (c) A true
+   **rule-CLASS holdout across task families**, which is not implemented at all
+   and is the only version of this item that puts the headline number on a task
+   whose rule is genuinely held out (limitation 1). With item 0 closed and the
+   `subst-fst` rung reported, the oracle rung is now the highest-value item per
+   GPU-hour.
 2. **Finish the depth axis** *(partly done: a first pass over `fixed
    {1,2,4,8}` exists)*. **One of the two confounds is gone.** The worry that
    depth was moving learned order-dependence rather than capacity — a depth
@@ -788,7 +990,9 @@ kept here for the record, not as work.
    flip, exactly as intended; `eval_holdout: 0` remains loader-rejected. What
    is missing is the range: the axis has to be pushed past 288 instances, and
    to be swept at two or more model sizes and depths so the crossover can be
-   located in more than one coordinate. Hold the instances-seen budget constant
+   located in more than one coordinate. Pushing the constant-rule axis further
+   alone does not get there — limitation 2 says why: that rung measures map
+   application, and the varying-rule rung has no rise to fall from. Hold the instances-seen budget constant
    along the axis — the earlier undertrained pass at a fixed step count is what
    produced the refuted "onset below 16" reading.
 6. **Add the compute-matched non-looped baseline** so "depth" has something
