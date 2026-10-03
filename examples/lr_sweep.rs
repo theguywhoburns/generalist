@@ -87,22 +87,29 @@ fn main() {
             panic!("gpu requested but the `cuda` feature is off");
         }
     } else {
-        let device = Default::default();
-        println!("backend: NdArray (CPU)");
-        for lr in &candidates {
-            for seed in &seeds {
-                if let Some(acc) = one(&base, *lr, *seed, |r| {
-                    run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
-                        &r,
-                        &device,
-                        None,
-                        &[],
-                    )
-                }) {
-                    results.push((*lr, *seed, acc));
+        // Feature-gated: naming `burn::backend::NdArray` unconditionally broke
+        // the cuda-only build, which is the feature set the GPU runs use.
+        #[cfg(feature = "ndarray")]
+        {
+            let device = Default::default();
+            println!("backend: NdArray (CPU)");
+            for lr in &candidates {
+                for seed in &seeds {
+                    if let Some(acc) = one(&base, *lr, *seed, |r| {
+                        run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
+                            &r,
+                            &device,
+                            None,
+                            &[],
+                        )
+                    }) {
+                        results.push((*lr, *seed, acc));
+                    }
                 }
             }
         }
+        #[cfg(not(feature = "ndarray"))]
+        panic!("cpu requested but the `ndarray` feature is off");
     }
 
     summarize(&results);

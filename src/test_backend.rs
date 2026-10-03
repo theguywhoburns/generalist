@@ -1,19 +1,40 @@
 //! Single swap point for the test-suite backend.
 //!
-//! Every `#[cfg(test)]` module uses [`TestBackend`] + [`test_device`].
-//! To run the whole suite on another backend, change the three marked lines
-//! below (e.g. `NdArray` -> `Cuda`, `NdArrayDevice` -> `CudaDevice`).
+//! Every `#[cfg(test)]` module uses [`TestBackend`] + [`test_device`]. The
+//! suite runs on the CPU when the `ndarray` feature is on and falls back to
+//! CUDA when it is off, so `cargo test --features cuda` runs the whole suite
+//! on the GPU without editing this file.
 
-use burn::backend::{Autodiff, NdArray, ndarray::NdArrayDevice};
+/// The suite runs on the CPU by default and falls back to the GPU when the
+/// `ndarray` feature is off.
+///
+/// The fallback exists because naming `NdArray` unconditionally made a
+/// cuda-only build fail to compile -- and cuda-only is the feature set the GPU
+/// sweeps actually use, so "run the suite on the GPU" was documented here but
+/// not actually buildable. With the fallback it is, at the cost of needing a
+/// working GPU.
+#[cfg(feature = "ndarray")]
+mod selected {
+    use burn::backend::{Autodiff, NdArray, ndarray::NdArrayDevice};
 
-/// Backend for the entire test suite. CHANGE THIS to swap backends.
-/// GPU runs via `Autodiff<Cuda>` are already kernel-fused (the `Cuda` alias
-/// wraps `Fusion` while the `fusion` feature is on).
-pub(crate) type TestBackend = Autodiff<NdArray>;
-/// Device matching [`TestBackend`]. CHANGE THIS to swap backends.
-pub(crate) type TestDevice = NdArrayDevice;
+    pub(crate) type TestBackend = Autodiff<NdArray>;
+    pub(crate) type TestDevice = NdArrayDevice;
+}
 
-/// Device for the entire test suite. CHANGE THIS to swap backends.
+#[cfg(all(feature = "cuda", not(feature = "ndarray")))]
+mod selected {
+    use burn::backend::{Autodiff, Cuda, cuda::CudaDevice};
+
+    pub(crate) type TestBackend = Autodiff<Cuda>;
+    pub(crate) type TestDevice = CudaDevice;
+}
+
+#[cfg(not(any(feature = "ndarray", feature = "cuda")))]
+compile_error!("the test suite needs a backend: enable `ndarray` (CPU, the default) or `cuda`");
+
+pub(crate) use selected::{TestBackend, TestDevice};
+
+/// Device for the entire test suite.
 pub(crate) fn test_device() -> TestDevice {
     TestDevice::default()
 }

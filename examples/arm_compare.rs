@@ -110,22 +110,30 @@ fn main() {
         #[cfg(not(feature = "cuda"))]
         panic!("gpu requested but the `cuda` feature is off");
     } else {
-        let device = Default::default();
-        println!("backend: NdArray (CPU)\n");
-        for (name, cfg) in [("A", &a), ("B", &b)] {
-            for seed in &seeds {
-                if let Some(r) = run_one(name, cfg, *seed, auto_batch, |c| {
-                    run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
-                        &c,
-                        &device,
-                        None,
-                        &[],
-                    )
-                }) {
-                    rows.push(r);
+        // Feature-gated for the same reason as the CUDA branch's mirror in
+        // scaling_sweep: naming NdArray unconditionally breaks a cuda-only
+        // `--all-targets` build.
+        #[cfg(feature = "ndarray")]
+        {
+            let device = Default::default();
+            println!("backend: NdArray (CPU)\n");
+            for (name, cfg) in [("A", &a), ("B", &b)] {
+                for seed in &seeds {
+                    if let Some(r) = run_one(name, cfg, *seed, auto_batch, |c| {
+                        run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
+                            &c,
+                            &device,
+                            None,
+                            &[],
+                        )
+                    }) {
+                        rows.push(r);
+                    }
                 }
             }
         }
+        #[cfg(not(feature = "ndarray"))]
+        panic!("cpu requested but the `ndarray` feature is off");
     }
 
     report(&rows);

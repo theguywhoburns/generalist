@@ -33,12 +33,19 @@ fn main() {
             panic!("gpu requested but the `cuda` feature is off");
         }
     } else {
-        println!("backend: NdArray (CPU)");
-        run_chain::<burn::backend::Autodiff<burn::backend::NdArray>>(
-            plan,
-            runs,
-            &Default::default(),
-        );
+        // Feature-gated: naming `burn::backend::NdArray` unconditionally broke
+        // the cuda-only build, which is the feature set the GPU runs use.
+        #[cfg(feature = "ndarray")]
+        {
+            println!("backend: NdArray (CPU)");
+            run_chain::<burn::backend::Autodiff<burn::backend::NdArray>>(
+                plan,
+                runs,
+                &Default::default(),
+            );
+        }
+        #[cfg(not(feature = "ndarray"))]
+        panic!("cpu requested but the `ndarray` feature is off");
     }
 }
 

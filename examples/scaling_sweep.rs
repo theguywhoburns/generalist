@@ -107,23 +107,35 @@ fn main() {
         #[cfg(not(feature = "cuda"))]
         panic!("gpu requested but the `cuda` feature is off");
     } else {
-        let device = Default::default();
-        println!("backend: NdArray (CPU)");
-        for v in &values {
-            for seed in &seeds {
-                let cfg = apply(&base, axis, *v, *seed);
-                if let Some(r) = one(&cfg, axis, *v, *seed, |r| {
-                    run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
-                        &r,
-                        &device,
-                        None,
-                        &[],
-                    )
-                }) {
-                    rows.push(r);
+        // Feature-gated rather than assumed. A cuda-only build has no
+        // `burn::backend::NdArray`, so naming it unconditionally breaks
+        // `--features cuda` --all-targets entirely, which is exactly the build
+        // the GPU runs use.
+        #[cfg(feature = "ndarray")]
+        {
+            let device = Default::default();
+            println!("backend: NdArray (CPU)");
+            for v in &values {
+                for seed in &seeds {
+                    let mut cfg = apply(&base, axis, *v, *seed);
+                    if auto_batch {
+                        cfg.train.auto_batch = true;
+                    }
+                    if let Some(r) = one(&cfg, axis, *v, *seed, |r| {
+                        run_stage::<burn::backend::Autodiff<burn::backend::NdArray>>(
+                            &r,
+                            &device,
+                            None,
+                            &[],
+                        )
+                    }) {
+                        rows.push(r);
+                    }
                 }
             }
         }
+        #[cfg(not(feature = "ndarray"))]
+        panic!("cpu requested but the `ndarray` feature is off");
     }
 
     report(&rows, axis);
