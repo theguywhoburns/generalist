@@ -249,6 +249,8 @@ mod metric_tests {
             track: Track::A,
             k: 0,
             correct,
+            byte_hits: usize::from(correct),
+            byte_total: 1,
             copied: false,
             steps_used: 4,
             mean_halt: block_halt.iter().sum::<f32>() / block_halt.len() as f32,

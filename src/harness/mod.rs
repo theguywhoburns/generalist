@@ -5,6 +5,7 @@
 //! [`Record`]s via [`Jsonl`]. New metric = one function over `Record`s.
 
 pub mod batch;
+pub mod batch_tuner;
 pub mod config;
 pub mod experiment;
 pub mod metrics;

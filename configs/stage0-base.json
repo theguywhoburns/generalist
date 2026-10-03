@@ -36,6 +36,12 @@
     "lr_muon": { "kind": "linear", "lr": 0.0002, "max_lr": 0.002, "warmup_steps": 100 },
     "lr_adamw": { "kind": "constant", "lr": 0.0003 },
     "batch_size": 6,
+
+    "auto_batch": false,
+
+    "auto_batch_max": 16384,
+
+    "auto_batch_headroom": 0.75,
     "steps": 500,
     "log_every": 50,
     "eval_every": 200,

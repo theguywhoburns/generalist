@@ -38,8 +38,34 @@ pub struct TrainConfig {
     /// Same, for the AdamW partition (embed, head, norms, halt gates).
     #[config(default = "LrConfig::Constant { lr: 3e-4 }")]
     pub lr_adamw: LrConfig,
+    /// Micro-batch size. With `auto_batch` this is the *starting* size the
+    /// tuner grows from, and a floor it will not go below.
     #[config(default = 32)]
     pub batch_size: usize,
+    /// Grow `batch_size` to fill the GPU instead of leaving it at whatever a
+    /// manifest happened to hardcode.
+    ///
+    /// The tuner measures a batch it has already survived and extrapolates
+    /// before growing, because a CUDA OOM aborts the process rather than
+    /// raising a catchable error. It holds the *effective* batch
+    /// (`batch_size * accum_steps`) fixed while it moves, so gradient noise —
+    /// and therefore every number in a sweep — stays comparable across
+    /// machines.
+    ///
+    /// The realized `batch_size` and `accum_steps` are logged at the top of the
+    /// run. Without that line an auto-tuned run is not reproducible, since the
+    /// batch is a function of the card it ran on.
+    #[config(default = false)]
+    pub auto_batch: bool,
+    /// Largest micro-batch the tuner may select. Bounds the search so one
+    /// enormous allocation cannot be authorized on a card with room for it.
+    #[config(default = 512)]
+    pub auto_batch_max: usize,
+    /// Fraction of total device memory activations may occupy. The remainder
+    /// absorbs fragmentation and the eval pass, which is sized separately and
+    /// would otherwise OOM after tuning concluded.
+    #[config(default = 0.75)]
+    pub auto_batch_headroom: f64,
     #[config(default = 1000)]
     pub steps: usize,
     #[config(default = 50)]
@@ -153,6 +179,24 @@ pub fn top_bucket_rows(t_pad: usize, rows: usize) -> usize {
 /// Long-band windows are trimmed so the tape size stays band-independent.
 /// Mean-reduced CE keeps merged micro-grads a mean of micro-means either way.
 const MICRO_BT_BUDGET: usize = 2048;
+
+/// Rows the banded window may hold before trimming, derived from a B×T budget
+/// at the shortest band.
+///
+/// The budget — not `batch_size` — is the knob that decides how many rows
+/// actually reach the GPU, because the trim caps every band. A window larger
+/// than this simply supplies more candidate rows to trim from, which is
+/// harmless: the trim drops the longest, so the survivors are the same rows it
+/// would have kept from a smaller window.
+///
+/// Sized so the window always exceeds what the shortest band can use, making
+/// the B×T budget the single binding constraint. Otherwise the window would
+/// silently cap the short bands while the tuner believed the budget was doing
+/// the limiting.
+pub fn window_for_budget(budget: usize, batch_size: usize) -> usize {
+    let shortest = crate::harness::batch::BUCKET_EDGES[0].max(1);
+    (budget / shortest).max(1).max(batch_size)
+}
 
 /// Same budget for eval decode chunks (B×T per fused forward). Eval prompts
 /// bucket to 512 while training bands sit near 64, so a fixed row count that
@@ -628,11 +672,21 @@ impl<B: AutodiffBackend> Trainer<B> {
             .map(|(inst, gbytes)| {
                 let text = String::from_utf8_lossy(gbytes);
                 let expected = String::from_utf8_lossy(&inst.target);
+                // Counted over `chars`, not bytes: targets are single-token
+                // symbols, so UTF-8 byte positions do not line up with the
+                // units the model emits.
+                let byte_hits = text
+                    .chars()
+                    .zip(expected.chars())
+                    .filter(|(a, b)| a == b)
+                    .count();
                 MetricRecord {
                     task: inst.info.task.to_string(),
                     track: inst.info.track,
                     k: inst.info.k,
                     correct: text == expected,
+                    byte_hits,
+                    byte_total: expected.chars().count(),
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
@@ -869,6 +923,236 @@ fn vram_mb() -> Option<u64> {
     lines.next()?.split_whitespace().next()?.parse().ok()
 }
 
+/// Total device memory in MB, for the tuner's budget.
+fn vram_total_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    lines.next()?;
+    lines.next()?.split_whitespace().next()?.parse().ok()
+}
+
+/// Grow the micro-batch to fill the GPU, holding the EFFECTIVE batch fixed.
+///
+/// The returned `accum_steps` compensates for the growth
+/// (`effective = micro * accum`), because the effective batch is what sets
+/// gradient noise. Varying it would make the batch a second confound on top of
+/// whatever axis a sweep is varying.
+///
+/// Returns `None` when tuning is inapplicable (no CUDA, `auto_batch` off, or
+/// no readable memory), in which case the caller keeps the manifest values.
+///
+/// # Why this cannot OOM the process
+///
+/// Every candidate is *measured* by actually running steps at it, and growth
+/// is authorized by extrapolating from a size that already completed. A CUDA
+/// OOM aborts rather than unwinding, so the limit can never be discovered by
+/// hitting it — see [`crate::harness::batch_tuner`] for the reasoning.
+fn auto_tune_batch<B: AutodiffBackend>(
+    trainer: &mut Trainer<B>,
+    run: &crate::harness::RunConfig,
+    train_pool: &[Instance],
+    device: &B::Device,
+) -> Option<(usize, usize, usize)> {
+    use crate::harness::batch_tuner::{Measurement, next_candidate, predicts_fit};
+    if !run.train.auto_batch {
+        return None;
+    }
+    // Gated on the instantiated backend rather than a `cfg` feature test: a build
+    // can have both features compiled in and still run on the CPU backend, so
+    // the gate has to be on what is actually being used.
+    //
+    // Only meaningful against a real memory budget. On ndarray there is no VRAM
+    // to fill: `vram_mb` reports whatever the display is doing (a flat ~12MB),
+    // and an unguarded tuner reads that flat line as unlimited headroom and
+    // grows to the ceiling for free. Skip it rather than emit a batch number
+    // that means nothing.
+    if !std::any::type_name::<B>().contains("Cuda") {
+        println!(
+            "auto-batch: skipped, no device memory to fill on {}",
+            std::any::type_name::<B>()
+        );
+        return None;
+    }
+    let total = vram_total_mb()?;
+    let target_effective = run.train.batch_size.max(1) * run.train.accum_steps.max(1);
+    // The ladder's axis is the B×T budget, NOT the sampling window.
+    //
+    // `batch_size` alone cannot use more VRAM: the trim already caps rows per
+    // band, so a window of 512 at the default budget still delivers at most
+    // `MICRO_BT_BUDGET / T` rows to the GPU. Growing the window past that point
+    // measured as a flat memory line — the signature of a knob that has
+    // stopped being connected to the thing it claims to control.
+    let mut bt = MICRO_BT_BUDGET;
+    // The ceiling is the B×T product, so a manifest can bound memory directly:
+    // the top band (T=512) then admits `max_bt / 512` rows.
+    let ceiling = run.train.auto_batch_max.max(bt);
+
+    // Baseline before any activation exists: weights + optimizer state +
+    // context. Subtracting it is what makes the extrapolation a statement
+    // about activations rather than about a constant.
+    let baseline = vram_mb().unwrap_or(0);
+
+    println!(
+        "auto-batch: tuning the B×T budget from {bt} (window {target_effective}), \
+         {total}MB total, baseline {baseline}MB, ceiling {ceiling}"
+    );
+
+    // A non-monotonic reading means the previous measurement was not a
+    // reliable peak, and every prediction extrapolated from it is wrong.
+    //
+    // This is not defensive padding: an allocator that keeps pages between
+    // probes makes "memory fell when the budget doubled" routine, and without
+    // this the ladder takes the lower reading as its slope and can authorize a
+    // budget larger than any actually measured.
+    // `last` is the most recent trustworthy measurement, and is the ONLY source
+    // of the slope every prediction below is computed from.
+    let mut last: Option<Measurement> = None;
+    loop {
+        // Measure by doing real work: the probe runs the same forward and
+        // backward a training step would, at a window sized so the budget is
+        // the only binding constraint. Nothing here is simulated, so a budget
+        // that survives the probe will survive the step.
+        let window = window_for_budget(bt, run.train.batch_size);
+        let peak = measure_batch_peak::<B>(trainer, train_pool, window, bt, device);
+        let m = Measurement {
+            batch: bt,
+            peak_mb: peak.saturating_sub(baseline),
+        };
+        println!(
+            "  probe B×T {bt} (window {window}): +{}MB over baseline ({}MB used)",
+            m.peak_mb, peak
+        );
+        // A non-monotonic reading means the previous measurement was not a
+        // reliable peak, and every prediction extrapolated from it is wrong.
+        if let Some(prev) = last.filter(|p| m.peak_mb < p.peak_mb) {
+            println!(
+                "  memory fell as the budget grew ({}MB -> {}MB): the allocator \
+                 is not returning pages between probes, so peaks are not \
+                 comparable and no further growth is predictable. \
+                 Keeping the largest measured, B×T {}",
+                prev.peak_mb, m.peak_mb, prev.batch
+            );
+            break;
+        }
+        // A measurement that never moved means nothing is constraining growth.
+        //
+        // The 0MB case is a probe that cannot see this process at all (a CPU
+        // backend reads the display's flat figure). Extrapolating it gives
+        // slope 0, so every candidate predicts as fitting and the ladder runs
+        // to the ceiling on imagination alone. A flat reading ABOVE zero is
+        // the allocator holding its high-water mark, which is equally
+        // uninformative about what a bigger budget would cost.
+        if last.is_some_and(|p| p.peak_mb == m.peak_mb) {
+            if m.peak_mb == 0 {
+                println!(
+                    "  memory reads 0MB at every size — the probe cannot see \
+                     this process's allocations, so no prediction is \
+                     meaningful; stopping at B×T {bt}"
+                );
+            } else {
+                println!(
+                    "  memory flat at +{}MB as the budget grew: the allocator \
+                     is holding a high-water mark, so this reading says \
+                     nothing about what a bigger budget would cost. \
+                     Stopping at B×T {bt} rather than guessing",
+                    m.peak_mb
+                );
+            }
+            break;
+        }
+        last = Some(m);
+        let budget = crate::harness::batch_tuner::Budget::new(
+            total,
+            run.train.auto_batch_headroom,
+            baseline,
+        );
+        match next_candidate(bt, ceiling) {
+            // Refusal is monotone in candidate size (pinned by a test), so
+            // stopping at the first refusal cannot skip a size that fits.
+            Some(cand) if predicts_fit(&m, cand, &budget) => bt = cand,
+            Some(cand) => {
+                println!("  B×T {cand} predicted to exceed budget; stopping at {bt}");
+                break;
+            }
+            None => break,
+        }
+    }
+    // The largest budget actually MEASURED, which is the last one when the
+    // ladder grew cleanly. A non-monotonic reading broke out with `last` still
+    // holding the trustworthy one, and claiming the rejected budget here would
+    // select a size whose memory was never observed.
+    let chosen_bt = last.map(|m| m.batch).unwrap_or(bt);
+    // The window is sized from the budget, and the micro-batch at the shortest
+    // band is what the effective batch is computed from.
+    let window = window_for_budget(chosen_bt, run.train.batch_size);
+    let micro_at_shortest = (chosen_bt / crate::harness::batch::BUCKET_EDGES[0].max(1)).max(1);
+    let accum = crate::harness::batch_tuner::accum_for(micro_at_shortest, target_effective);
+    let realized = micro_at_shortest * accum;
+    println!(
+        "auto-batch: selected B×T {chosen_bt} -> window {window}, \
+         short-band micro {micro_at_shortest} x {accum} = effective {realized} \
+         (target {target_effective})"
+    );
+    if realized != target_effective {
+        // Rounding up means the realized effective batch can exceed the target.
+        // Say so rather than let it read as an exact match.
+        println!(
+            "  note: effective batch is {realized}, above the requested {target_effective} \
+             (the tuner cannot subdivide a micro-batch)"
+        );
+    }
+    Some((chosen_bt, window, accum))
+}
+
+/// High-water mark of device memory while running a few real steps at `batch`.
+///
+/// Polls around each step rather than only at the end: an allocation that
+/// spikes during forward and is freed by the time the step returns would be
+/// invisible to an end-only measurement, and that spike is exactly what
+/// decides whether the next size fits.
+fn measure_batch_peak<B: AutodiffBackend>(
+    trainer: &mut Trainer<B>,
+    train_pool: &[Instance],
+    window: usize,
+    bt_budget: usize,
+    device: &B::Device,
+) -> u64 {
+    const PROBE_STEPS: usize = 3;
+    let mut peak = vram_mb().unwrap_or(0);
+    let mut rng = HarnessRng::new(0xA070_5EED_5EED_5EED ^ bt_budget as u64);
+    for _ in 0..PROBE_STEPS {
+        let sampled = Trainer::<B>::sample_banded_batch(&mut rng, train_pool, window);
+        if sampled.is_empty() {
+            break;
+        }
+        let t_raw = sampled
+            .iter()
+            .map(|i| i.prompt.len() + i.target.len() + 1)
+            .max()
+            .unwrap_or(1);
+        let t_pad = crate::harness::bucket_len(t_raw);
+        let micro = &sampled[..(bt_budget / t_pad).clamp(1, sampled.len())];
+        let micro = &micro[..top_bucket_rows(t_pad, micro.len())];
+        let (_info, grads) = trainer.forward_backward(micro, 1.0, 0);
+        // The tape is held by `grads`, so the peak exists while it is alive.
+        peak = peak.max(vram_mb().unwrap_or(0));
+        // Release without stepping: the optimizer must not move, or the probe
+        // would train the model and the run would start from a different point
+        // than an untuned run.
+        drop(grads);
+        B::memory_cleanup(device);
+        peak = peak.max(vram_mb().unwrap_or(0));
+    }
+    peak
+}
+
 /// Run one manifest end to end: pool -> train loop -> evals -> checkpoints.
 /// Shared by single-manifest runs and curriculum stages. `init_from` chains
 /// onto a previous stage's checkpoint (optimizer states restart fresh).
@@ -982,6 +1266,24 @@ pub fn run_stage<B: AutodiffBackend>(
     let mut trainer = Trainer::<B>::new(
         &run.model, &run.optim, run.stop, &run.train, device, init_from,
     );
+    // Auto-batch runs before the loop, on the real trainer, so a tuned run and
+    // an untuned one differ only in the batch — which the accum compensation
+    // then holds constant in effective terms.
+    let tuned = auto_tune_batch::<B>(&mut trainer, run, &train_pool, device);
+    // Resolved once, before the loop, and logged: the B×T budget is a function
+    // of the card it ran on, so a run whose realized budget is not recorded is
+    // not reproducible. Un-tuned runs keep the shipped constant.
+    let (bt_budget, batch_size, accum_steps) = tuned.unwrap_or((
+        MICRO_BT_BUDGET,
+        run.train.batch_size,
+        run.train.accum_steps.max(1),
+    ));
+    if tuned.is_some() {
+        println!(
+            "auto-batch: training with B×T {bt_budget}, window {batch_size}, \
+             {accum_steps} micro-batches per step"
+        );
+    }
     let mut rng = HarnessRng::new(run.train.seed ^ 0x9E37_79B9_7F4A_7C15);
     let watchdog = crate::fail_fast::Watchdog::spawn(run.train.stuck_timeout_secs);
     // Ponder warmup base: ramped per step via the setter below.
@@ -1002,7 +1304,7 @@ pub fn run_stage<B: AutodiffBackend>(
         trainer.set_ponder_weight(ponder_warmup_weight(base_ponder, step, warmup_steps));
         // Gradient accumulation: `accum` micro-batches of 1/accum-scaled
         // losses merge into one mean-equivalent grad for a single step.
-        let accum = run.train.accum_steps.max(1);
+        let accum = accum_steps;
         let scale = 1.0 / accum as f64;
         let specs = trainer.model.grad_specs();
         let mut acc_grads = None;
@@ -1010,8 +1312,7 @@ pub fn run_stage<B: AutodiffBackend>(
         let (mut ans_sum, mut eos_sum) = (0.0f32, 0.0f32);
         let mut steps_sum = 0usize;
         for _ in 0..accum {
-            let window =
-                Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, run.train.batch_size);
+            let window = Trainer::<B>::sample_banded_batch(&mut rng, &train_pool, batch_size);
             // B×T budget: trim the banded window (drop longest rows, they sit
             // at the window's end) so padded T never inflates the tape.
             let t_raw = window
@@ -1020,7 +1321,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 .max()
                 .unwrap_or(1);
             let t_pad = crate::harness::bucket_len(t_raw);
-            let micro = &window[..(MICRO_BT_BUDGET / t_pad).clamp(1, window.len())];
+            let micro = &window[..(bt_budget / t_pad).clamp(1, window.len())];
             let micro = &micro[..top_bucket_rows(t_pad, micro.len())];
             let fk = trainer.free_k;
             let (info, grads) = trainer.forward_backward(micro, scale, fk);
@@ -1130,8 +1431,9 @@ pub fn run_stage<B: AutodiffBackend>(
                         None => "vram n/a".to_string(),
                     };
                     println!(
-                        "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] (n={}) {vram}",
+                        "  eval [{label}] {task}/{track}: acc {:.2} byte {:.3} copy {:.2} halt {:.2} bh [{}] (n={}) {vram}",
                         s.accuracy,
+                        s.byte_accuracy,
                         s.copy_rate,
                         s.mean_halt,
                         fmt2(&s.mean_block_halt),
@@ -1160,8 +1462,8 @@ pub fn run_stage<B: AutodiffBackend>(
     // the trained gap in excess of that control floor is evidence of learned
     // role specialization — see `harness::shuffle_control`.
     let n_stages = trainer.model.stages.len();
-    let mut trained_order: Option<f64> = None;
-    let mut trained_shuffled: Option<f64> = None;
+    let mut trained_order: Option<(f64, f64)> = None;
+    let mut trained_shuffled: Option<(f64, f64)> = None;
     for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval, "trained") {
         let records = trainer.evaluate_watched(
             &final_set,
@@ -1187,8 +1489,9 @@ pub fn run_stage<B: AutodiffBackend>(
                 .flat_map(|row| row.iter().map(|v| format!("{v:.2}")))
                 .collect();
             println!(
-                "  eval [{label}] {task}/{track}: acc {:.2} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] sh [{}] cor [{}] (n={})",
+                "  eval [{label}] {task}/{track}: acc {:.2} byte {:.3} copy {:.2} halt {:.2} bh [{}] bhC [{}] bhW [{}] p90 [{}] sh [{}] cor [{}] (n={})",
                 s.accuracy,
+                s.byte_accuracy,
                 s.copy_rate,
                 s.mean_halt,
                 fmt2(&s.mean_block_halt),
@@ -1211,6 +1514,7 @@ pub fn run_stage<B: AutodiffBackend>(
         // it is captured rather than only printed.
         let pool_acc = {
             let s = summarize(&records);
+            let pool_byte_acc = s.byte_accuracy;
             let cor: Vec<String> = s
                 .block_halt_corr
                 .iter()
@@ -1229,8 +1533,9 @@ pub fn run_stage<B: AutodiffBackend>(
                 ),
             };
             println!(
-                "  eval [{label}-pool]: acc {:.2} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
                 s.accuracy,
+                s.byte_accuracy,
                 s.copy_rate,
                 s.mean_halt,
                 fmt2(&s.mean_block_halt),
@@ -1258,7 +1563,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 .expect("label serializes"),
                 ev.reading().is_some_and(|r| r.supports_roles()),
             ));
-            s.accuracy
+            (s.accuracy, pool_byte_acc)
         };
         if order.is_none() {
             trained_order = Some(pool_acc);
@@ -1279,22 +1584,30 @@ pub fn run_stage<B: AutodiffBackend>(
             watchdog.ping_step(run.train.steps)
         });
         let ind = crate::harness::summarize(&records);
-        let held_acc = trained_order.unwrap_or(0.0);
+        let (held_acc, held_byte) = trained_order.unwrap_or((0.0, 0.0));
         let gap = held_acc - ind.accuracy;
+        let byte_gap = held_byte - ind.byte_accuracy;
         println!(
-            "  memorization: train-pool acc {:.3} | held-out acc {:.3} | gap {:+.3} (n_train={} n_held={})",
+            "  memorization: train-pool acc {:.3} byte {:.3} | held-out acc {:.3} byte {:.3} | gap {:+.3} / {:+.3} (n_train={} n_held={})",
             ind.accuracy,
+            ind.byte_accuracy,
             held_acc,
+            held_byte,
             gap,
+            byte_gap,
             ind.n,
             final_set.len()
         );
         log.push_str(&format!(
             "{{\"eval\":\"memorization\",\"indist_accuracy\":{:.6},\"heldout_accuracy\":{:.6},\
-             \"gap\":{:.6},\"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
+             \"gap\":{:.6},\"indist_byte_accuracy\":{:.6},\"heldout_byte_accuracy\":{:.6},\
+             \"byte_gap\":{:.6},\"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
             ind.accuracy,
             held_acc,
             gap,
+            ind.byte_accuracy,
+            held_byte,
+            byte_gap,
             ind.n,
             final_set.len(),
             run.train.seed
@@ -1302,7 +1615,7 @@ pub fn run_stage<B: AutodiffBackend>(
     }
 
     // The role diagnostic, read against its floor.
-    if let (Some(t), Some(ts)) = (trained_order, trained_shuffled) {
+    if let (Some((t, _)), Some((ts, _))) = (trained_order, trained_shuffled) {
         let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log, &|| {
             watchdog.ping_step(run.train.steps);
         });

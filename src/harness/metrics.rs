@@ -13,6 +13,17 @@ pub struct Record {
     pub track: Track,
     pub k: usize,
     pub correct: bool,
+    /// Matching byte count between decoded output and target, and the target
+    /// length, so [`Summary::byte_accuracy`] can be aggregated.
+    ///
+    /// Exact-match is a conjunction over every byte, so on a 20-byte target
+    /// it reports 0.000 identically for "19 of 20 right" and "nothing right".
+    /// At the scale these experiments run, the model sits firmly in the
+    /// former state: a measured exact-match of 0.000 says the strict metric
+    /// is floored, not that nothing was learned. Byte accuracy resolves the
+    /// region exact-match cannot see.
+    pub byte_hits: usize,
+    pub byte_total: usize,
     /// Model output appeared verbatim among demo outputs.
     pub copied: bool,
     pub steps_used: usize,
@@ -35,10 +46,12 @@ impl Record {
         };
         let bh: Vec<String> = self.block_halt.iter().map(|v| format!("{v:.3}")).collect();
         format!(
-            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
+            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"byte_hits\":{},\"byte_total\":{},\"copied\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
             self.task,
             self.k,
             self.correct,
+            self.byte_hits,
+            self.byte_total,
             self.copied,
             self.steps_used,
             self.mean_halt,
@@ -52,6 +65,12 @@ impl Record {
 pub struct Summary {
     pub n: usize,
     pub accuracy: f64,
+    /// Micro-averaged over all target bytes: `sum(hits) / sum(total)`.
+    ///
+    /// Micro rather than per-instance mean because instance lengths vary, and
+    /// the long targets are exactly the ones exact-match grades as all-or-
+    /// nothing.
+    pub byte_accuracy: f64,
     pub copy_rate: f64,
     pub mean_steps: f64,
     pub mean_halt: f64,
@@ -216,6 +235,15 @@ pub fn summarize(records: &[Record]) -> Summary {
     Summary {
         n: records.len(),
         accuracy: records.iter().filter(|r| r.correct).count() as f64 / n,
+        byte_accuracy: {
+            let hits: usize = records.iter().map(|r| r.byte_hits).sum();
+            let total: usize = records.iter().map(|r| r.byte_total).sum();
+            if total == 0 {
+                0.0
+            } else {
+                hits as f64 / total as f64
+            }
+        },
         copy_rate: records.iter().filter(|r| r.copied).count() as f64 / n,
         mean_steps: records.iter().map(|r| r.steps_used as f64).sum::<f64>() / n,
         mean_halt: records.iter().map(|r| r.mean_halt as f64).sum::<f64>() / n,
@@ -280,12 +308,66 @@ mod tests {
             track: Track::B,
             k: 2,
             correct,
+            byte_hits: usize::from(correct),
+            byte_total: 1,
             copied,
             steps_used: 6,
             mean_halt: 4.5,
             block_halt: vec![1.0, 1.5, 1.0, 1.0],
             seed: 0,
         }
+    }
+
+    /// Byte accuracy is micro-averaged over bytes, and the two averaging
+    /// schemes differ enough to matter: a per-instance mean would let one
+    /// short, mostly-correct target outweigh a long, mostly-wrong one. This
+    /// pins the choice, because exact-match is floored wherever byte accuracy
+    /// is imperfect, so byte accuracy is what the sweeps actually read.
+    #[test]
+    fn byte_accuracy_is_micro_averaged_over_bytes() {
+        let mut short = rec(false, false);
+        short.byte_hits = 9;
+        short.byte_total = 10; // 0.90 on a short target
+        let mut long = rec(false, false);
+        long.byte_hits = 2;
+        long.byte_total = 100; // 0.02 on a long target
+        let s = summarize(&[short, long]);
+        // Micro: 11 hits / 110 bytes.
+        assert!(
+            (s.byte_accuracy - 0.1).abs() < 1e-9,
+            "got {}",
+            s.byte_accuracy
+        );
+        // A per-instance mean would have given (0.90 + 0.02) / 2 = 0.46, which
+        // is a 4.6x overstatement and would invert any gap computed from it.
+    }
+
+    /// The whole reason byte accuracy exists: exact-match is blind to "mostly
+    /// right", so a run can be simultaneously 0% exact and high byte accuracy.
+    /// If this stops holding, the softer metric has stopped adding information.
+    #[test]
+    fn byte_accuracy_sees_what_exact_match_cannot() {
+        let mut r = rec(false, false); // one instance, not exactly correct
+        r.byte_hits = 19;
+        r.byte_total = 20;
+        let s = summarize(&[r]);
+        assert_eq!(s.accuracy, 0.0, "exact-match is 0 as intended");
+        assert!(
+            s.byte_accuracy > 0.9,
+            "byte accuracy must still read 0.95, got {}",
+            s.byte_accuracy
+        );
+    }
+
+    /// Zero-length targets must not divide by zero.
+    #[test]
+    fn byte_accuracy_is_zero_when_there_are_no_bytes() {
+        let mut r = rec(false, false);
+        r.byte_hits = 0;
+        r.byte_total = 0;
+        assert_eq!(summarize(&[r]).byte_accuracy, 0.0);
+        // And the empty-set path stays total.
+        assert_eq!(summarize(&[]).byte_accuracy, 0.0);
     }
 
     #[test]

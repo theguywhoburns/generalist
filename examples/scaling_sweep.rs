@@ -45,6 +45,10 @@ fn main() {
         .map(|s| s.as_str())
         .expect("axis is required: data | depth | params");
     let gpu = args.iter().any(|a| a == "gpu");
+    // Off by default: the tuner changes the effective batch (it cannot
+    // subdivide below the micro-batch), which is a confound on a sweep whose
+    // point is a single controlled comparison. Opt in explicitly.
+    let auto_batch = args.iter().any(|a| a == "--auto-batch");
 
     let values: Vec<f64> = args
         .iter()
@@ -67,7 +71,11 @@ fn main() {
     let base =
         load_run(std::path::Path::new(path)).unwrap_or_else(|e| panic!("load base manifest:\n{e}"));
     println!("base: {}", base.summary());
-    println!("axis: {axis}  values: {values:?}  seeds: {seeds:?}\n");
+    println!("axis: {axis}  values: {values:?}  seeds: {seeds:?}");
+    if auto_batch {
+        println!("auto-batch: ON (the effective batch may exceed the manifest's)");
+    }
+    println!();
 
     let mut rows: Vec<SweepRow> = Vec::new();
 
@@ -75,11 +83,19 @@ fn main() {
         #[cfg(feature = "cuda")]
         {
             use burn::backend::{Autodiff, Cuda, cuda::CudaDevice};
+            // Tuned runs resolve their own batch; the `apply` knobs below only
+            // set the axis value.
             let device = CudaDevice::default();
             println!("backend: CUDA (fused)");
             for v in &values {
                 for seed in &seeds {
-                    let cfg = apply(&base, axis, *v, *seed);
+                    // Tuned per point: the batch is a function of the card, and a sweep
+                    // re-measuring it every run is the only way the rows stay
+                    // comparable when the tuner picks different sizes.
+                    let mut cfg = apply(&base, axis, *v, *seed);
+                    if auto_batch {
+                        cfg.train.auto_batch = true;
+                    }
                     if let Some(r) = one(&cfg, axis, *v, *seed, |r| {
                         run_stage::<Autodiff<Cuda>>(&r, &device, None, &[])
                     }) {
@@ -173,7 +189,9 @@ struct SweepRow {
     seed: u64,
     indist: f64,
     heldout: f64,
-    gap: f64,
+    indist_byte: f64,
+    heldout_byte: f64,
+    byte_gap: f64,
     halt: f64,
     roles: String,
 }
@@ -188,23 +206,39 @@ where
     let text = std::fs::read_to_string(&log_path).ok()?;
     let row = parse(&text, v, seed)?;
     println!(
-        "--> {axis}={v:.0} seed={seed}: indist {:.3} heldout {:.3} gap {:+.3} halt {:.1} roles {}\n",
-        row.indist, row.heldout, row.gap, row.halt, row.roles
+        "--> {axis}={v:.0} seed={seed}: byte in {:.3} out {:.3} gap {:+.3} | exact in {:.3} out {:.3} | halt {:.1} roles {}\n",
+        row.indist_byte,
+        row.heldout_byte,
+        row.byte_gap,
+        row.indist,
+        row.heldout,
+        row.halt,
+        row.roles
     );
     Some(row)
 }
 
-/// Read the three numbers the sweep is about out of one run's log.
+/// Read the numbers the sweep is about out of one run's log.
+///
+/// Byte accuracy is read alongside exact-match because exact-match is floored
+/// at 0.000 across entire depth points while training CE sits near 0.45 — the
+/// model is getting most bytes right and still failing the conjunction. A
+/// sweep that reports only the strict metric concludes "depth does nothing"
+/// when the truth is "the strict metric cannot see this".
 fn parse(text: &str, value: f64, seed: u64) -> Option<SweepRow> {
     let mut indist = None;
-    let mut gap = None;
     let mut heldout = None;
+    let mut indist_byte = None;
+    let mut heldout_byte = None;
+    let mut byte_gap = None;
     let mut roles = String::new();
     for line in text.lines() {
         if line.contains("\"eval\":\"memorization\"") {
             indist = jget(line, "indist_accuracy");
             heldout = jget(line, "heldout_accuracy");
-            gap = jget(line, "gap");
+            indist_byte = jget(line, "indist_byte_accuracy");
+            heldout_byte = jget(line, "heldout_byte_accuracy");
+            byte_gap = jget(line, "byte_gap");
         }
         if line.contains("-roles\"") && line.contains("final-trained") {
             roles = line
@@ -221,7 +255,9 @@ fn parse(text: &str, value: f64, seed: u64) -> Option<SweepRow> {
         seed,
         indist: indist?,
         heldout: heldout?,
-        gap: gap?,
+        indist_byte: indist_byte?,
+        heldout_byte: heldout_byte?,
+        byte_gap: byte_gap?,
         halt: mean_halt(text),
         roles,
     })
@@ -259,8 +295,11 @@ fn report(rows: &[SweepRow], axis: &str) {
     }
     println!("\n=== {axis} sweep: generalization vs memorization ===");
     println!(
-        "{:>10} {:>3} {:>9} {:>9} {:>8} {:>7}  roles",
-        "value", "n", "indist", "heldout", "gap", "halt"
+        "byte accuracy is the load-bearing column; exact-match is floored wherever byte accuracy is high but < 1."
+    );
+    println!(
+        "{:>10} {:>3} {:>9} {:>9} {:>8} | {:>8} {:>8} {:>7}  roles",
+        "value", "n", "byte-in", "byte-out", "byte-gap", "ex-in", "ex-out", "halt"
     );
     let mut vals: Vec<f64> = rows.iter().map(|r| r.value).collect();
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -270,11 +309,13 @@ fn report(rows: &[SweepRow], axis: &str) {
         let avg = |f: fn(&SweepRow) -> f64| g.iter().map(|r| f(r)).sum::<f64>() / g.len() as f64;
         let roles = g[0].roles.clone();
         println!(
-            "{v:>10.0} {:>3} {:>9.3} {:>9.3} {:>+8.3} {:>7.1}  {roles}",
+            "{v:>10.0} {:>3} {:>9.3} {:>9.3} {:>+8.3} | {:>8.3} {:>8.3} {:>7.1}  {roles}",
             g.len(),
+            avg(|r| r.indist_byte),
+            avg(|r| r.heldout_byte),
+            avg(|r| r.byte_gap),
             avg(|r| r.indist),
             avg(|r| r.heldout),
-            avg(|r| r.gap),
             avg(|r| r.halt),
         );
     }
@@ -290,23 +331,37 @@ fn report(rows: &[SweepRow], axis: &str) {
         println!("\nper-seed:");
         for r in rows {
             println!(
-                "  {axis}={:.0} seed {}: indist {:.3} heldout {:.3} gap {:+.3} halt {:.1}",
-                r.value, r.seed, r.indist, r.heldout, r.gap, r.halt
+                "  {axis}={:.0} seed {}: byte in {:.3} out {:.3} gap {:+.3} | ex in {:.3} out {:.3} | halt {:.1}",
+                r.value,
+                r.seed,
+                r.indist_byte,
+                r.heldout_byte,
+                r.byte_gap,
+                r.indist,
+                r.heldout,
+                r.halt
             );
         }
     }
-    // The onset claim, stated only if the data supports one.
-    let first = rows.first().map(|r| r.gap).unwrap_or(0.0);
-    let last = rows.last().map(|r| r.gap).unwrap_or(0.0);
+    // The onset claim, stated only if the data supports one. Read off the byte
+    // gap, and stated as a direction rather than a threshold, because with
+    // n=3 seeds no threshold is defensible.
+    let first = rows.first().map(|r| r.byte_gap).unwrap_or(0.0);
+    let last = rows.last().map(|r| r.byte_gap).unwrap_or(0.0);
     println!(
-        "\ngap moved {:+.3} -> {:+.3} across the axis. {}",
+        "\nbyte gap moved {:+.3} -> {:+.3} across the axis. {}",
         first,
         last,
-        if last - first > 0.10 {
-            "A gap that opens with this axis is consistent with memorization onset."
+        if last - first > 0.05 {
+            "Gap narrowing with the axis: more of the train-pool advantage \
+             transfers, consistent with the model moving out of the pure-memorization regime."
+        } else if first - last > 0.05 {
+            "Gap WIDENING with the axis: the train-pool advantage is growing, \
+             which is the signature of memorization onset along this axis."
         } else {
-            "A flat gap means this axis is not where memorization begins; \
-             the model is data-limited or capacity-limited instead."
+            "Flat byte gap: this axis is not where memorization begins. The \
+             model is limited by data or capacity at every point, so the \
+             question cannot be answered on this axis at these settings."
         }
     );
 }
