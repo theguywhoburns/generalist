@@ -360,20 +360,62 @@ fn report(rows: &[SweepRow], axis: &str) {
     // n=3 seeds no threshold is defensible.
     let first = rows.first().map(|r| r.byte_gap).unwrap_or(0.0);
     let last = rows.last().map(|r| r.byte_gap).unwrap_or(0.0);
+    // A gap is the wrong instrument when one side is pinned at a floor. It moved
+    // from -0.695 to -0.634 on the varying-rule rung, which the summary printed
+    // as "gap narrowing: more of the train-pool advantage transfers" -- while
+    // held-out byte accuracy sat at 0.25-0.34 against a chance rate of 0.333
+    // and never moved. Nothing transferred; the numerator drifted because
+    // in-distribution was near-ceiling and did not have far to fall.
+    //
+    // So the held-out curve is checked for flatness FIRST, and the gap reading
+    // is suppressed when the held-out side is not actually moving. Reporting a
+    // gap trend in isolation invites reading noise as a mechanism.
+    let out_first = rows.first().map(|r| r.heldout_byte).unwrap_or(0.0);
+    let out_last = rows.last().map(|r| r.heldout_byte).unwrap_or(0.0);
+    let out_moved = (out_last - out_first).abs();
+    let heldout_flat = out_moved < 0.05;
     println!(
-        "\nbyte gap moved {:+.3} -> {:+.3} across the axis. {}",
-        first,
-        last,
-        if last - first > 0.05 {
-            "Gap narrowing with the axis: more of the train-pool advantage \
-             transfers, consistent with the model moving out of the pure-memorization regime."
-        } else if first - last > 0.05 {
-            "Gap WIDENING with the axis: the train-pool advantage is growing, \
-             which is the signature of memorization onset along this axis."
-        } else {
-            "Flat byte gap: this axis is not where memorization begins. The \
-             model is limited by data or capacity at every point, so the \
-             question cannot be answered on this axis at these settings."
-        }
+        "\nheld-out byte accuracy moved {:.3} -> {:.3} across the axis ({}).",
+        out_first,
+        out_last,
+        if heldout_flat { "flat" } else { "moved" }
     );
+    if heldout_flat {
+        println!(
+            "  The held-out side did not move, so the gap trend ({:+.3} -> {:+.3}) \
+             is not evidence of transfer: with one side pinned near a floor and \
+             the other near a ceiling the gap has almost no room to move, and \
+             its drift is noise. Read the held-out column on its own -- flat \
+             means more data bought nothing here.",
+            first, last
+        );
+        if out_last < 0.40 {
+            println!(
+                "  Held-out byte accuracy of {:.3} is at or below the ~0.333 chance \
+                 rate for a 3-symbol alphabet, so this is chance-level transfer at \
+                 every point on the axis.",
+                out_last
+            );
+        }
+    } else if last - first > 0.05 {
+        println!(
+            "  Gap narrowing with the axis ({:+.3} -> {:+.3}) alongside a rising \
+             held-out curve: more of the train-pool advantage transfers, \
+             consistent with the model moving out of the pure-memorization regime.",
+            first, last
+        );
+    } else if first - last > 0.05 {
+        println!(
+            "  Gap WIDENING with the axis ({:+.3} -> {:+.3}) while held-out accuracy \
+             also rose: the train-pool advantage is growing faster than transfer, \
+             which is the signature of memorization onset along this axis.",
+            first, last
+        );
+    } else {
+        println!(
+            "  Held-out accuracy moved but the gap did not track it: the two \
+             halves are changing together, so this axis separates memorization \
+             from transfer at none of its points."
+        );
+    }
 }
