@@ -85,7 +85,10 @@ classic single-gate ACT.
 - The scaling runs in "Current results" use a deliberately smaller model —
   `d_model` 128, `n_stages` 2, `max_loops` 4, **492,418 parameters** — so that
   600 steps is enough to fit anything at all on a 4 GB laptop. It is the
-  smallest point on the size axis, which is not yet swept.
+  smallest point on the size axis, which is not yet swept. The order-augmented
+  arm uses `d_model` 128 at the full `n_stages` 4, **919,172 parameters**, on
+  the full 6-task suite; at 576 held-out instances per eval pass that eval set
+  is an order of magnitude larger than the ~29 used by the two scaling axes.
 - Halt gates deep-start at `halt_bias_init = -3.0` (~4.7% halt probability),
   so training begins near max depth and ponder pressure shortens it — the
   shallow-halt trap is the failure mode this avoids.
@@ -160,6 +163,12 @@ sequentially, so reversal reverses the data flow, and the same collapse
 appears for random weights. A collapse on its own is *necessary* for role
 specialization but nowhere near sufficient.
 
+It also has a hidden premise: that the collapse is **learned**, not a fixed
+property of sequential stage execution. A model wired to run stages in order
+would collapse under reversal no matter what it learned, and the collapse would
+then carry nothing about roles. That premise is not an assumption any more —
+the order-augmented arm below has tested it, and the test came back positive.
+
 Three measurements carry the claim instead, weakest to strongest:
 
 1. **Profile evidence** (`src/harness/role_evidence.rs`) — needs no control
@@ -198,14 +207,32 @@ Three measurements carry the claim instead, weakest to strongest:
    comparable to the ordered run's: it solves a different,
    permutation-robust function.
 
-All three land in `run.jsonl` (`*-roles` and `shuffle-control` records) so a
-sweep can aggregate them without scraping stdout.
+   **This has now been run, and the answer is the second branch.** Order
+   augmentation cut the reversal collapse by 72% (0.179 → 0.049), so
+   order-dependence is learned, the premise holds, and the collapse is
+   readable as evidence about roles. `examples/arm_compare.rs` runs the two
+   arms; the table and its caveats are under "Order augmentation" in "Current
+   results". Note what the positive result does *not* fix: instrument 2 above
+   is still degenerate on this rung, so the collapse is now known to be learned
+   but is still not certified as exceeding a chance floor. Those are two
+   separate questions and only one of them has an answer.
+
+All three land in `run.jsonl` — the `*-roles` and `shuffle-control` records,
+and the pool-level `final-trained-pool` / `final-shuffled-pool` summaries the
+reversal collapse is computed from — so a sweep can aggregate them without
+scraping stdout.
 
 **Scope.** These three answer one question — *do the stages do different jobs* —
 and every one of them is about role specialization. They say nothing about
 whether an accuracy number is generalization, which is what the next section is
 for. A clean role reading on a model that memorizes is still a model that
 memorizes, so the two instruments are never substitutes for each other.
+
+Where the three stand: instrument 1 produced the first differentiated reading in
+this repo on the order-augmented arm (2 of 3 seeds), instrument 3 has returned
+its positive branch, and instrument 2 is still degenerate on every rung
+measured so far. The role claim therefore rests on instruments 1 and 3, and it
+rests on one cell.
 
 ## Measuring the gap
 
@@ -350,7 +377,9 @@ measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
   in `stop` plus the `ponder_weight` zeroing that fixed depth requires and
   the `ckpt_dir`; `stage0-converge.json` covers the convergence control.
 - the order axis: `stage0-orderaug.json` sets `stop.act.shuffle_train`, and
-  differs from `stage0-4block.json` in that key plus its `ckpt_dir`.
+  differs from `stage0-4block.json` in that key plus its `ckpt_dir`. Run, and
+  it is the one axis in the grid with a settled positive result; see "Order
+  augmentation" in "Current results".
 - the data axis, by `train.max_train_instances` (cap the pool after the
   holdout, eval set held fixed). `experiment.per_cell` also varies the pool but
   moves the eval set with it, so it is not a sweep axis.
@@ -363,16 +392,35 @@ measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
 run's `run.jsonl`, and reports mean halt and the profile reading at every point
 so a fixed-depth win stays distinguishable from a degenerate-halting artifact.
 
+`examples/arm_compare.rs` drives the order axis as a paired two-arm comparison
+(`<A.json> <B.json>`, N seeds), one seed per run, each run's checkpoint
+directory carrying both its arm and its seed so the arms cannot overwrite each
+other. It is log-driven rather than return-value-driven: each arm is run, and
+both halves of each run are then read back out of that arm's `run.jsonl`, so a
+derived number always has a source in a log and a rerun is what verifies it. It
+**refuses** to report a comparison whose arms differ by more than the
+intervention — model, experiment, optim, steps, LRs, batch, and every eval knob
+are compared field by field, the two `ckpt_dir`s excepted, and both arms are
+required to be ACT. That refusal is the point: without it, a config edit that
+moves two knobs produces a difference that gets attributed entirely to the one
+under test, which is worse than no result because it looks clean. Its report
+also prints the random-weight control's informativeness next to the collapse,
+so a collapse is never printed as role evidence where the control could not
+have measured a floor.
+
 **Not implemented:** the non-looped columns (param-matched and
 compute-matched), and any manifest knob for them.
 
 ## Current results
 
-Three measurements exist, plus a throughput note. All of them are on
-`subst-fst-fixed`, the weights-only rung, and all are reported here with the
-caveats that keep them honest rather than as findings. The LR sweep came first
-and is the weakest of the three; the two scaling axes are first passes, not
-curves.
+Four measurements exist, plus a throughput note. Three are on
+`subst-fst-fixed`, the weights-only rung; the fourth is the order-augmented
+comparison on the full 6-task suite, where 576 held-out instances replace the
+~29 the two scaling axes run on. All are reported here with the caveats that
+keep them honest rather than as findings. The LR sweep came first and is the
+weakest of them; the two scaling axes are first passes, not curves; the
+order-augmented arm is the one settled positive result here, and its caveats
+travel with it.
 
 ### Data axis: the memorization-onset curve
 
@@ -513,6 +561,76 @@ a checked-in artifact — re-running is how to verify it. `lr_sweep` reports
 for generalization here) and prints an explicit single-seed caveat, quoting
 the binomial SE at the observed n, when `--seeds` is omitted.
 
+### Order augmentation: order-dependence is learned, not structural
+
+The causal test from "Reading the stages", run on the premise the role
+diagnostic rests on. `configs/stage0-orderaug.json` against
+`configs/stage0-4block.json`, differing only in `stop.act.shuffle_train`:
+919,172-param model (`d_model` 128, `n_stages` 4), 500 steps, ACT, the full
+6-task suite at k ∈ {0,1,2,3,5,8}, 576 held-out instances per eval pass,
+3 seeds per arm, RTX 3050 4 GB. The collapse is exact-match accuracy in trained
+order minus the same in reversed order, over the same instances.
+
+| | ordered (A) | order-augmented (B) |
+|---|---|---|
+| reversal collapse (mean of 3 seeds) | 0.179 | 0.049 |
+| per-seed collapse | 0.210, 0.207, 0.120 | 0.073, 0.023, 0.052 |
+| held-out byte accuracy | 0.382, 0.380, 0.384 | 0.342, 0.379, 0.371 |
+| profile reading | "uniform" / "one global head (flat + correlated)" | "DIFFERENTIATED (skewed + independent)" in 2 of 3 seeds |
+| shuffled-order accuracy | 0.000 on all 3 seeds | 0.069, 0.096, 0.118 |
+
+Order augmentation cut the collapse by 72% (3.6× smaller), so **order-dependence
+is learned, not structural.** A model that collapses under reversal only
+because stages are wired in sequence would have collapsed just as hard with the
+order resampled during training; this one did not. So the trained-order
+collapse does carry information about learned roles, and the role diagnostic
+stands as an instrument.
+
+Two independent signals agree, and neither is the collapse. The profile reading
+needs no control at all, and it moves from uniform / one-global-head in the
+ordered arm to the first "DIFFERENTIATED" reading anywhere in this repo. And
+shuffled-order accuracy stops being exactly zero, so the reversed order is no
+longer fatal.
+
+**Held-out byte accuracy barely moves (0.382 → 0.364 mean), and it is not what
+the arms are compared on.** That is the expected price, not a failure: the
+order-augmented arm is solving a different, permutation-robust function, so its
+training loss was never comparable to the ordered arm's and its accuracy need
+not be either. The arms are compared on the collapse and the profile — **not**
+on accuracy or loss.
+
+**The random-weight control is still degenerate, on both arms.** It read 0.000
+in *both* orders on both arms, so `control_informative: false` and
+`roles_supported: null` on every run. The collapse sizes above are real and
+measured; what is unconfirmed is that they exceed a chance floor. The causal
+test therefore says "learned, not structural" while the shuffle control still
+declines to certify the collapse. Both statements are true, they are about
+different questions, and neither substitutes for the other.
+
+What this does not establish, stated plainly:
+
+- **n = 3, and the per-seed ranges overlap.** Arm A spans 0.120–0.210 and arm B
+  spans 0.023–0.073, so the 3.6× is a ratio of 3-seed means. The direction is
+  consistent across every seed; the effect size is not resolved better than
+  n=3, which is the same threshold described in limitation 5.
+- **One operating point.** One model size, one depth, one suite, one step
+  budget. "Order-dependence is learned" is a statement about this cell; it does
+  not generalize to the depth and size axes the queue is about to sweep.
+- **Not comparable to the tables above.** Both arms are measured on the same
+  576 held-out instances, so the within-table comparison holds, but the ~29-
+  instance splits used by the two scaling axes cannot be put in this table.
+- **Provenance, and what is left to check.** Arm A's numbers were recovered from
+  pre-existing logs through `arm_compare`'s per-instance fallback rather than
+  re-run, because pool accuracy is defined as the mean of the per-instance
+  `correct` flags and the tally reproduces it exactly. Only arm A's `run.jsonl`
+  files remain on disk; arm B's were not retained. As with every other table
+  here, nothing is a checked-in artifact — re-running is how to verify any of
+  it, and the command below is the whole check.
+
+```bash
+cargo run --release --example arm_compare -- configs/stage0-4block.json configs/stage0-orderaug.json gpu 0 1 2
+```
+
 ## Known limitations
 
 Listed with what would change the conclusion, strongest first.
@@ -560,15 +678,28 @@ Listed with what would change the conclusion, strongest first.
    The code now *refuses* to answer rather than answering wrongly: on that
    data `roles_supported` serializes as `null` with `control_informative:
    false`, and the human line says `roles UNKNOWN`. But an honest `UNKNOWN` is
-   not a measurement. See "Reading the stages" for the two instruments that
-   do work here — profile shape (no control needed) and order-augmented
-   training (causal) — and note that the order-augmented arm has been
-   **specified but not yet run**.
+   not a measurement.
+
+   **What the order-augmented arm resolved, and what it did not.** It has now
+   been run (`configs/stage0-orderaug.json`, 3 seeds, 919,172 params), and it
+   is positive: the reversal collapse fell from 0.179 to 0.049, so the
+   collapse is learned rather than structural and the "learned roles" framing
+   stands — the earlier possibility that it needed replacing is closed. The
+   other instrument here has not changed. The control read 0.000 on **both**
+   arms, so `control_informative: false` and `roles_supported: null` hold on
+   every run of this measurement too. The collapse is known to be real and
+   learned; it is still **not certified to exceed a chance floor**, and the two
+   facts do not substitute for each other. Closing that needs a rung where the
+   untrained model scores above chance — see item 1 under "Next experiments".
 5. **Single task, three seeds, and a smaller eval split than the LR sweep.**
    The scaling runs use ~29 held-out instances, so the binomial SE there is
    ~0.09 at p = 0.7 before seed variance, and the gap is a difference of two
    such numbers. No effect smaller than ~0.1 in byte accuracy is resolvable,
-   which is the same threshold at which the depth axis stops being legible.
+   which is the same threshold at which the depth axis stops being legible. The
+   order-augmented comparison is outside this limitation on two of the three
+   counts — full 6-task suite, 576 held-out instances per eval pass — but
+   **not** on the third: it is also 3 seeds, with overlapping per-seed ranges,
+   so its 3.6× is directional rather than resolved.
 6. **The non-looped columns of the comparison grid are not implemented.** Only
    the stop-mode axis (and, by editing the model block, the size axis) is
    reachable from manifests. Compute-matched non-looped baselines — the thing
@@ -586,32 +717,57 @@ and no point in the depth sweep where the held-out curve turns over.
 ## Next experiments
 
 Ordered by how much each would reduce uncertainty. Items marked *(partly done)*
-were started and the remainder is stated explicitly.
+were started and the remainder is stated explicitly; item 0 is closed and is
+kept here for the record, not as work.
 
-0. **Run the order-augmented arm** (`stage0-orderaug.json` vs
-   `stage0-4block.json`, 3 seeds each). Both instruments for reading the
-   stages now exist and neither has been used at scale: this is the cheapest
-   test of whether the 4-stage structure means anything, it costs two runs per
-   seed, and it is the one cell where a *negative* result is genuinely
-   informative — if an order-augmented model still collapses under reversal,
-   the sequential dependency is structural and the whole "learned roles"
-   framing needs replacing. Do this before any further depth work, because it
-   decides what a depth sweep would even be measuring.
+0. **Run the order-augmented arm** *(done — the premise held, nothing about
+   roles needs replacing)*. `stage0-orderaug.json` vs `stage0-4block.json`,
+   3 seeds each, 919,172 params. Both instruments for reading the stages are
+   now used and the arm returned the informative branch: order augmentation cut
+   the reversal collapse by 72% (0.179 → 0.049), so order-dependence is
+   **learned**, not structural. The "learned roles" framing stands, and the
+   possible outcome that would have retired it — an order-augmented model that
+   still collapses — did not occur.
+
+   **What it buys the queue.** It was run before any further depth work, so the
+   depth sweep is now known to be measuring learned order-dependence rather
+   than a structural artifact of sequential stage execution: a collapse recorded
+   at any depth is a fact about what the model learned at that depth, not a
+   property of the wiring. Item 2 no longer has to defend against "the depth
+   effect might be an order artifact". That was the reason this was sequenced
+   first, and it is discharged.
+
+   **What is still not discharged.** The random-weight control read 0.000 on
+   both arms, so `control_informative: false` and `roles_supported: null` stand
+   on every run, and the collapse is still uncertified against a chance floor.
+   That is what item 1 is for, and it is now the top open item. The closed test
+   itself does not need rerunning, but anything read off it inherits its n=3.
 1. **Extend the sweep to the k>0 and oracle rungs** (`stage0-oracle`,
    `stage0-4block`, `subst-fst`). This does two things at once: it moves the
    headline number onto a task where the rule is genuinely held out
    (limitation 1), and it puts the model on a rung where the random-weight
    control scores above chance, which is what makes the shuffle control
-   non-degenerate (limitation 4). Highest value per GPU-hour after item 0.
+   non-degenerate (limitation 4). With item 0 closed, this is the
+   highest-value item per GPU-hour.
 2. **Finish the depth axis** *(partly done: a first pass over `fixed
-   {1,2,4,8}` exists)*. Still open, in order of value: add **ACT** as a
-   compute-matched point, which is the comparison Goal question 2 actually
-   asks; add `loops: 16` (raising `max_loops` alongside it); and enough seeds
-   to resolve the 4-vs-8 difference the current n=3 pass cannot. Keep reporting
-   byte accuracy, the gap, and the per-stage profile at every point — the
-   existing pass reads "uniform" at every depth, so nothing there distinguishes
-   a real depth effect from a wider-capacity effect, and that ambiguity is the
-   confound the LR sweep above already demonstrated.
+   {1,2,4,8}` exists)*. **One of the two confounds is gone.** The worry that
+   depth was moving learned order-dependence rather than capacity — a depth
+   effect that is really a change in how order-bound the model is — has been
+   settled by item 0: order-dependence is learned, so a collapse measured at a
+   deeper point reflects what that model learned, not the stage wiring. What
+   remains of the original ambiguity is the other confound, which item 0 does
+   not touch: the existing pass reads "uniform" at every depth and trains on
+   one rung, so nothing there separates a depth effect from a
+   wider-capacity effect, and that is the degenerate-early-halting confound the
+   LR sweep above already demonstrated.
+
+   Still open, in order of value: add **ACT** as a compute-matched point, which
+   is the comparison Goal question 2 actually asks; add `loops: 16` (raising
+   `max_loops` alongside it); and enough seeds to resolve the 4-vs-8 difference
+   the current n=3 pass cannot. Keep reporting byte accuracy, the gap, and the
+   per-stage profile at every point — and now also the reversal collapse, whose
+   per-depth size is a measurement of learned order-dependence rather than of
+   the architecture.
 3. **Run the size axis** *(unmeasured; the tool supports it)*: param-matched
    models at several `d_model` (128 / 256 / 384 / 512, with `n_heads × head_dim`
    kept consistent and `vocab_size ≥ 256` for byte level), fixed depth, fixed
@@ -679,6 +835,9 @@ Natural language. Scale.
 - `examples/lr_sweep.rs` — two-axis (LR × seed) sweep over held-out accuracy
 - `examples/scaling_sweep.rs` — named-axis (`data` | `depth` | `params`) sweep
   reporting both accuracies and the gap, with `--auto-batch`
+- `examples/arm_compare.rs` — paired two-arm comparison (ordered vs
+  order-augmented) over seeds, log-driven, refusing any pair whose arms differ
+  by more than the intervention
 - `configs/` — run manifests + chains (JSON, no recompile to tweak)
 
 ## Optimizer
