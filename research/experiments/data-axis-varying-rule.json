@@ -22,7 +22,7 @@
   ],
   "extends": "base-492k.json",
   "train": {
-    "ckpt_dir": "$curdir/checkpoints-varying-rule",
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-varying-rule",
     "shuffle_eval": true
   },
   "experiment": {

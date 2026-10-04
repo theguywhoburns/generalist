@@ -7,5 +7,5 @@
   "extends": "stage0-base.json",
   "stop": { "kind": "converge" },
   "model": { "ponder_weight": 0.0 },
-  "train": { "ckpt_dir": "checkpoints-converge" }
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-converge" }
 }

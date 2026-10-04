@@ -34,7 +34,7 @@
     "indist_eval_per_cell": 12,
     "batch_size": 4,
     "auto_batch": true,
-    "ckpt_dir": "$curdir/checkpoints-arm-ordered"
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-ordered"
   },
   "experiment": { "per_cell": 200 }
 }

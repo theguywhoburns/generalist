@@ -6,7 +6,7 @@
     "k_set [0] makes this a weights-only test - demos carry no information."
   ],
   "extends": "stage0-base.json",
-  "train": { "ckpt_dir": "checkpoints-fixed" },
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-fixed" },
   "experiment": {
     "tasks": ["subst-fst-fixed"],
     "protocol": { "k_set": [0] }

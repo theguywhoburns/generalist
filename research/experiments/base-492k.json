@@ -41,7 +41,7 @@
     "batch_size": 4,
     "auto_batch": true,
     "auto_batch_max": 16384,
-    "ckpt_dir": "$curdir/checkpoints",
+    "ckpt_dir": "$repo_root/research/runs/checkpoints",
     "lr_muon": { "kind": "linear", "lr": 0.0002, "max_lr": 0.002, "warmup_steps": 100 },
     "lr_adamw": { "kind": "constant", "lr": 0.0003 },
     "eval_in_distribution": true,

@@ -11,6 +11,12 @@
     pkg-config
     zlib
     openssl
+    # For analysing run.jsonl. This is analysis tooling, not part of the crate:
+    # the library and every shipped tool stay pure Rust, because a number in
+    # research/findings.md should be reproducible by `cargo run` and not depend
+    # on a second language being present. Reach for it when a question needs
+    # reshaping a log and jq is not enough.
+    python3
   ] ++ lib.optionals pkgs.stdenv.isLinux (with pkgs; [
     cudaPackages.cudatoolkit
     cudaPackages.cudnn

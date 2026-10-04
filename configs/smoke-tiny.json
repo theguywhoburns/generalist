@@ -51,7 +51,7 @@
     "ckpt_every": 500,
     "eval_max_new": 8,
     "seed": 0,
-    "ckpt_dir": "checkpoints-smoke-tiny",
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-smoke-tiny",
     "eval_holdout": 0.25,
     "eval_in_distribution": true,
     "indist_eval_per_cell": 24,

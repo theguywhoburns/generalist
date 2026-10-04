@@ -30,6 +30,6 @@
     "exactly, so the ONLY difference between the two runs is the oracle header."
   ],
   "extends": "data-axis-varying-rule.json",
-  "train": { "ckpt_dir": "$curdir/checkpoints-oracle" },
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-oracle" },
   "experiment": { "tasks": ["subst-fst-oracle"] }
 }

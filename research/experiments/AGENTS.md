@@ -37,9 +37,9 @@ cells that are too small, too short, or otherwise unsuitable as defaults.
 4. **Note what is deliberately off** and why — `auto_batch: false` on the depth
    axis, `shuffle_eval: false` on the weights-only rung. A knob that looks
    misconfigured invites a well-meaning fix that breaks provenance.
-5. **Checkpoints go under `$curdir/checkpoints-*`,** never a bare relative
-   path, so a run from the repo root and a run from this directory land in the
-   same place.
+5. **Checkpoints go under `$repo_root/research/runs/checkpoints-*`.** Not
+   `$curdir` and not a bare relative path: the root must stay readable, and a
+   bare path resolves against wherever the runner was invoked.
 6. **Use `$` path variables, never absolute paths.** `$curdir`,
    `$parent_dir`, `$repo_root`, `$experiment_dir`, `$configs_dir`. An absolute
    path in a committed manifest breaks for everyone else; an unknown variable

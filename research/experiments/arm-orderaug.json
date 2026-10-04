@@ -30,5 +30,5 @@
   ],
   "extends": "arm-ordered.json",
   "stop": { "kind": "act", "shuffle_train": true },
-  "train": { "ckpt_dir": "$curdir/checkpoints-arm-orderaug" }
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-orderaug" }
 }

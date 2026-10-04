@@ -17,7 +17,7 @@
   ],
   "extends": "data-axis-varying-rule.json",
   "train": {
-    "ckpt_dir": "$curdir/checkpoints-dump",
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-dump",
     "shuffle_eval": true,
     "dump_samples": 12
   }

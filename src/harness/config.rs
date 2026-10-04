@@ -131,6 +131,21 @@ fn merge(base: &mut Value, layer: Value) {
 /// Load and fully resolve a run manifest.
 pub fn load_run(path: &Path) -> Result<RunConfig, ConfigError> {
     let (merged, root) = resolve(path, &mut Vec::new())?;
+    // A chain plan loaded as a single run would otherwise fail deep inside the
+    // path-variable expander, on the plan's own `$prev` checkpoint sentinel,
+    // which reads as a broken manifest rather than as "wrong loader". The two
+    // document shapes are disjoint: a plan has `experiments`, a run does not.
+    if merged.get("experiments").is_some() {
+        return Err(ConfigError::Invalid {
+            path: root,
+            problems: vec![format!(
+                "this is a chain PLAN, not a single-run manifest: it has an \
+                 `experiments` array. Use `--example chain`, which takes a plan \
+                 and runs its stages in order (`init_from: \"$prev\"` chains each \
+                 stage onto the previous one's weights)"
+            )],
+        });
+    }
     let cfg: RunConfig = serde_json::from_value(merged).map_err(|source| ConfigError::Schema {
         path: root.clone(),
         source,

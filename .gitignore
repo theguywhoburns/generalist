@@ -1,8 +1,13 @@
 /target
 .devenv/
 .direnv/
-checkpoints*/
 *.mpk
+
+# Checkpoints land under research/runs/ via $repo_root in every manifest, so
+# the repo root stays readable. Matched at any depth because the sweep tools
+# append a per-point subdirectory.
+research/runs/
+checkpoints*/
 
 # Run archives. These are multi-hundred-MB zip exports of checkpoints + logs:
 # never commit them, and never let `git add .` stage one.
@@ -10,3 +15,8 @@ checkpoints*/
 
 # Agent scratch notes (external tool state, not project source).
 .workbuddy-ai/
+
+# Run artifacts: stdout logs, scratch manifests, ad-hoc analysis scripts.
+# Reproducible manifests live in research/experiments/ and ARE tracked; this is
+# the disposable side.
+.runs/

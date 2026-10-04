@@ -23,5 +23,5 @@
   ],
   "extends": "stage0-base.json",
   "stop": { "kind": "act", "shuffle_train": true },
-  "train": { "ckpt_dir": "checkpoints-orderaug" }
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-orderaug" }
 }

@@ -48,7 +48,7 @@
     "ckpt_every": 100,
     "eval_max_new": 64,
     "seed": 0,
-    "ckpt_dir": "checkpoints-stage0",
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-stage0",
     "eval_holdout": 0.1,
     "eval_in_distribution": true,
     "indist_eval_per_cell": 48,

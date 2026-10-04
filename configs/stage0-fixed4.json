@@ -8,5 +8,5 @@
   "extends": "stage0-base.json",
   "stop": { "kind": "fixed", "loops": 4 },
   "model": { "ponder_weight": 0.0 },
-  "train": { "ckpt_dir": "checkpoints-fixed4" }
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-fixed4" }
 }

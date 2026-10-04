@@ -69,7 +69,20 @@ Running an experiment:
    set `train.dump_samples` and read `samples.txt`. Three conclusions in this
    repo were wrong before someone looked at the actual emitted strings.
 6. Read results out of `<ckpt_dir>/run.jsonl`, not stdout, so the numbers
-   survive a crash.
+   survive a crash. For a sweep, `python3 .runs/summarize.py <ckpt_root>`
+   collapses seeds per axis value and prints the spread — read the ± before the
+   mean. `jq` for single-record reads. **Never recompute a metric in a script**:
+   read the logged field. An ad-hoc script once recomputed an off-pair count
+   from sample dumps, got it wrong (it searched the alphabet for "a third
+   symbol" and skipped positions where the map has a fixed point), and turned a
+   chance-level 0.337 into a confident "never happens".
+7. Long runs use the shell tool's `background: true`. It detaches the process,
+   streams to a log, and delivers a notification when the command exits. A
+   `nohup … &` plus a sleep loop discards that and substitutes polling, which is
+   slower and misses the exit event entirely.
+8. Checkpoints go under `research/runs/` (`$repo_root/research/runs/checkpoints-*`
+   in every manifest) so the repo root stays readable. `.gitignore` covers it at
+   any depth, since the sweep tools append a per-point subdirectory.
 
 Recording it: new thread → new file in `experiments/`, then update
 `findings.md`. Update the child index below.
