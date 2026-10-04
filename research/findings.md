@@ -135,8 +135,58 @@ distract" rather than a point of interest.
 
 ---
 
-## Depth helps generalization and memorization about equally
+## Compute-matched: width beats reuse decisively, and the goal's premise is refuted
 
+`measured`, n=3 per arm, same block-steps per token and same parameters to
+within 0.05%. This is the experiment the goal's central question turns on, and
+the only design in the repo that could have supported the premise.
+
+| arm | params | in-dist byte | held-out byte | held-out exact |
+|---|---|---|---|---|
+| looping: 4 stages × 8 loops | 919,172 | 0.390 | **0.323** | 0.000, 0.000, 0.000 |
+| wide: 32 stages × 1 loop | 919,648 | **0.849** | **0.625** | 0.083, 0.792, 0.625 |
+
+Wide's *worst* seed (held-out 0.567) beats looping's *best* (0.355). Complete
+separation, far outside the seed spread.
+
+**So reuse does not buy generalization without proportional parameters. It buys
+generalization worse than those parameters spent on width would.** At equal
+arithmetic and equal storage, distinct parameters win by roughly 2× on held-out
+accuracy and by a factor of several on exact-match.
+
+**Why, and it is not mysterious.** Memorization is storage in weights. At equal
+parameters the storage is equal, so looping ought to be neutral, and is instead
+*worse at memorization* (0.390 vs 0.849). The cause is the reuse itself: 4 weight
+sets are asked to serve 32 transformations' worth of function. Reuse is
+storage-inefficient — it compresses 32 learned transformations through 4
+parameter sets.
+
+**This also relabels the depth axis, and the earlier reading of it was wrong.**
+That axis varied `max_loops` at fixed `n_stages = 2`, so depth 1 → 8 was 2 → 16
+block-steps: compute and reuse rose together, and the conclusion "looping
+improves generalization and memorization about equally" was really "more compute
+helps." Holding compute fixed and spending the parameters on width instead is 2×
+better. Two axes, opposite conclusions, because only one of them held compute
+constant.
+
+**A nuance that cuts the other way, stated because it would be easy to omit.**
+In *relative* terms the looping arm retains more of what it learned:
+0.323 / 0.390 = 83% of its in-distribution accuracy transfers, against
+0.625 / 0.849 = 74% for wide. Per unit of learning, reuse is slightly better at
+transfer. It simply learned far less, and absolute held-out accuracy is what a
+scaling law is about.
+
+**Uncontrolled difference.** Head count is 8 vs 4 and cannot be matched — an 8×
+stage ratio forces an ~8× body-parameter ratio. `head_dim` (16) is matched. The
+effect is large enough that head count is unlikely to explain it, but it is not
+zero, and the params-free pair removes it entirely by holding `d_model` fixed.
+
+---
+
+## Depth buys compute, not reuse (superseded by the compute-matched result above)
+
+**This section is kept because its error is instructive.** Read the section above
+first: at matched compute and matched parameters, width beats reuse 2:1.
 `single-pass`, n=3 (n=2 at depth 8), 492,418 params, same-rule rung. This is the
 closest thing to a direct answer to the goal's central question — does looping
 buy generalization without proportional parameters — and it is a partial one.

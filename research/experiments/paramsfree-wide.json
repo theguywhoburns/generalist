@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "DATA AXIS, constant rule (subst-fst-fixed, k=0).",
+    "",
+    "This is the rung the memorization-onset curve was first measured on, and the",
+    "settings here are the ones that produced the reported table, not a cleaned-up",
+    "version: per_cell 160, batch 6 with auto_batch ON, indistinguishable 12, 600",
+    "steps, fixed eval set of ~29 held-out instances.",
+    "",
+    "k_set [0] with k0_rate 1.0 means NO in-context demonstrations. The rule is",
+    "memorizable in weights, so held-out accuracy here measures applying a known",
+    "map to new inputs. That is not generalization in the sense the research goal",
+    "means. Do not report a rule-INDUCTION result from this rung.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep --",
+    "    research/experiments/data-axis-constant-rule.json data gpu \\",
+    "    16 48 128 288 --seeds=0,1,2"
+  ],
+  "extends": "base-492k.json",
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-paramsfree-wide",
+    "batch_size": 6,
+    "eval_every": 1000,
+    "indist_eval_per_cell": 12
+  },
+  "experiment": {
+    "per_cell": 160,
+    "tasks": [
+      "subst-fst-fixed"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  },
+  "model": {
+    "n_stages": 16,
+    "max_loops": 1,
+    "d_model": 128,
+    "n_heads": 2,
+    "head_dim": 64,
+    "ffn_hidden": 384
+  }
+}
