@@ -38,7 +38,7 @@ fn main() {
     generalist::fail_fast::install();
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).map(|s| s.as_str()).expect(
-        "usage: cargo run --example scaling_sweep -- configs/<base>.json <data|depth|params> [gpu] [values...] [--seeds=a,b]",
+        "usage: cargo run --example scaling_sweep -- configs/<base>.json <data|depth|params|k> [gpu] [values...] [--seeds=a,b]",
     );
     let axis = args
         .get(2)
@@ -147,7 +147,11 @@ fn default_values(axis: &str) -> &'static [f64] {
         // 16 exceeds the base's max_loops of 8, so it is raised with the value.
         "depth" => &[1.0, 2.0, 4.0, 8.0],
         "params" => &[128.0, 192.0, 256.0, 384.0],
-        other => panic!("unknown axis {other}: expected data | depth | params"),
+        // k=0 is included deliberately: it is the weights-only rung, and seeing
+        // the curve start there makes "evidence in context" a measured
+        // difference rather than an assumption.
+        "k" => &[0.0, 1.0, 2.0, 4.0, 8.0],
+        other => panic!("unknown axis {other}: expected data | depth | params | k"),
     }
 }
 
@@ -183,6 +187,19 @@ fn apply(base: &RunConfig, axis: &str, v: f64, seed: u64) -> RunConfig {
             if loops > cfg.model.max_loops {
                 cfg.model.max_loops = loops;
             }
+        }
+        "k" => {
+            // Demos per instance: the difficulty axis for anything that has to
+            // be induced rather than recalled.
+            //
+            // A SINGLE value, and `k0_rate: 0`, because a mixture would make
+            // every point a blend of difficulties and the curve would average
+            // away the thing it is measuring. k = 0 is a legitimate point and a
+            // meaningful one — it is the weights-only rung, where the rule
+            // cannot be in the prompt at all — so it is allowed here rather
+            // than rejected, and its reading is "no evidence in context".
+            cfg.experiment.protocol.k_set = vec![v as usize];
+            cfg.experiment.protocol.k0_rate = 0.0;
         }
         "params" => {
             // Keep head geometry consistent: hold head_dim fixed and derive
@@ -401,6 +418,17 @@ fn report(rows: &[SweepRow], axis: &str) {
                  rate for a 3-symbol alphabet, so this is chance-level transfer at \
                  every point on the axis.",
                 out_last
+            );
+        }
+        if axis == "k" {
+            // Without this, a flat k curve reads as "the model cannot use
+            // in-context evidence", when k=0 contains no evidence at all and
+            // the rest of the axis is a genuine difficulty ladder.
+            println!(
+                "  On the k axis, remember what the axis varies: k is demos per \
+                 instance, and k=0 carries NO rule in the prompt at all. A flat \
+                 curve that includes k=0 is a statement about recall, not about \
+                 induction; read the k>=1 points against k=0 for that."
             );
         }
     } else if last - first > 0.05 {

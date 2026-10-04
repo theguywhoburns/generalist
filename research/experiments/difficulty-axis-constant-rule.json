@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "DIFFICULTY AXIS on the SAME-RULE rung: the positive control.",
+    "",
+    "Identical to difficulty-axis-new-rule.json except for the task. This rung",
+    "holds one substitution map constant, so transfer is known to exist here",
+    "(held-out byte 0.329 -> 0.850 as data grows), which makes it the control for",
+    "the new-rule rung's difficulty curve.",
+    "",
+    "Run this and difficulty-axis-new-rule.json and read them together:",
+    "  - helps here, flat there  ->  evidence quantity matters for recall, not for",
+    "                                induction. A real dissociation.",
+    "  - helps in both           ->  the new-rule null is about something else,",
+    "                                probably the 0.333 chance floor.",
+    "  - flat in both            ->  the instrument or the budget, not the task.",
+    "",
+    "CAVEAT ON k=0 HERE. With a constant rule and k=0 there is nothing in the",
+    "prompt to indicate the task at all -- no demos and no rule -- so k=0 on this",
+    "rung is close to an unconditioned generation task, and a low score there is",
+    "expected rather than diagnostic. It is included so both curves have the same",
+    "x-axis, not because it is an interesting point on this rung.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/difficulty-axis-constant-rule.json k gpu 0 1 2 4 8 --seeds=0,1,2"
+  ],
+  "extends": "data-axis-constant-rule.json",
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-k-constant-rule" }
+}

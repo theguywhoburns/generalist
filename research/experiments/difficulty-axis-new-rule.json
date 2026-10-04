@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "DIFFICULTY AXIS on the new-rule rung: demos per instance.",
+    "",
+    "The k axis is the natural difficulty knob for anything that must be induced",
+    "rather than recalled, and it has never been swept -- every new-rule run so",
+    "far pooled k in {1,2,3,5} into a single number.",
+    "",
+    "Why paired with k-axis-constant-rule.json rather than run alone: if held-out",
+    "accuracy is flat in k HERE, that is uninterpretable on its own. It is",
+    "interpretable next to the same-rule rung, where transfer is known to exist",
+    "and rises with data. More evidence helping there and not here is a",
+    "dissociation, not two separate nulls.",
+    "",
+    "k=0 is a real point, not a formality: it carries no rule in the prompt, so",
+    "it measures pure recall of the trained rule. The gap between k=0 and k>=1 is",
+    "what evidence in context is worth, measured rather than assumed.",
+    "",
+    "Read with off_pair_rate, not byte accuracy alone. On a 3-symbol alphabet",
+    "chance is 0.333, so a weak partial competence cannot be told from guessing;",
+    "off_pair cannot be gamed by a positional bias.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/difficulty-axis-new-rule.json k gpu 0 1 2 4 8 --seeds=0,1,2"
+  ],
+  "extends": "data-axis-varying-rule.json",
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-k-new-rule" }
+}
