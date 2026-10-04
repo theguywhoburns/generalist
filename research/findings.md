@@ -184,11 +184,19 @@ could show above it.---
 ## Open, in order of value
 
 0. **Size axis, to completion.** Running — `size-axis-varying-rule.json`. Held-out
-   byte is flat at ~0.27 with `off_pair` at chance for d_model 128 and 192, so
-   capacity is not moving the new-rule number. Steps are fixed at 600 across
-   sizes, so larger models are also less-converged per parameter: a null here is
-   "not better at 600 steps", and the in-distribution column moving
-   (0.926 → 0.763 → 0.904) is that confound showing up rather than a size effect.
+   byte is flat at ~0.27 with `off_pair` at chance for d_model 128, 192 and 256,
+   so capacity is not moving the new-rule number.
+
+   An earlier note here blamed a steps confound — "larger models are less-trained
+   per parameter". **That was wrong.** The auto-batch tuner holds the *effective*
+   batch fixed, so samples-per-optimizer-step, and therefore epochs over the
+   ~360-instance training pool, are constant across sizes. Memory pressure cannot
+   leak into the optimization. Corrected in the manifest too.
+
+   The confound that is live runs the other way: a fixed effective batch is what
+   makes the axis comparable, but it means every size gets the same batch, so a
+   size that wanted a larger one is handicapped rather than helped. If the axis
+   comes back flat, that is the first thing to revisit — not more steps.
    **This is the single measurement that turns every claim here from a
    single-cell statement into a scaling claim.**
 1. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
