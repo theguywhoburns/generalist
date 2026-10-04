@@ -44,6 +44,32 @@ pub struct Record {
     /// a partial-credit rule-application failure.
     pub len_out: usize,
     pub len_target: usize,
+    /// Byte accuracy of the output measured against the **query input** rather
+    /// than the target.
+    ///
+    /// This bounds how much the model uses the prompt at all. A model that
+    /// applies a rule beats the chance rate against the target; a model that
+    /// copies beats it against the query; a model that has learned neither sits
+    /// at chance against **both**, which means its output carries no positional
+    /// information about the input. On the varying-rule rung the two came out
+    /// 0.385 and 0.336 against a 0.333 chance rate — indistinguishable from
+    /// noise — which is a sharper statement than "below chance" and is what
+    /// makes "no rule-application mechanism" a measurement rather than a guess.
+    pub query_byte_hits: usize,
+    /// Positions where the emitted symbol was **neither** the query's symbol
+    /// nor the target's.
+    ///
+    /// On a 3-symbol alphabet with a permutation as the rule, every position
+    /// has exactly one symbol that is neither, so a model guessing uniformly
+    /// would land here a third of the time. Measured at **0 of 141 positions**
+    /// on the varying-rule rung: the model never proposes the third symbol. It
+    /// therefore knows the answer must be one of the two symbols in play at
+    /// each position, and fails only at resolving which — which is a far more
+    /// specific failure than "at chance", and the reason the byte-accuracy
+    /// number alone was misleading.
+    ///
+    /// Denominator is `byte_total`, matching the other byte metrics.
+    pub off_pair: usize,
     /// Model output appeared verbatim among demo outputs.
     pub copied: bool,
     pub steps_used: usize,
@@ -110,6 +136,17 @@ pub struct Summary {
     /// and one that emits double-length ones have the same mean absolute error
     /// and opposite faults.
     pub mean_len_ratio: f64,
+    /// Micro-averaged byte accuracy against the query input. See
+    /// [`Record::query_byte_hits`].
+    ///
+    /// The chance rate is the same as for `byte_accuracy` — uniform over the
+    /// track's alphabet — so the two columns are directly comparable, and
+    /// reading both is what separates "ignores the rule" from "ignores the
+    /// prompt".
+    pub query_byte_accuracy: f64,
+    /// Fraction of positions where the emitted symbol was neither the query's
+    /// nor the target's. See [`Record::off_pair`].
+    pub off_pair_rate: f64,
     /// Micro-averaged over all target bytes: `sum(hits) / sum(total)`.
     ///
     /// Micro rather than per-instance mean because instance lengths vary, and
@@ -286,6 +323,24 @@ pub fn summarize(records: &[Record]) -> Summary {
             .filter(|r| r.len_target > 0 && r.len_out == r.len_target)
             .count() as f64
             / n,
+        off_pair_rate: {
+            let off: usize = records.iter().map(|r| r.off_pair).sum();
+            let total: usize = records.iter().map(|r| r.byte_total).sum();
+            if total == 0 {
+                0.0
+            } else {
+                off as f64 / total as f64
+            }
+        },
+        query_byte_accuracy: {
+            let hits: usize = records.iter().map(|r| r.query_byte_hits).sum();
+            let total: usize = records.iter().map(|r| r.byte_total).sum();
+            if total == 0 {
+                0.0
+            } else {
+                hits as f64 / total as f64
+            }
+        },
         mean_len_ratio: {
             let ratios: Vec<f64> = records
                 .iter()
@@ -376,6 +431,9 @@ mod tests {
             echoed_query: false,
             len_out: 1,
             len_target: 1,
+            query_byte_hits: usize::from(correct),
+
+            off_pair: 0,
             copied,
             steps_used: 6,
             mean_halt: 4.5,

@@ -16,7 +16,7 @@
     "induction result without checking k_set.",
     "",
     "Run:",
-    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "  cargo run --example scaling_sweep --",
     "    research/experiments/data-axis-varying-rule.json data gpu \\",
     "    16 48 128 288 --seeds=0,1,2"
   ],

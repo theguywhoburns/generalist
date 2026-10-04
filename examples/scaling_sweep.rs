@@ -155,8 +155,14 @@ fn default_values(axis: &str) -> &'static [f64] {
 fn apply(base: &RunConfig, axis: &str, v: f64, seed: u64) -> RunConfig {
     let mut cfg = base.clone();
     cfg.train.seed = seed;
-    // Distinguishable per point so a rerun never silently clobbers a result.
-    cfg.train.ckpt_dir = format!("{}-sweep-{axis}{:?}-s{seed}", base.train.ckpt_dir, v);
+    // Distinguishable per point so a rerun never silently clobbers a result, and
+    // anchored to the base manifest's own directory so `$curdir`-derived paths
+    // stay put instead of resolving against wherever the runner was invoked.
+    cfg.train.ckpt_dir = format!(
+        "{}/sweep-{axis}{:?}-s{seed}",
+        base.train.ckpt_dir.trim_end_matches('/'),
+        v
+    );
     match axis {
         "data" => {
             // Cap training data, NOT per_cell. `per_cell` would move the eval

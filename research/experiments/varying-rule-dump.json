@@ -5,7 +5,7 @@
     "diagnosed instead of theorized about.",
     "",
     "Run:",
-    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "  cargo run --example scaling_sweep --",
     "    research/experiments/varying-rule-dump.json data gpu 288 --seeds=0",
     "  then read $curdir/checkpoints-dump/samples.txt",
     "",

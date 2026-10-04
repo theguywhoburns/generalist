@@ -53,12 +53,11 @@ metrics, and the harness that makes a run reproducible from a manifest.
 
 ## Verification
 
-```bash
-cargo test --no-default-features --features ndarray        # must pass
-cargo clippy --all-targets --no-default-features --features ndarray   # 0 warnings
-cargo fmt --check
-cargo build  --no-default-features --features cuda  --all-targets
-cargo build  --no-default-features --features ndarray --all-targets
-```
+Default features only (see root AGENTS.md). While iterating build just the lib:
+`cargo build --lib`. Before committing:
 
-Both feature sets. The cuda-only one has broken silently before.
+```bash
+cargo test                    # must pass
+cargo clippy --all-targets    # 0 warnings
+cargo fmt --check
+```

@@ -59,10 +59,10 @@ Running an experiment:
    `extends`, expands `$` variables, validates, and prints pool cell counts
    without touching the GPU. Validation failures here are the cheapest possible
    feedback.
-3. GPU sweeps: `cargo run --no-default-features --features cuda --example
-   scaling_sweep -- <manifest> <axis> gpu <values> --seeds=a,b,c`. Pass `gpu`
-   explicitly — omitting it silently runs on CPU and every number is then
-   meaningless (device memory reads a flat 12MB there).
+3. GPU sweeps: `cargo run --example scaling_sweep -- <manifest> <axis> gpu
+   <values> --seeds=a,b,c`. Pass `gpu` explicitly — omitting it silently runs on
+   CPU and every number is then meaningless (device memory reads a flat 12MB
+   there).
 4. Two-arm interventions: `examples/arm_compare.rs`, which refuses to compare
    arms differing by more than the intervention.
 5. For any below-chance or otherwise inexplicable number, do not theorize —

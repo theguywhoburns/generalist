@@ -1,10 +1,9 @@
 //! CPU demo for the 1M looped character transformer base.
 //!
 //! Runs on whichever backend is compiled in, preferring the CPU. The binary
-//! used to name `burn::backend::NdArray` unconditionally, which made a
-//! cuda-only build (`--no-default-features --features cuda`, the exact feature
-//! set the GPU sweep runs use) fail to compile. Selecting the backend by
-//! `cfg` keeps every feature combination buildable.
+//! used to name `burn::backend::NdArray` unconditionally, which broke any
+//! build without the `ndarray` feature. Selecting the backend by `cfg` keeps
+//! every feature combination buildable.
 
 #[cfg(all(feature = "cuda", not(feature = "ndarray")))]
 use burn::backend::Cuda;

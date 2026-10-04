@@ -85,30 +85,44 @@ is a hypothesis, not a finding.
 | "the model echoes the query" as the below-chance mechanism | `copy_rate` and `query_echo_rate` both 0.000 | `16079a8` |
 | "gap narrowing means transfer" on the varying-rule rung | the gap drifted because in-distribution was pinned at ceiling; held-out never moved. The sweep tool now checks the held-out curve first | `dd34041` |
 | "the model applies a wrong but consistent permutation" | 0 of 12 sampled outputs admit a consistent char→char map at all | not committed |
+| "the model never proposes a symbol other than the query's or the target's" (0 of 141 sampled positions) | my analysis script searched the track's alphabet for a third symbol, but when the map has a **fixed point** the query and target symbols are equal and no third symbol exists — those positions were silently skipped. The real `off_pair_rate` on the full 44-instance held-out set is **0.337**, i.e. chance. The constraint is absent, and it is an artifact of the fixed-point positions, not a property of the model | not committed |
 
 ---
 
-## Mechanism of the varying-rule failure: still unidentified
+## Mechanism of the varying-rule failure: no mechanism, it is at chance
 
-**Known** (`measured`): the rule is demonstrated in context; the demo-derived
-map predicts the target exactly (verified 100% on 12/12 samples, so the rule is
-unambiguous); held-out byte accuracy 0.30; `copy_rate` 0.000; `query_echo_rate`
-0.000; exact-match 0.000; mean length ratio 0.94 with `length_exact_rate` 0.11.
+**Known** (`measured`, n=44 held-out / 32 in-distribution, 600 steps, k≥1 so the
+rule is demonstrated in context every time):
 
-**Ruled out**: replaying a demo output; echoing the query input; uniform
-guessing (0.30 is *below* 0.333); applying a fixed wrong permutation (no output
-is a function of its input).
+| | held-out | in-distribution | chance |
+|---|---|---|---|
+| byte accuracy vs target | 0.297 | 0.901 | 0.333 |
+| byte accuracy vs query | 0.267 | — | 0.333 |
+| off-pair rate | 0.337 | 0.054 | 0.333 |
+| exact-match | 0.000 | 0.844 | — |
+| copy rate / query-echo rate | 0.000 / 0.000 | — | — |
 
-**So**: the model emits roughly the right number of symbols, does not copy,
-does not guess uniformly, and does not apply any consistent per-character
-transformation. That is a specific and unusual failure, and we do not yet have
-the diagnostic that names it.
+All three held-out numbers sit at chance, from three different directions: the
+output is no better than chance against the target, no better than chance
+against the input, and proposes an "off-pair" symbol exactly as often as chance
+predicts. `off_pair` — any position whose emitted symbol is neither the query's
+nor the target's — is the strongest of the three, because no bias the other two
+allow can game it.
 
-**Next**: per-track and per-k breakdown of the held-out failure, and the
-emitted strings analysed by output class (constant / position-dependent /
-symbol-dependent). `varying-rule-dump.json` produces the samples.
+**So on an unseen rule the output is statistically indistinguishable from a
+uniform draw over the track's alphabet.** Length is approximately right (ratio
+0.90) and the symbols stay in-alphabet. That is the whole of it.
 
----
+**What it does have is memorization**: in-distribution byte accuracy 0.90 with
+`off_pair` at 0.054 against a 0.333 chance rate. Reproducing a stored target
+structurally cannot propose an off-pair symbol, so that low number is what
+memorization looks like — not a competence that fails to transfer.
+
+**Next is no longer a mechanism question**, since the answer is "none detectable
+at this scale". The productive question is what would change that: a bigger
+model, longer training, more demos per instance, or a rung whose output space
+is larger than a 3-symbol alphabet so chance is lower and a partial competence
+could show above it.---
 
 ## Open, in order of value
 

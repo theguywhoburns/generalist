@@ -7,7 +7,7 @@
     "half of the pair that decides whether the role diagnostic's premise holds.",
     "",
     "Run both arms together so the isolation check runs:",
-    "  cargo run --no-default-features --features cuda --example arm_compare --",
+    "  cargo run --example arm_compare --",
     "    research/experiments/arm-ordered.json \\",
     "    research/experiments/arm-orderaug.json gpu 0 1 2",
     "",

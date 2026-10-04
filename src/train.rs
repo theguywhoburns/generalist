@@ -723,6 +723,24 @@ impl<B: AutodiffBackend> Trainer<B> {
                     echoed_query: text == inst.info.query_input,
                     len_out: text.chars().count(),
                     len_target: expected.chars().count(),
+                    // Measured against the query input, bounded by the target's
+                    // length so both columns cover the same positions and are
+                    // directly comparable.
+                    query_byte_hits: text
+                        .chars()
+                        .zip(inst.info.query_input.chars())
+                        .take(expected.chars().count())
+                        .filter(|(a, b)| a == b)
+                        .count(),
+                    // Neither the query's nor the target's symbol. On the
+                    // varying-rule rung this is 0, which is the sharpest
+                    // statement available about what the model did learn.
+                    off_pair: text
+                        .chars()
+                        .zip(inst.info.query_input.chars())
+                        .zip(expected.chars())
+                        .filter(|((a, b), c)| *a != *b && *a != *c)
+                        .count(),
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
@@ -1504,8 +1522,18 @@ pub fn run_stage<B: AutodiffBackend>(
     // the trained gap in excess of that control floor is evidence of learned
     // role specialization — see `harness::shuffle_control`.
     let n_stages = trainer.model.stages.len();
-    let mut trained_order: Option<(f64, f64, (f64, f64))> = None;
-    let mut trained_shuffled: Option<(f64, f64, (f64, f64))> = None;
+    // Pool-level readouts for one eval pass, carried from that pass to the
+    // memorization record.
+    //
+    // Flat and named because this grew one element at a time and the positional
+    // `.0 .1 .2 .3` at the use site stopped being readable several elements ago
+    // — the point where the next addition would have silently put a number in
+    // the wrong slot of the JSON record.
+    #[allow(clippy::type_complexity)] // a named tuple beats six named structs here
+    type PoolReadout = (f64, f64, f64, f64, f64, f64);
+
+    let mut trained_order: Option<PoolReadout> = None;
+    let mut trained_shuffled: Option<PoolReadout> = None;
     for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval, "trained") {
         let records = trainer.evaluate_watched(
             &final_set,
@@ -1575,9 +1603,10 @@ pub fn run_stage<B: AutodiffBackend>(
                 ),
             };
             println!(
-                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} echo {:.2} len {:.2}/{:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                "  eval [{label}-pool]: acc {:.2} byte {:.3} vsq {:.3} copy {:.2} echo {:.2} len {:.2}/{:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.byte_accuracy,
+                s.query_byte_accuracy,
                 s.copy_rate,
                 s.query_echo_rate,
                 s.length_exact_rate,
@@ -1618,6 +1647,7 @@ pub fn run_stage<B: AutodiffBackend>(
                 "{{\"eval\":\"{label}-pool\",\"accuracy\":{:.6},\"byte_accuracy\":{:.6},\
                  \"copy_rate\":{:.6},\"query_echo_rate\":{:.6},\
                  \"length_exact_rate\":{:.6},\"mean_len_ratio\":{:.6},\
+                 \"query_byte_accuracy\":{:.6},\"off_pair_rate\":{:.6},\
                  \"mean_halt\":{:.6},\"n\":{}}}\n",
                 s.accuracy,
                 pool_byte_acc,
@@ -1625,13 +1655,18 @@ pub fn run_stage<B: AutodiffBackend>(
                 s.query_echo_rate,
                 s.length_exact_rate,
                 s.mean_len_ratio,
+                s.query_byte_accuracy,
+                s.off_pair_rate,
                 s.mean_halt,
                 s.n,
             ));
             (
                 s.accuracy,
                 pool_byte_acc,
-                (s.length_exact_rate, s.mean_len_ratio),
+                s.length_exact_rate,
+                s.mean_len_ratio,
+                s.query_byte_accuracy,
+                s.off_pair_rate,
             )
         };
         if order.is_none() {
@@ -1653,15 +1688,14 @@ pub fn run_stage<B: AutodiffBackend>(
             watchdog.ping_step(run.train.steps)
         });
         let ind = crate::harness::summarize(&records);
-        let (held_acc, held_byte, held_len) = trained_order.unwrap_or((0.0, 0.0, (0.0, 0.0)));
+        let (held_acc, held_byte, _held_len_exact, held_len_ratio, held_query_byte, held_off_pair) =
+            trained_order.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
         let gap = held_acc - ind.accuracy;
         let byte_gap = held_byte - ind.byte_accuracy;
         // Termination is now carried on both halves of the memorization record
         // too. Byte accuracy cannot see a length error, so a comparison that
         // reports only bytes cannot tell "wrong symbols" from "right symbols,
         // wrong count", and those have different causes.
-        let held_len_exact = held_len.0;
-        let held_len_ratio = held_len.1;
         println!(
             "  memorization: train-pool acc {:.3} byte {:.3} len {:.2} | held-out acc {:.3} byte {:.3} len {:.2} | gap {:+.3} / {:+.3} (n_train={} n_held={})",
             ind.accuracy,
@@ -1680,6 +1714,8 @@ pub fn run_stage<B: AutodiffBackend>(
              \"gap\":{:.6},\"indist_byte_accuracy\":{:.6},\"heldout_byte_accuracy\":{:.6},\
              \"byte_gap\":{:.6},\"indist_length_exact\":{:.6},\"heldout_length_exact\":{:.6},\
              \"indist_len_ratio\":{:.6},\"heldout_len_ratio\":{:.6},\
+             \"indist_query_byte_accuracy\":{:.6},\"heldout_query_byte_accuracy\":{:.6},\
+             \"heldout_off_pair_rate\":{:.6},\"indist_off_pair_rate\":{:.6},\
              \"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
             ind.accuracy,
             held_acc,
@@ -1688,9 +1724,13 @@ pub fn run_stage<B: AutodiffBackend>(
             held_byte,
             byte_gap,
             ind.length_exact_rate,
-            held_len_exact,
+            _held_len_exact,
             ind.mean_len_ratio,
             held_len_ratio,
+            ind.query_byte_accuracy,
+            held_query_byte,
+            held_off_pair,
+            ind.off_pair_rate,
             ind.n,
             final_set.len(),
             run.train.seed
@@ -1717,7 +1757,7 @@ pub fn run_stage<B: AutodiffBackend>(
     }
 
     // The role diagnostic, read against its floor.
-    if let (Some((t, _, _)), Some((ts, _, _))) = (trained_order, trained_shuffled) {
+    if let (Some((t, ..)), Some((ts, ..))) = (trained_order, trained_shuffled) {
         let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log, &|| {
             watchdog.ping_step(run.train.steps);
         });
@@ -2333,6 +2373,92 @@ mod tests {
     /// and the path must be the one a chain's `init_from: $prev` picks up.
     /// The in-loop cadence skips the final step, so this is the only place
     /// that file is written.
+    /// The `memorization` record is written with a 17-slot positional
+    /// `format!`, and its `indist_*` / `heldout_*` pairs are the same numbers
+    /// computed two independent ways — once from the in-distribution sample and
+    /// once from the final-eval pass over the held-out set.
+    ///
+    /// That redundancy is the point: a swapped pair of arguments produces a
+    /// record that is internally consistent and completely wrong, and nothing
+    /// downstream can tell. Cross-checking the two derivations of the same
+    /// quantity catches it, which a unit test on the formatter cannot.
+    ///
+    /// This test exists because that swap happened: `heldout_off_pair_rate`
+    /// came out at 0.030 while the pool summary for the *same* eval set said
+    /// 0.292. Only disagreeing-with-itself exposed it.
+    #[test]
+    fn memorization_record_agrees_with_the_pool_summary_it_duplicates() {
+        let dir = std::env::temp_dir().join("generalist-memorization-record");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut run = crate::harness::RunConfig::smoke();
+        run.experiment.per_cell = 24;
+        run.experiment.seeds = vec![0];
+        run.train.steps = 2;
+        run.train.eval_every = 100;
+        run.train.eval_max_new = 4;
+        run.train.ckpt_dir = dir.display().to_string();
+        run.train.eval_holdout = 0.25;
+        run.train.eval_in_distribution = true;
+        run.train.shuffle_eval = false;
+        run_stage::<TestBackend>(&run, &test_device(), None, &[]);
+
+        let text = std::fs::read_to_string(format!("{}/run.jsonl", dir.display()))
+            .expect("run.jsonl written");
+        let val = |key: &str| -> f64 {
+            text.lines()
+                .find(|l| l.contains("\"eval\":\"memorization\""))
+                .unwrap_or_else(|| panic!("no memorization record"))
+                .split(&format!("\"{key}\":")[..])
+                .nth(1)
+                .and_then(|s| {
+                    s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                        .map(|i| s[..i].parse::<f64>().ok())
+                        .unwrap_or(None)
+                })
+                .unwrap_or_else(|| panic!("key {key} absent or unparsable"))
+        };
+        let pool_val = |key: &str| -> f64 {
+            text.lines()
+                .find(|l| l.contains("\"eval\":\"final-trained-pool\""))
+                .unwrap_or_else(|| panic!("no pool record"))
+                .split(&format!("\"{key}\":")[..])
+                .nth(1)
+                .and_then(|s| {
+                    s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                        .map(|i| s[..i].parse::<f64>().ok())
+                        .unwrap_or(None)
+                })
+                .unwrap_or_else(|| panic!("pool key {key} absent"))
+        };
+
+        // The held-out quantities appear in BOTH records, derived separately.
+        for (memorization_key, pool_key) in [
+            ("heldout_accuracy", "accuracy"),
+            ("heldout_byte_accuracy", "byte_accuracy"),
+            ("heldout_off_pair_rate", "off_pair_rate"),
+        ] {
+            assert!(
+                (val(memorization_key) - pool_val(pool_key)).abs() < 1e-9,
+                "{memorization_key} = {} disagrees with the pool summary's \
+                 {pool_key} = {} for the same eval set; an argument pair is \
+                 swapped or misaligned",
+                val(memorization_key),
+                pool_val(pool_key)
+            );
+        }
+        // And the gap really is the difference of its two halves.
+        assert!(
+            (val("gap") - (val("heldout_accuracy") - val("indist_accuracy"))).abs() < 1e-6,
+            "gap is not heldout - indist"
+        );
+        assert!(
+            (val("byte_gap") - (val("heldout_byte_accuracy") - val("indist_byte_accuracy"))).abs()
+                < 1e-6,
+            "byte_gap is not heldout - indist"
+        );
+    }
+
     #[test]
     fn final_checkpoint_is_written_once_and_named_for_chaining() {
         // `run_stage` generates the pool itself, so this drives it through the

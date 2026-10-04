@@ -13,7 +13,7 @@
     "the axis.",
     "",
     "Run:",
-    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "  cargo run --example scaling_sweep --",
     "    research/experiments/depth-axis.json depth gpu 1 2 4 8 --seeds=0,1,2",
     "",
     "The sweep tool sets stop.fixed{loops} per point, zeroes ponder_weight (no",

@@ -48,18 +48,50 @@ child index changes. Remove stale or contradictory text immediately.
 
 ## Build and verify
 
-- Development profile is the working profile. `[profile.dev] opt-level = 1` is
-  deliberate: the arithmetic runs on the GPU, so `0` only slows host-side
-  bookkeeping while costing rebuild time. Do not switch the working loop to
-  `--release` to "make it faster" — a clean tree builds in ~1.5 min in debug.
-- `cargo test --no-default-features --features ndarray` — full suite.
-- `cargo clippy --all-targets --no-default-features --features ndarray` — must
-  be 0 warnings.
-- `cargo fmt --check` — must be clean.
-- **Verify both feature sets compile.** `--features cuda` alone has broken
-  silently before (see Local Contracts). Use
-  `cargo build --no-default-features --features cuda --all-targets` and
-  `--features ndarray --all-targets`.
+**Use only the default feature set.** `cargo build`, `cargo test`,
+`cargo clippy`, `cargo fmt` — nothing else.
+
+- No `--release`. `[profile.dev] opt-level = 1` is the working profile and is
+  what every measurement in this repo was taken on. Switching profiles
+  silently changes the numbers, not just the speed.
+- No `--no-default-features`, no `--features`, no `--all-features`.
+- **Why this is a hard rule and not a preference:** every distinct feature set
+  is a *separate artifact cache*. Naming `--no-default-features --features
+  ndarray` and `--features cuda` alongside the default maintains three parallel
+  caches and pays a full recompile of burn and its dependencies for each. The
+  default `cargo build` is instant; the "extra" verification builds were costing
+  minutes each and bought a check that belongs in a test, not in the loop.
+
+### Commands
+
+Build only what you touched, while iterating:
+
+```bash
+cargo build --lib                      # editing src/
+cargo build --example scaling_sweep     # editing one example
+cargo build --bin generalist            # editing src/main.rs
+```
+
+Full gate before committing or calling a task done — not on every edit:
+
+```bash
+cargo test                    # full suite; also the broadest build
+cargo clippy --all-targets    # must be 0 warnings
+cargo fmt --check             # must be clean
+```
+
+`cargo test` already builds every test target, so it is the widest build
+available; `--all-targets` on `build` is rarely worth its time on a small edit.
+
+### Known blind spot this leaves
+
+The default build has both features on, so it **cannot** catch an ungated
+single-feature compile error — naming `burn::backend::NdArray` without a `#[cfg]`
+gate compiles fine here and fails only under `--features cuda` alone. That class
+of bug was real once (see Local Contracts 1). The mitigation is the `#[cfg]`
+gates themselves plus contract 1, not a separate build in the loop. If a
+single-feature build ever needs checking again, do it **once**, deliberately,
+rather than folding it into the working loop.
 
 ## Local Contracts
 

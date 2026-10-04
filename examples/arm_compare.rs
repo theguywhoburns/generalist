@@ -290,8 +290,12 @@ where
         cfg.train.auto_batch = true;
     }
     // Arm and seed both in the path, so the two arms never share a checkpoint
-    // directory and a rerun cannot silently overwrite the other arm.
-    cfg.train.ckpt_dir = format!("{}-arm{arm}-s{seed}", base.train.ckpt_dir);
+    // directory and a rerun cannot silently overwrite the other arm. Anchored
+    // to the base manifest's directory so `$curdir` paths stay put.
+    cfg.train.ckpt_dir = format!(
+        "{}/arm{arm}-s{seed}",
+        base.train.ckpt_dir.trim_end_matches('/')
+    );
     let log_path = format!("{}/run.jsonl", cfg.train.ckpt_dir);
 
     println!("=== arm {arm}  seed {seed} -> {log_path} ===");

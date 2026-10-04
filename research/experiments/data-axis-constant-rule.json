@@ -13,7 +13,7 @@
     "means. Do not report a rule-INDUCTION result from this rung.",
     "",
     "Run:",
-    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "  cargo run --example scaling_sweep --",
     "    research/experiments/data-axis-constant-rule.json data gpu \\",
     "    16 48 128 288 --seeds=0,1,2"
   ],

@@ -540,7 +540,7 @@ and the card fixed does not reproduce it. Anyone re-deriving the old numbers
 from commit `8bcffc6` should read this table instead.
 
 ```bash
-cargo run --no-default-features --features cuda --example scaling_sweep -- \
+cargo run --example scaling_sweep -- \
     research/experiments/data-axis-constant-rule.json data gpu 16 48 128 288 --seeds=0,1,2
 ```
 
@@ -653,7 +653,7 @@ chance-level reading is uniform across Track A and Track B is not established
 here either. Both are open; the induction and oracle rungs are queue item 1.
 
 ```bash
-cargo run --no-default-features --features cuda --example scaling_sweep -- \
+cargo run --example scaling_sweep -- \
     research/experiments/data-axis-varying-rule.json data gpu 16 48 128 288 --seeds=0,1,2
 ```
 
@@ -693,7 +693,7 @@ stage roles — see "Reading the stages". It also says nothing about ACT: the ax
 is `fixed` only, so no point here is compute-matched to any other.
 
 ```bash
-cargo run --no-default-features --features cuda --example scaling_sweep -- \
+cargo run --example scaling_sweep -- \
     research/experiments/depth-axis.json depth gpu 1 2 4 8 --seeds=0,1,2
 ```
 
@@ -756,7 +756,7 @@ central confound in the depth-scaling question and is called out again under
 Reproduce with:
 
 ```bash
-cargo run --no-default-features --features cuda --example lr_sweep -- \
+cargo run --example lr_sweep -- \
     configs/stage0-fixed.json gpu 2e-3 1.5e-2 --seeds=0,1,2
 ```
 
@@ -834,7 +834,7 @@ What this does not establish, stated plainly:
   it, and the command below is the whole check.
 
 ```bash
-cargo run --no-default-features --features cuda --example arm_compare -- \
+cargo run --example arm_compare -- \
     research/experiments/arm-ordered.json research/experiments/arm-orderaug.json gpu 0 1 2
 ```
 

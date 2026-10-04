@@ -53,5 +53,5 @@ merge, and validate — including a round-trip check that `save_run` output
 reloads identically. Adding a manifest without full keys fails the suite.
 
 ```bash
-for f in configs/*.json; do cargo run -q --example run -- $f || echo "FAIL $f"; done
+cargo run --example run -- configs/<name>.json
 ```

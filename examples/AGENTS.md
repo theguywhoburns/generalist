@@ -51,11 +51,13 @@ halfway still has usable numbers.
 
 ## Verification
 
+Default features only (see root AGENTS.md).
+
 ```bash
-cargo build --no-default-features --features ndarray --examples
-cargo build --no-default-features --features cuda     --examples
-cargo run   --example run -- configs/stage0-base.json     # smoke: all tools' shared path
+cargo build --example run     # smoke: the shared manifest-resolution path
+cargo run   --example run -- configs/stage0-base.json
 ```
 
-New tools are covered by `cargo test --all-targets` compiling cleanly on both
-feature sets; there is no separate harness for them.
+There is no separate harness for the tools; `cargo test` builds them, so they
+are covered by compiling. Add a tool-level check to `research/` if the tool
+makes a claim worth pinning.
