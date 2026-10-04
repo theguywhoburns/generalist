@@ -87,19 +87,92 @@ In-distribution byte accuracy is non-monotone (0.926 → 0.763 → 0.904 → 0.8
 with ±0.12 spread at two of the four sizes, so it is noise at n=3 rather than a
 size effect.
 
-## Single-pass, unresolved against seed spread
+**Demonstrations are not used as evidence, and on the memorized rung they actively harm the model.** `measured`, n=3 per point, effect ~8× the seed spread, consistent in every seed.
 
-**Depth helps and appears to saturate by 4.** `single-pass`. Byte accuracy at
-fixed depth 1/2/4/8: 0.201 / 0.406 / 0.444 / 0.405 held-out. The gap narrows
-with depth (−0.067 → −0.018), so extra compute buys transfer rather than
-memorization. Exact-match was 0.000 on both halves at *every* depth — this axis
-was invisible until byte accuracy existed.
+k = demos per instance, swept as a single value per point. Both rungs, 492,418
+params, 600 steps, auto-batch.
 
-Unresolved: within-seed spread at depth 8 is 0.265–0.495, which exceeds every
-between-depth difference. "Saturates by 4" is not established at n=3. No ACT
-point, so there is still no compute-matched ACT-vs-fixed comparison, which is
-the comparison the goal actually asks for.
+*Same-rule rung* (rule in weights):
 
+| k | held-out byte | in-dist byte | held-out exact |
+|---|---|---|---|
+| 0 | **0.909** | 0.993 | **0.59** |
+| 1 | **0.519** | 0.965 | **0.01** |
+| 2 | **0.448** | 0.812 | 0.00 |
+
+*New-rule rung* (rule absent from weights, demonstrated per instance):
+
+| k | held-out byte | in-dist byte |
+|---|---|---|
+| 0 | 0.322 | 0.881 |
+| 1 | 0.279 | 0.876 |
+| 2 | 0.287 | 0.850 |
+
+One demonstration **halves** held-out accuracy on the same-rule rung and
+collapses exact-match from 0.59 to 0.01, while in-distribution barely moves
+(0.993 → 0.965). So the loss is specific to unseen inputs, not to the task.
+
+**The dissociation is the result.** Where the rule is already in the weights,
+demos are interference: the model attends to them and does worse. Where the
+rule is absent, they supply nothing, because they are not being read. Those are
+opposite-looking symptoms of one fact — demonstrations are not treated as
+evidence about the rule.
+
+This also retires the "the model cannot induce a rule, maybe it needs more
+demonstrations" hypothesis: going from 0 to 8 demos is the largest manipulation
+of evidence quantity available and it moves the new-rule number by less than the
+seed spread.
+
+**Caveats.** k changes prompt length, so it also changes the length bucket and
+the auto-batch micro-batch. A length effect of that size is implausible as the
+sole cause, but it is not excluded. k=4 and k=8 were lost when the watchdog
+killed the run at ~20 minutes, so the curve is 0→2 rather than 0→8; the direction
+is established, the shape beyond k=2 is not. k=0 on the same-rule rung is close to
+unconditioned generation — there is no rule in the prompt at all — which is why
+its 0.909 is an upper bound on "apply the memorized map with nothing to
+distract" rather than a point of interest.
+
+
+---
+
+## Depth helps generalization and memorization about equally
+
+`single-pass`, n=3 (n=2 at depth 8), 492,418 params, same-rule rung. This is the
+closest thing to a direct answer to the goal's central question — does looping
+buy generalization without proportional parameters — and it is a partial one.
+
+| depth | in-dist byte | held-out byte | gap |
+|---|---|---|---|
+| 1 | 0.201 | 0.134 | −0.067 |
+| 2 | 0.406 | 0.324 | −0.082 |
+| 4 | 0.444 | 0.403 | −0.041 |
+| 8 | 0.474 | 0.433 | −0.041 |
+
+Looping improves held-out accuracy a lot — 0.134 → 0.433, **+0.30 absolute,
+3.2× relative**, the largest single effect measured anywhere in this repo. It
+improves in-distribution accuracy by essentially the same amount (+0.27), and the
+generalization gap is flat (−0.067 → −0.041).
+
+So at this scale looping is **not selectively buying generalization over
+memorization**; it makes the model better at both, roughly proportionally.
+
+Two refinements:
+
+- The 1→4 rise is real; 4→8 is **not resolved**. Per-seed held-out at depth 4
+  spans 0.340–0.440 and at depth 8 spans 0.380–0.485, so the +0.030 difference
+  sits inside the noise. Depth 1 is genuinely undertrained (in-dist 0.20), so
+  most of the headline effect is really "depth 1 does not learn this task".
+- In the regime where the model is actually learning (depth 2→8), held-out rises
+  faster than in-distribution: +0.109 vs +0.068, so the gap halves. That hints
+  looping favours transfer past the undertrained regime — a hypothesis at n=3
+  with 0.10–0.22 seed spread, not a result.
+
+**The confound that stops this answering the question.** Depth *is* compute:
+depth 8 does 8× the forward passes of depth 1. This therefore measures "more
+compute per token helps", not "reusing parameters helps". The control — a wider
+model at matched FLOPs, or any non-looped model at matched compute — **does not
+exist in this repo**. That is now the top open item, because until it exists
+this table cannot distinguish parameter reuse from arithmetic.
 **Depth does not differentiate the stages.** The profile read "uniform" or "one
 global head" at every depth on the fixed-rule rung. Combined with the order-
 augmentation result, this says depth and stage-role specialization are not
