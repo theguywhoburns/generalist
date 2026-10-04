@@ -1844,11 +1844,9 @@ pub fn format_sample(inst: &Instance, decoded: &str) -> String {
         "--- {} track={:?} k={} ---\n",
         inst.info.task, inst.info.track, inst.info.k
     ));
-    // No rule header is stored on the instance, so the demos are the only
-    // statement of the rule in view -- which is precisely what makes this
-    // diagnostic able to answer "did the model use the rule it was shown?".
-    // (The oracle *tasks* do print a header, but that text lives in the
-    // rendered prompt, not on `InstanceInfo`.)
+    if let Some(h) = &inst.info.oracle_header {
+        s.push_str(&format!("header : {h}\n"));
+    }
     for d in &inst.info.demos {
         s.push_str(&format!("demo   : {} -> {}\n", d.input, d.output));
     }

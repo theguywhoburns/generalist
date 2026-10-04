@@ -74,9 +74,16 @@ augmentation result, this says depth and stage-role specialization are not
 obviously the same axis — but the two were measured on different cells, so that
 is a hypothesis, not a finding.
 
+**Being told the rule explicitly does not help, and is worse.** `single-pass`,
+n=1, confounded — see the oracle section below. Held-out byte accuracy 0.297 on
+the induction rung vs 0.152 on the oracle rung, with mean length ratio
+collapsing 0.90 → 0.56 and some outputs empty. Recorded because it is a real
+measurement, but the comparison is confounded by prompt length and the drop
+cannot be attributed to anything yet.
+
 ---
 
-## Refuted, with the commit that holds the old numbers
+## Mechanism of the varying-rule failure: no mechanism, it is at chance
 
 | claim | why refuted | old numbers in |
 |---|---|---|
@@ -89,7 +96,50 @@ is a hypothesis, not a finding.
 
 ---
 
-## Mechanism of the varying-rule failure: no mechanism, it is at chance
+## The oracle rung does not help, and the comparison is confounded
+
+`single-pass`, n=1, `varying-rule-oracle.json`. The intent was the sharpest
+available test: `subst-fst-oracle` *states* the map in the prompt
+(`MAP a->c b->a c->b`), so oracle-minus-normal isolates rule **execution** from
+rule **induction**.
+
+It made things worse, and the comparison is confounded, so neither the size of
+the effect nor its direction can be read as a fact about induction:
+
+| | induction (`subst-fst`) | oracle (`subst-fst-oracle`) |
+|---|---|---|
+| held-out byte accuracy | 0.297 | 0.152 |
+| held-out mean length ratio | 0.90 | 0.56 |
+| length exact | 0.11 | 0.02 |
+
+**The confound, measured** (`examples/prompt_lens.rs`): the 20-char header is
+prepended to every prompt, which moves the length distribution hard.
+
+```
+              mean len   len<64    64..128
+subst-fst        64.6     54.5%     45.5%
+oracle           84.4     13.0%     86.8%
+```
+
+41% of instances cross out of the short bucket, doubling their padded T, which
+changes the B×T row trim and so the micro-batch the model sees. The oracle arm
+therefore differs from the induction arm in **two** ways — rule stated vs
+inferred, *and* longer context at a higher padded T — and the 0.145 drop in byte
+accuracy is consistent with either.
+
+**What is not confounded**: some oracle outputs are *empty* (one sampled
+instance emitted nothing for a 16-character target), and mean length ratio 0.56
+means the model is systematically truncating. Degenerate output of that kind is
+a worse failure than the induction arm's at-chance-but-well-formed output, and it
+did not need the length story to appear.
+
+**What would de-confound it**: a length-matched control — the same
+`subst-fst` with ~20 chars of inert filler prepended, so both arms share a
+length distribution and the header's *content* is isolated from its *length*.
+That needs a task variant, not a manifest, so it is queued below rather than
+claimed.
+
+---
 
 **Known** (`measured`, n=44 held-out / 32 in-distribution, 600 steps, k≥1 so the
 rule is demonstrated in context every time):
@@ -126,18 +176,29 @@ could show above it.---
 
 ## Open, in order of value
 
+0. **De-confound the oracle rung.** Add ~20 chars of inert filler to
+   `subst-fst`'s prompts so both arms share a length distribution, isolating the
+   header's content from its length. Needs a task variant, not a manifest.
+   Until then "execution vs induction" is untested rather than answered, and the
+   empty/short oracle outputs are unexplained.
 1. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
    in any form. Not implemented at all. This is what Goal questions 1 and 3
    require, and no amount of work on the two rungs above substitutes for it.
-2. **Size axis.** Completely unmeasured. The 492K model is the *only* point on
-   it, and it sits at the bottom. "Where on the ladder" is currently a statement
-   about one cell.
-3. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth.
-4. **Bracketing memorization onset.** The varying-rule held-out curve never
+2. **A rung whose output space beats chance.** Every ICL measurement so far sits
+   on a 3-symbol alphabet where chance is 0.333, so a weak competence cannot be
+   distinguished from guessing. A larger alphabet (or a task whose answer space
+   is combinatorial) would make partial competence visible, which is the
+   precondition for measuring a threshold at all.
+3. **Size axis.** Running — see `size-axis-varying-rule.json`. Steps are held at
+   600 across sizes, so the larger models are also the less-trained per
+   parameter; a null there means "not better at 600 steps".
+4. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth.
+5. **Bracketing memorization onset.** The varying-rule held-out curve never
    rises, so it cannot bracket onset either. Onset needs the held-out curve to
    rise then fall, and no rung tested so far does that.
-5. **Seeds.** n=3 cannot resolve anything below ~0.1. Every axis here has
+6. **Seeds.** n=3 cannot resolve anything below ~0.1. Every axis here has
    within-seed spread at or above its between-condition differences.
-6. **Positive control for rule induction.** Nothing shows the model *can* induce
-   a new map at this size and budget, so "at chance" names a failure without
-   isolating which sub-skill is missing.
+7. **`InstanceInfo` should carry the oracle header.** The sample dump shows
+   demos, query and target, but not the header — which is the only part of the
+   prompt that differs between the oracle and induction arms, so the diagnostic
+   cannot see the thing under test.

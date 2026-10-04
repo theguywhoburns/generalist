@@ -16,6 +16,17 @@ pub struct InstanceInfo {
     pub expected: String,
     pub corrupted_demo: bool,
     pub query_first: bool,
+    /// The rule's self-statement, when it has one (oracle tasks).
+    ///
+    /// Stored rather than left in the rendered prompt because the sample dump
+    /// reconstructs what the model saw from `InstanceInfo` — and on the oracle
+    /// rung the header is the *only* part of the prompt that differs from the
+    /// induction rung. Without it here, the diagnostic cannot see the thing
+    /// under test.
+    ///
+    /// `None` for every non-oracle task. Not scored, and not used for
+    /// verification: it is context that happens to be recoverable.
+    pub oracle_header: Option<String>,
 }
 
 impl InstanceInfo {
@@ -31,6 +42,7 @@ impl InstanceInfo {
             expected: String::new(),
             corrupted_demo: false,
             query_first: false,
+            oracle_header: None,
         }
     }
 }
@@ -187,8 +199,12 @@ impl DemoProtocol {
         let mut prompt = String::new();
         // Oracle header first (if the rule states itself explicitly): part
         // of the unscored prompt context, never of the target.
-        if let Some(header) = rule.oracle_header() {
-            prompt.push_str(&header);
+        // Kept on `InstanceInfo` as well, because the sample dump rebuilds what
+        // the model saw from the struct and the header is the only part of the
+        // oracle prompt that differs from the induction one.
+        let header = rule.oracle_header();
+        if let Some(h) = &header {
+            prompt.push_str(h);
             prompt.push('\n');
         }
         let push_pair = |s: &mut String, input: &str, output: Option<&str>| {
@@ -229,6 +245,7 @@ impl DemoProtocol {
                 expected: query.target,
                 corrupted_demo,
                 query_first,
+                oracle_header: header,
             },
         }
     }
