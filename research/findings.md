@@ -249,7 +249,83 @@ advantage even in principle.** Three independent measurements now agree:
 task" is.** Width wins here for a boring reason — the rung rewards
 parameters-as-storage and is indifferent to parameters-as-compute. Any claim that
 reuse cannot buy generalization has to survive a task whose answer requires
-several dependent steps and cannot be looked up. That task does not exist yet.
+several dependent steps and cannot be looked up.
+
+**Correction: I then wrote that such a task "does not exist yet." That was
+wrong.** Four of the eight registered rungs already require dependent multi-step
+computation — `dyck1`, `scan-tiny`, `parity`, `periodic` — and had never been
+used for an architecture comparison. The gap was never a missing task; it was a
+missing sweep. See the rung-monoculture section below.
+
+---
+
+## The architecture thread ran on exactly one rung, and it is the wrong one
+
+`measured` by inspection of all six manifests. Every depth-vs-width experiment in
+this repo — compute-matched pair, params-free pair, and all five frontier points —
+resolves to `pool instances: 320`, which is `per_cell 160 × 2 tracks`, which is
+`subst-fst-fixed` and nothing else.
+
+| arm | extends | pool | rung |
+|---|---|---|---|
+| `compute-matched` | `data-axis-constant-rule` | 320 | subst-fst-fixed |
+| `compute-matched-wide` | `compute-matched` | 320 | subst-fst-fixed |
+| `paramsfree-looping` | `base-492k` | 320 | subst-fst-fixed |
+| `paramsfree-wide` | `base-492k` | 320 | subst-fst-fixed |
+| `frontier-s02l08` … `frontier-s16l01` | `base-492k` | 320 | subst-fst-fixed |
+
+**Verified, because `jq '.experiment.tasks'` returns `null` for a manifest that
+inherits its `experiment` block rather than erroring.** The null reads like a
+missing setting and is not one; the loader resolves `extends` first. All six were
+confirmed through `cargo run --example run`, which prints the resolved pool. Note
+also that an absent or empty `tasks` key means **all eight builtin rungs**, so a
+manifest relying on inheritance from a base with no `tasks` is not a
+single-rung run at all. That is the default in `harness/experiment.rs` and it is
+a live trap.
+
+**Why this matters more than it looks.** `subst-fst-fixed` is the one rung in the
+registry whose answer is a lookup. Held-out accuracy there is "apply a map
+already in your weights", which needs **storage of the rule** and no arithmetic
+to apply it. Three separate measurements now agree that the rung is
+storage-limited:
+
+1. the k axis shows in-context demos are unused (0.909 → 0.519 given one demo),
+   so there is no sequential inference for extra loops to be spent on;
+2. depth 1 sits at in-distribution byte 0.201, **below** the 0.333 chance rate on
+   data it trained on — confidently applying a wrong map, a learning failure;
+3. the params-free looped arm shows a gap of −0.000, i.e. it memorized nothing
+   at all, in-distribution or out.
+
+**So the entire depth-vs-width thread has been measured on the one rung
+structurally incapable of distinguishing parameters-as-storage from
+parameters-as-compute.** Every conclusion above about reuse is real *as stated*
+and says nothing about depth.
+
+**The compute-requiring rungs already exist and were never swept:**
+`dyck1`, `scan-tiny`, `parity`, `periodic` all require dependent multi-step
+computation. The missing measurement was a missing sweep, not a missing task.
+
+`dyck1` is the best depth probe of the four, for three reasons:
+
+- **The answer cannot be looked up.** It is `")".repeat(open_depth(input))`, a
+  function of the input's stack state. No memorized rule map shortcuts it.
+- **The length gradient is steep.** Held-out prefixes are 8..28 characters
+  against demo prefixes of 2..10, so the sequential computation required grows
+  roughly 3–14× at test time. That gradient *is* the depth probe: a reuse arm
+  that adds passes should degrade more gracefully with length.
+- **Track B adds unseen depth.** Nesting depth 4..6 never appears in training, so
+  the held-out set contains genuinely unseen depth as well as unseen lengths.
+
+**Instrument warning on `dyck1`, recorded before running rather than after.** Its
+output alphabet is **unary** — `)` only. A model emitting only `)` scores byte
+accuracy 1.0 whenever the true depth is 1, so byte accuracy alone cannot separate
+a correct answer from a correct length by luck. The decisive readouts are
+`length_exact_rate` and `mean_len_ratio` with byte accuracy beside them, and the
+floor here is **not** 0.333: it is whatever a length-only guesser emitting the
+training-set modal depth scores. That floor has to be computed from the eval set
+before any arm is called above it. `scan-tiny` avoids the unary-output problem
+and is the better second choice, because Track B holds out `thrice` and novel
+`and` pairings — a compositional holdout already built in.
 
 ---
 
@@ -401,25 +477,28 @@ could show above it.---
 
 ## Open, in order of value
 
-0. **The representational-capacity decisive point.** Designed, not yet run.
+0. **Run the architecture comparison on `dyck1`.** Designed and preflighted, not
+   yet run: `research/experiments/arch-dyck1-looping.json` (4 stages × 8 loops,
+   919,172 params) against `arch-dyck1-wide.json` (32 stages × 1 loop, 919,648),
+   both 32 block-steps/token, pool 400 → ~40 held-out, `k_set [0]`. Same
+   compute-matched pair as on `subst-fst-fixed`, on the rung whose answer is a
+   function of the input's stack state and whose held-out prefixes are 3–14×
+   longer than its demos. **Every reuse conclusion so far is scoped to the one
+   rung that cannot test it, and this is the experiment that leaves that scope.**
+   Three outcomes count: the looped arm wins (reuse does work width cannot buy),
+   they tie (depth was arithmetic in disguise), or width wins again (the premise
+   is wrong on a rung that genuinely rewards computation). Read
+   `length_exact_rate` and `mean_len_ratio` first — the output alphabet is unary.
+1. **The representational-capacity decisive point, next on the same rung.**
    `4 stages × 4 loops` at `d_model = 256`, `ffn_hidden = 748` → 3,480,836
    params, against `16 stages × 1 loop` at `d_model = 128`, `ffn_hidden = 384`
    → 3,479,696. Matched parameters to 0.03%, matched block-steps to the step,
    `head_dim` matched, and `ffn:d` preserved at 2.92 vs 3.00 so it is not the
    degenerate-FFN corner the frontier's `16×1` endpoint falls into. The looped
    arm gets 4× the width per stage at identical storage and arithmetic. If
-   **representational capacity** is its deficit it should climb well above
-   0.335 toward the wide arm's 0.739; if **storage** is the deficit it will not
-   move. This is the cheapest experiment that discriminates the two.
-1. **A rung whose answer requires dependent multi-step computation.** This is the
-   only thing that can test depth's advantage at all, and it is the reason the
-   whole depth thread is currently inconclusive rather than settled. Held-out
-   accuracy on `subst-fst-fixed` is "apply a map already in your weights"; the
-   k-axis says demos are unused; depth 1 sits *below* chance in-distribution.
-   Three independent measurements say the rung rewards storage and is
-   indifferent to computation. Until a task exists where the answer needs
-   several dependent steps and cannot be looked up, "reuse does not buy
-   generalization" rests on a task that never tested it.
+   **representational capacity** is its deficit it should climb well above the
+   looped arm's number toward the wide arm's; if **storage** is the deficit it
+   will not move. Cheapest experiment that discriminates the two.
 2. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
    in any form. Not implemented at all. This is what a generalization claim needs
    and no amount of work on the two `subst-fst` rungs substitutes for it.

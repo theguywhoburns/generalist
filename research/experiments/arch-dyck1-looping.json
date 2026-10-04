@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "COMPUTE-MATCHED depth vs width on dyck1 -- the same pair as",
+    "compute-matched.json, on a rung that can actually test depth.",
+    "",
+    "MOTIVATION. Every architecture experiment in this repo has run on",
+    "subst-fst-fixed and nothing else (all six arms resolve to pool instances:",
+    "320 = per_cell 160 x 2 tracks). On that rung the held-out answer is 'apply a",
+    "map already in your weights', which needs STORAGE of the rule, not",
+    "arithmetic to apply it. Three measurements say the rung is",
+    "storage-limited: the k axis shows demos are unused (0.909 -> 0.519 given one",
+    "demo), depth 1 sits BELOW the 0.333 chance rate in-distribution (0.201), and",
+    "the params-free pair showed the looped arm memorizing nothing at all (gap",
+    "-0.000). So 'depth loses' is untested rather than established.",
+    "",
+    "dyck1 fixes that without writing a new task. The answer is",
+    "\")\".repeat(open_depth(input)) -- a function of the input's stack state, so",
+    "no memorized map can shortcut it. And the held-out prefixes are 8..28 chars",
+    "against demo prefixes of 2..10, so the sequential computation required grows",
+    "~3-14x at test time. That gradient is the depth probe.",
+    "",
+    "THE PAIR (from examples/param_match.rs, not by hand):",
+    "  looping : n_stages 4,  max_loops 8, d_model 128, ffn 384, head_dim 16",
+    "          = 32 block-steps/token, 919,172 params",
+    "  wide    : n_stages 32, max_loops 1, d_model  64, ffn  58, head_dim 16",
+    "          = 32 block-steps/token, 919,648 params  (+0.05%)",
+    "",
+    "Known uncontrolled difference, carried over from the subst-fst pair: head",
+    "COUNT is 8 vs 4 and cannot be matched at an 8x stage ratio. head_dim is",
+    "matched at 16. If the wide arm wins here too, rule out head count before",
+    "concluding anything about reuse.",
+    "",
+    "INSTRUMENT WARNING: the output alphabet is UNARY (')' only). A model",
+    "emitting only ')' scores byte accuracy 1.0 whenever true depth is 1, so byte",
+    "accuracy alone cannot separate a right answer from a right length by luck.",
+    "Decisive readouts are length_exact_rate and mean_len_ratio WITH byte accuracy",
+    "beside them. The floor here is NOT 0.333 -- it is what a length-only",
+    "guesser emitting the training-set modal depth scores. Compute it from the",
+    "eval set first; nothing in this manifest makes that automatic.",
+    "",
+    "eval_max_new stays at the inherited 16, which is sufficient: the target is",
+    "\")\".repeat(depth) and depth is capped at 3 (Track A) / 6 (Track B), so no",
+    "target exceeds 6 characters. The INPUT reaches 28 characters, which is the",
+    "length gradient being probed.",
+    "",
+    "auto_batch stays OFF so the arms differ only in reuse pattern.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/arch-dyck1-looping.json depth gpu 8 \\",
+    "    --seeds=0,1,2"
+  ],
+  "extends": "compute-matched.json",
+  "model": {
+    "d_model": 128,
+    "n_heads": 8,
+    "head_dim": 16,
+    "ffn_hidden": 384,
+    "n_stages": 4,
+    "max_loops": 8
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-arch-dyck1-looping"
+  },
+  "experiment": {
+    "tasks": [
+      "dyck1"
+    ],
+    "per_cell": 200,
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  }
+}
