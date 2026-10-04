@@ -8,18 +8,25 @@ Confidence key: **measured** = reproduced or n≥3 with per-seed recorded;
 
 ---
 
-## The ladder, and where we are on it
+## Where we are: memorization yes, generalization only in its weak sense
 
-| rung | status | evidence |
+| | status | evidence |
 |---|---|---|
-| memorization | **measured, strong** | in-distribution exact-match 1.000, byte 0.89–1.00, length ratio ~1.04 |
-| generalization (new inputs, same rule) | **measured, strong** on the constant-rule rung only | held-out byte 0.329 → 0.850 as data grows |
-| generalization (new *rule*) | **measured, absent** | held-out byte 0.18–0.27, below the 0.333 chance rate, flat over 18× data |
-| in-context learning | **measured, absent** | the varying-rule rung *is* the ICL test; it fails |
-| higher-order (infer/evaluate/apply) | **not measured** | no rung of the suite tests it |
+| memorization | **measured, strong** | in-distribution byte 0.90–0.93, `off_pair` 0.04–0.05 vs a 0.333 chance rate |
+| generalization — same rule, new inputs | **measured, present** | held-out byte 0.329 → 0.850 as data grows 16 → 288 |
+| generalization — new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on three independent instruments, flat over 18× data and across every size run so far |
 
-All of this is at 492,418 params. It says nothing about other sizes, which is
-exactly what the unmeasured size axis exists to determine.
+All at 492,418 params. The gap between rows 2 and 3 is the headline: transfer
+to new inputs under a trained rule is real and scales with data; transfer to an
+unseen rule is nothing, and "nothing" here means three instruments agreeing with
+chance rather than one accuracy number.
+
+**Scope note.** In-context learning and higher-order inference were dropped as
+*goals*. The varying-rule rung is exactly the ICL test, it is at chance at every
+size and data scale measured, and chasing it is chasing a rung this model does
+not reach. Its measurements stay below because they are results about
+generalization — the strong sense — and deleting a negative result because it
+stopped being the target would be exactly the error this file exists to prevent.
 
 ---
 
@@ -176,29 +183,37 @@ could show above it.---
 
 ## Open, in order of value
 
-0. **De-confound the oracle rung.** Add ~20 chars of inert filler to
-   `subst-fst`'s prompts so both arms share a length distribution, isolating the
-   header's content from its length. Needs a task variant, not a manifest.
-   Until then "execution vs induction" is untested rather than answered, and the
-   empty/short oracle outputs are unexplained.
+0. **Size axis, to completion.** Running — `size-axis-varying-rule.json`. Held-out
+   byte is flat at ~0.27 with `off_pair` at chance for d_model 128 and 192, so
+   capacity is not moving the new-rule number. Steps are fixed at 600 across
+   sizes, so larger models are also less-converged per parameter: a null here is
+   "not better at 600 steps", and the in-distribution column moving
+   (0.926 → 0.763 → 0.904) is that confound showing up rather than a size effect.
+   **This is the single measurement that turns every claim here from a
+   single-cell statement into a scaling claim.**
 1. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
-   in any form. Not implemented at all. This is what Goal questions 1 and 3
-   require, and no amount of work on the two rungs above substitutes for it.
-2. **A rung whose output space beats chance.** Every ICL measurement so far sits
-   on a 3-symbol alphabet where chance is 0.333, so a weak competence cannot be
-   distinguished from guessing. A larger alphabet (or a task whose answer space
-   is combinatorial) would make partial competence visible, which is the
-   precondition for measuring a threshold at all.
-3. **Size axis.** Running — see `size-axis-varying-rule.json`. Steps are held at
-   600 across sizes, so the larger models are also the less-trained per
-   parameter; a null there means "not better at 600 steps".
-4. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth.
-5. **Bracketing memorization onset.** The varying-rule held-out curve never
-   rises, so it cannot bracket onset either. Onset needs the held-out curve to
-   rise then fall, and no rung tested so far does that.
-6. **Seeds.** n=3 cannot resolve anything below ~0.1. Every axis here has
+   in any form. Not implemented at all. This is what a generalization claim
+   needs and no amount of work on the two `subst-fst` rungs substitutes for it.
+2. **A rung whose output space beats chance.** Every measurement on the
+   new-rule rung sits on a 3-symbol alphabet where chance is 0.333, so a weak
+   partial competence cannot be distinguished from guessing. A larger alphabet
+   would make partial competence visible — the precondition for locating any
+   threshold.
+3. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth,
+   and depth is the axis the goal cares about (does reuse buy generalization).
+4. **The same-rule generalization curve, characterized properly.** It is the one
+   place transfer exists (0.329 → 0.850), so it is where a scaling law is
+   actually measurable. Needs more than one model size and more seeds to be a
+   law rather than a curve.
+5. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
+   it cannot bracket onset. Onset needs the curve to rise then fall, and no rung
+   tested so far does that.
+6. **De-confound the oracle rung.** Add ~20 chars of inert filler to `subst-fst`
+   so both arms share a length distribution, isolating the header's content from
+   its length. Needs a task variant, not a manifest. Until then "execution vs
+   induction" is untested rather than answered.
+7. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
    within-seed spread at or above its between-condition differences.
-7. **`InstanceInfo` should carry the oracle header.** The sample dump shows
-   demos, query and target, but not the header — which is the only part of the
-   prompt that differs between the oracle and induction arms, so the diagnostic
-   cannot see the thing under test.
+8. **`InstanceInfo` should carry the oracle header.** The sample dump shows demos,
+   query and target but not the header — the only part of the prompt that
+   differs between the oracle and induction arms.

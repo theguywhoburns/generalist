@@ -1,68 +1,59 @@
 # Generalist
 
 A byte-level looped transformer (`src/model`) trained with a stock Muon/AdamW
-hybrid optimizer (`src/optim`), used to **construct a generalization scaling
-law**: how held-out generalization varies with model scale and with compute
-depth, and where memorization takes over.
+hybrid optimizer (`src/optim`), used to measure how **generalization** varies
+with model capacity and training-data scale, and whether looping a fixed
+parameter set buys generalization without proportionally more parameters.
 
 ## Research goal
 
-> To systematically investigate the relationship between model capacity,
-> training-data scale, and generalization ability, with particular emphasis on
-> how parameter reuse through recurrent or looped architectures alters the
-> balance between memorization and generalization.
+> To characterize how generalization changes as a function of model capacity and
+> training-data scale, and to determine whether iterative reuse of a fixed
+> parameter set — a looped architecture — buys generalization without a
+> proportional increase in trainable parameters.
 >
-> The study aims to characterize how generalization changes as a function of
-> parameter count and dataset size, determine whether iterative reuse of a fixed
-> parameter set can improve generalization without a proportional increase in
-> trainable parameters, and identify the regimes in which models begin to
-> exhibit increasingly higher-order forms of generalization.
->
-> A particular focus is placed on in-context learning as an observable
-> intermediate capability, in which a model infers a task, rule, or procedure
-> from contextual examples rather than relying solely on memorized
-> associations. Beyond this, the project seeks to investigate the emergence of
-> critical-thinking-like behavior as a still higher-order form of
-> generalization, characterized by the ability to infer, evaluate, and flexibly
-> apply underlying rules or strategies to novel situations rather than merely
-> reproducing learned patterns.
->
-> Ultimately, the research seeks to determine how model size, data scale, and
-> parameter reuse jointly influence the transition from memorization to
-> generalization, from generalization to in-context learning, and from
-> in-context learning toward higher-order reasoning capabilities, including
-> whether parameter reuse shifts the capacity threshold at which these
-> behaviors emerge.
+> Concretely: does held-out accuracy scale with parameter count and with data,
+> in what regime, and does looping shift that regime?
 
-The organizing idea is a **ladder**, and every measurement in this repo is a
-position on it:
+Two axes, one question. **Capacity** (`d_model`, `n_stages`) and **data**
+(`max_train_instances`) are the independent variables; **held-out accuracy** is
+the dependent one; **looping** is the intervention whose effect on the
+capacity axis is the thing worth knowing. The quantity of interest is the
+**generalization gap** — in-distribution accuracy minus held-out accuracy, both
+from the same run — because held-out accuracy alone cannot say whether a model
+is failing or merely not being helped by more data.
 
-```
-memorization  ->  generalization  ->  in-context learning  ->  higher-order
-  reproduce     apply to new        infer the rule from      infer, evaluate
-  what was      inputs              examples                and flexibly apply
-  trained       (same rule)          (rule not in weights)   a strategy
-```
+### What "generalization" means here, precisely
 
-with **parameter reuse** (looping a fixed weight set) as the intervention that
-may shift where on that ladder a given size lands. The load-bearing question is
-not "does it do ICL" but **whether reuse moves the threshold** — the size and
-data at which each rung is reached.
+Two distinguishable senses, and conflating them produced a wrong result in this
+repo before:
 
-**Where this repo actually is on the ladder.** Stated up front because it
-determines what every number means:
+- **Same rule, new inputs.** The latent rule is fixed and trained on; the eval
+  asks for it on strings the model has not seen. This is the rung where transfer
+  is measurable and non-zero here.
+- **New rule, new inputs.** The rule differs per instance, so the model must
+  acquire it rather than recall it. Measured, and **absent** at every size
+  tested.
+
+The second is the stronger sense and it is where the interesting negative lives.
+The first is where a scaling curve exists to be measured. Both are in scope.
+
+### Status
 
 | rung | status | evidence |
 |---|---|---|
-| memorization | **measured, strong** | in-distribution exact-match 1.000 with the rule demonstrated in context |
-| generalization | **measured, absent on the varying-rule rung** | held-out byte accuracy 0.18–0.27, below the 0.333 chance rate, flat over an 18× data range |
-| in-context learning | **measured, absent** | the varying-rule rung *is* the ICL test — the rule is demonstrated per instance and never in the weights — and it fails |
-| higher-order | **not measured, not reachable** | no rung of the suite tests infer-evaluate-apply; this is a gap, not a null result |
+| memorization | **measured, strong** | in-distribution byte accuracy 0.90–0.93, `off_pair` 0.04–0.05 against a 0.333 chance rate |
+| generalization, same rule | **measured, present** | held-out byte accuracy 0.329 → 0.850 as data grows 16 → 288, at fixed model |
+| generalization, new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on all three instruments, flat over an 18× data range and across every model size run so far |
 
-So the answer so far is that at 492K parameters the model is on rung 1 and does
-not reach rung 2 or 3. That is a statement about **this cell of (size × data ×
-reuse)**, not about the architecture in general, and it is exactly what the
-size axis — unmeasured — exists to test.
+The headline is the gap between rows 2 and 3. A 492K model transfers to new
+inputs under a trained rule, and transfers **nothing** to a rule it has not seen,
+where "nothing" is established on three independent measures rather than one
+accuracy number.
+
+**Every number here is at 492,418 parameters.** Statements about capacity are
+extrapolations from a single cell until the size axis lands, which is the
+largest open item.
 
 **Independent variables** (all manifest-reachable today):
 
@@ -110,12 +101,12 @@ should be compared against (see "Measuring the gap").
    each, that is the interesting finding; if not, depth is redundant with
    width and the cheaper axis wins.
 
-In-context learning is the **measure**, not the goal: accuracy-vs-k is one
-slice of the dependent variable, and the `subst-fst` family separates rule
-*execution* from rule *induction*. The distinction matters for the ladder above:
-`subst-fst-fixed` tests rung 2 with the rule already in the weights, while
-`subst-fst` at k ≥ 1 tests rung 3, because the rule exists nowhere in the model
-except the prompt.
+`subst-fst-fixed` and `subst-fst` are the two senses of generalization
+above, and they are separated by one flag. `subst-fst-fixed` holds one
+substitution map constant, so held-out accuracy measures applying a trained rule
+to new inputs. `subst-fst` redraws the map per instance, so it measures
+acquiring a rule that is nowhere in the weights. Accuracy-vs-k is one slice of
+the dependent variable, not a goal in itself.
 
 ## Setup
 
