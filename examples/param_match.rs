@@ -26,6 +26,25 @@
 //! ```text
 //! cargo run --example param_match -- 8 4
 //! ```
+//!
+//! # The stages<->width frontier
+//!
+//! A third argument pins the parameter target instead of deriving it from the
+//! looping arm's shape. That is what a frontier needs: holding parameters and
+//! block-steps fixed while `stages` varies *is* the tradeoff being measured, and
+//! the derived target moves with `stages`, so it can never hold parameters fixed.
+//!
+//! ```text
+//! for pair in 8/2 4/4 2/8; do   # max_loops/n_stages, all = 16 block-steps
+//!   cargo run --example param_match -- $loops $stages 492418
+//! done
+//! ```
+//!
+//! With a pinned target this also prints a `frontier` point with a freely
+//! searched `head_dim`, which is the config to put in the manifest for that
+//! point. Unlike the two-arm pair, a frontier point unavoidably varies head
+//! count: trading stages for width at fixed parameters *is* trading heads for
+//! stages. That is the axis, not a confound in it.
 
 use generalist::model::LoopedConfig;
 
@@ -106,13 +125,34 @@ fn main() {
     let loops: usize = a.first().and_then(|s| s.parse().ok()).unwrap_or(8);
     let stages: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
 
-    let target = count(stages, loops, 128, 2, 64, 384);
+    // An explicit third argument pins the parameter target instead of deriving
+    // it from the looping arm's own shape. That is what a stages<->width sweep
+    // needs: the derived target moves with `stages`, so it can never hold
+    // parameters fixed while the split varies.
+    let explicit: Option<usize> = a.get(2).and_then(|s| s.parse().ok());
+    let target = explicit.unwrap_or_else(|| count(stages, loops, 128, 2, 64, 384));
     println!("compute-matched pair: {stages} stages x {loops} loops");
-    println!("target parameter count from the looping arm's shape: {target}\n");
+    match explicit {
+        Some(t) => println!("target parameter count, pinned on the command line: {t}\n"),
+        None => println!("target parameter count from the looping arm's shape: {target}\n"),
+    }
 
     let (whd, wnh, wd, wffn, wdelta) = solve(stages * loops, 1, target, None);
-    println!("ARMS (search head_dim for the wide arm, then pin the looping arm to it):");
     let (lhd, lnh, ld, lffn, ldelta) = solve(stages, loops, target, Some(whd));
+    if explicit.is_some() {
+        // Free head_dim on the frontier point itself. Pinning it to the wide
+        // arm's head_dim would reintroduce the head-count confound the pinned
+        // mode exists to avoid.
+        let (fhd, fnh, fd, fffn, fdelta) = solve(stages, loops, target, None);
+        show("frontier", fhd, fnh, fd, fffn, stages, loops);
+        println!("\n  frontier point param total:");
+        println!(
+            "    {} ({fdelta:+}), target {target}, off by {:.2}%",
+            count(stages, loops, fd, fnh, fhd, fffn),
+            100.0 * (fdelta as f64 / target as f64)
+        );
+    }
+    println!("ARMS (search head_dim for the wide arm, then pin the looping arm to it):");
     show("looping", lhd, lnh, ld, lffn, stages, loops);
     show("wide", whd, wnh, wd, wffn, stages * loops, 1);
 

@@ -1,0 +1,64 @@
+{
+  "_comment": [
+    "FRONTIER point: 4 stages x 4 loops = 16 block-steps/token.",
+    "",
+    "The stages<->width tradeoff at FIXED parameters and FIXED compute. Every",
+    "point here is 492,418 parameters (this one 492,356, -0.01%) and 16 block-steps/token.",
+    "Only n_stages, max_loops, and the width that split forces differ. This is a",
+    "frontier rather than two arms: the compute-matched pair already answered",
+    "the two-endpoint question (width wins 2:1 at matched params AND compute),",
+    "and this traces the whole curve to show whether reuse wins anywhere in the",
+    "interior.",
+    "",
+    "Config from examples/param_match.rs with a pinned target:",
+    "  cargo run --example param_match -- 4 4 492418",
+    "",
+    "KNOWN LIMITATION, recorded before running: width does not fall",
+    "monotonically as stages rise (d_model 176 -> 128 -> 64 -> 64 -> 80). The",
+    "solver takes the smallest d_model that still reaches the target with a",
+    "legal ffn_hidden, so at high stage counts ffn_hidden collapses instead",
+    "(512 -> 213 -> 10). Stages is therefore confounded with how much of each",
+    "stage's budget goes to attention versus FFN. The three interior points",
+    "(s02/s04/s08) keep ffn substantial and are the interpretable subset.",
+    "Head count also varies (11 -> 8 -> 4 -> 4 -> 5) and unavoidably so:",
+    "trading stages for width at fixed parameters IS trading heads for stages.",
+    "That is the axis under test, not a nuisance.",
+    "",
+    "Rung: same-rule (subst-fst-fixed, k_set [0], k0_rate 1.0). This rung",
+    "rewards parameters-as-storage and is indifferent to",
+    "parameters-as-compute, so a win here would NOT establish that reuse buys",
+    "computation. A negative result IS informative about the reuse premise.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/frontier-s04l04.json depth gpu 4 \\",
+    "    --seeds=0,1,2"
+  ],
+  "extends": "base-492k.json",
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-frontier-s04l04",
+    "batch_size": 6,
+    "eval_every": 1000,
+    "indist_eval_per_cell": 12
+  },
+  "experiment": {
+    "per_cell": 160,
+    "tasks": [
+      "subst-fst-fixed"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  },
+  "model": {
+    "n_stages": 4,
+    "max_loops": 4,
+    "d_model": 64,
+    "n_heads": 4,
+    "head_dim": 16,
+    "ffn_hidden": 512
+  }
+}

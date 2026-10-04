@@ -179,7 +179,62 @@ scaling law is about.
 **Uncontrolled difference.** Head count is 8 vs 4 and cannot be matched — an 8×
 stage ratio forces an ~8× body-parameter ratio. `head_dim` (16) is matched. The
 effect is large enough that head count is unlikely to explain it, but it is not
-zero, and the params-free pair removes it entirely by holding `d_model` fixed.
+zero, and the params-free pair below removes it entirely.
+
+---
+
+## Params-free: 7.07× the parameters buys 2.2× the held-out accuracy
+
+`measured`, n=3 per arm, **identical** `d_model` (128), `n_heads` (2), `head_dim`
+(64), `ffn_hidden` (384), and identical compute (16 block-steps/token). Only
+`n_stages` and `max_loops` differ, so head geometry and activation memory are
+identical and the head-count confound above is gone. This is the design the goal's
+question actually asks for: match compute, let parameters differ.
+
+| arm | params | in-dist byte | held-out byte | in-dist exact | held-out exact |
+|---|---|---|---|---|---|
+| looping: 2 stages × 8 loops | 492,418 | 0.309, 0.278, 0.418 | **0.335** | 0.000 | **0.000** |
+| wide: 16 stages × 1 loop | 3,479,696 | 1.000, 0.985, 0.923 | **0.739** | 1.000, 0.833, 0.667 | **0.270** |
+
+Per-seed held-out byte: looping 0.305 / 0.298 / 0.401; wide 0.856 / 0.670 / 0.692.
+
+**The gaps are the real finding, and they have opposite signatures.**
+
+| arm | gap (in − out) | what that signature means |
+|---|---|---|
+| looping | −0.004, **+0.020**, −0.017 → mean **−0.000** | memorized nothing at all |
+| wide | −0.144, −0.314, −0.231 → mean −0.230 | memorized, then transferred 76% of it |
+
+The looping arm's gap is zero to within seed noise — and one seed is *positive*.
+It is not memorizing badly and transferring badly. It is not memorizing **at
+all**: in-distribution accuracy equals held-out accuracy because neither is above
+chance. The 0.100% relative transfer this arm shows (0.335 / 0.335 = 100%) is
+transfer of nothing and must not be read as reuse being good at transfer; the
+compute-matched section's 83%-vs-74% nuance was the same trap on a smaller scale.
+
+**So the diagnosis is storage, not compute.** At 492,418 parameters the 2-stage
+model can neither store the rule nor apply it to new inputs, and the reason is
+that four weight sets are being asked to serve sixteen transformations' worth of
+function. The 16-stage model at 3,479,696 parameters stores it nearly perfectly
+(in-dist exact 1.000 / 0.833 / 0.667) and transfers 76% of that to unseen inputs.
+
+**This is also the strongest evidence yet that the task family cannot test depth's
+advantage even in principle.** Three independent measurements now agree:
+
+1. On the same-rule rung the held-out answer is "apply a map already in your
+   weights" — that needs **storage of the rule**, not arithmetic to apply it.
+2. The k-axis result says the model **does not use in-context demonstrations at
+   all** (0.909 → 0.519 given one demo), so it is not performing sequential
+   inference and there is no computation for extra loops to be spent on.
+3. Depth 1 sits at in-distribution byte 0.201, **below the 0.333 chance rate**.
+   A memorizing model cannot fail below chance on data it trained on; it is
+   confidently applying a *wrong* map. A learning failure, not a compute failure.
+
+**Therefore: "depth loses" is not established, and "depth was never tested by this
+task" is.** Width wins here for a boring reason — the rung rewards
+parameters-as-storage and is indifferent to parameters-as-compute. Any claim that
+reuse cannot buy generalization has to survive a task whose answer requires
+several dependent steps and cannot be looked up. That task does not exist yet.
 
 ---
 
