@@ -56,6 +56,8 @@
     "eval_in_distribution": true,
     "indist_eval_per_cell": 24,
     "max_train_instances": 0,
+
+    "dump_samples": 0,
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
     "accum_steps": 1,

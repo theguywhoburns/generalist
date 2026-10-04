@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "ORDER-AUGMENTATION ARM A (ordered control).",
+    "",
+    "919,172 params at n_stages 4, on the full 6-task suite at k in",
+    "{0,1,2,3,5,8}, 576 held-out instances per eval pass. This is the ordered",
+    "half of the pair that decides whether the role diagnostic's premise holds.",
+    "",
+    "Run both arms together so the isolation check runs:",
+    "  cargo run --no-default-features --features cuda --example arm_compare --",
+    "    research/experiments/arm-ordered.json \\",
+    "    research/experiments/arm-orderaug.json gpu 0 1 2",
+    "",
+    "arm_compare refuses to compare arms differing by more than",
+    "stop.act.shuffle_train. Do not work around that refusal; a comparison that",
+    "isolates nothing looks exactly as clean as one that does.",
+    "",
+    "eval_max_new is 16, not 64: the targets here are 8-20 chars and 64 only",
+    "buys decode time. eval_every is effectively off because the final eval is",
+    "the measurement.",
+    "",
+    "AUTO-BATCH IS ON for throughput. It preserves the effective batch via",
+    "accumulation compensation, so the arms stay comparable with each other, but",
+    "neither is comparable with a fixed-batch run."
+  ],
+  "extends": "$configs_dir/stage0-4block.json",
+  "model": { "d_model": 128, "n_heads": 2, "ffn_hidden": 384, "n_stages": 4 },
+  "train": {
+    "steps": 500,
+    "log_every": 250,
+    "eval_every": 100000,
+    "eval_max_new": 16,
+    "eval_holdout": 0.25,
+    "indist_eval_per_cell": 12,
+    "batch_size": 4,
+    "auto_batch": true,
+    "ckpt_dir": "$curdir/checkpoints-arm-ordered"
+  },
+  "experiment": { "per_cell": 200 }
+}

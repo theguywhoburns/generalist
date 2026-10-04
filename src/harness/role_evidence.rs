@@ -252,6 +252,8 @@ mod metric_tests {
             byte_hits: usize::from(correct),
             byte_total: 1,
             echoed_query: false,
+            len_out: 1,
+            len_target: 1,
             copied: false,
             steps_used: 4,
             mean_halt: block_halt.iter().sum::<f32>() / block_halt.len() as f32,

@@ -131,7 +131,18 @@ pub struct TrainConfig {
     /// slowest part of a run.
     #[config(default = true)]
     pub eval_in_distribution: bool,
-    /// Instances sampled from the training pool for that diagnostic.
+    /// How many decoded eval samples to write to `<ckpt_dir>/samples.txt`, as
+    /// query input / expected / decoded triples. `0` = off.
+    ///
+    /// Purely a diagnostic, and off by default because it writes instance text to
+    /// disk. It exists because aggregate metrics could not identify a failure: on
+    /// the varying-rule rung held-out byte accuracy sat *below* the chance rate,
+    /// which says "systematically wrong" but not in what way. `copy_rate` and
+    /// `query_echo_rate` both came back 0.000, ruling out the two obvious policies,
+    /// and the remaining candidates are distinguishable only by looking at what
+    /// the model actually emits.
+    #[config(default = 0)]
+    pub dump_samples: usize,
     #[config(default = 48)]
     pub indist_eval_per_cell: usize,
     /// Cap on training instances, applied AFTER the holdout split. `0` = no
@@ -242,6 +253,16 @@ pub struct Trainer<B: AutodiffBackend> {
     device: B::Device,
     /// Current scheduled-sampling depth (see `free_schedule`).
     pub free_k: usize,
+    /// Rendered decoded samples from evals this run performed, capped at
+    /// `dump_samples`. Emptied by the caller after writing.
+    ///
+    /// Held here because the decoded string is a local inside
+    /// `evaluate_batched_inner`; returning it per-record would put multi-byte
+    /// model text on every `Record` for every eval, which is the wrong trade
+    /// for a diagnostic most runs never ask for.
+    pub sample_log: Vec<String>,
+    /// Cap on [`Trainer::sample_log`], from `train.dump_samples`. 0 = off.
+    pub dump_samples: usize,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
@@ -284,6 +305,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             order_counter: 0,
             device: device.clone(),
             free_k: 0,
+            sample_log: Vec::new(),
+            dump_samples: train.dump_samples,
         }
     }
 
@@ -460,7 +483,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// by `backward()` — un-backwarded eval graphs pile up (~80MB/instance
     /// at 1M scale) and OOM both RAM and VRAM.
     pub fn evaluate(
-        &self,
+        &mut self,
         instances: &[Instance],
         max_new: usize,
         order: Option<&[usize]>,
@@ -474,7 +497,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// accuracy/copy are exact; steps/halt use batch means (cells average
     /// them anyway).
     pub fn evaluate_batched(
-        &self,
+        &mut self,
         instances: &[Instance],
         max_new: usize,
         chunk: usize,
@@ -492,7 +515,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// between to ping. A slow-but-progressing eval is indistinguishable from
     /// a hang to a watchdog that only hears from the training loop.
     pub fn evaluate_watched(
-        &self,
+        &mut self,
         instances: &[Instance],
         max_new: usize,
         order: Option<&[usize]>,
@@ -502,7 +525,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     fn evaluate_batched_inner(
-        &self,
+        &mut self,
         instances: &[Instance],
         max_new: usize,
         chunk: usize,
@@ -541,7 +564,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     fn decode_chunk(
-        &self,
+        &mut self,
         model: &LoopedTransformer<B::InnerBackend>,
         group: &[Instance],
         max_new: usize,
@@ -666,7 +689,12 @@ impl<B: AutodiffBackend> Trainer<B> {
                 }
             }
         }
-        group
+        // Drained out of the closure so the sample buffer can be filled without a
+        // mutable borrow of `self` inside a `&self` iterator chain. Taken by
+        // value with `mem::take` so the closure owns the sink.
+        let mut sample_sink = std::mem::take(&mut self.sample_log);
+        let sample_cap = self.dump_samples;
+        let records: Vec<MetricRecord> = group
             .iter()
             .zip(out_bytes.iter())
             .map(|(inst, gbytes)| {
@@ -680,6 +708,11 @@ impl<B: AutodiffBackend> Trainer<B> {
                     .zip(expected.chars())
                     .filter(|(a, b)| a == b)
                     .count();
+                // Only the first group of the first eval pass, so a long run
+                // does not accumulate one sample per instance for every eval.
+                if sample_sink.len() < sample_cap {
+                    sample_sink.push(format_sample(inst, &text));
+                }
                 MetricRecord {
                     task: inst.info.task.to_string(),
                     track: inst.info.track,
@@ -688,6 +721,8 @@ impl<B: AutodiffBackend> Trainer<B> {
                     byte_hits,
                     byte_total: expected.chars().count(),
                     echoed_query: text == inst.info.query_input,
+                    len_out: text.chars().count(),
+                    len_target: expected.chars().count(),
                     copied: inst.info.demos.iter().any(|d| d.output == text),
                     steps_used: steps_sum / n_decode.max(1),
                     mean_halt: halt_sum / n_decode.max(1) as f32,
@@ -698,7 +733,13 @@ impl<B: AutodiffBackend> Trainer<B> {
                     seed: self.seed,
                 }
             })
-            .collect()
+            .collect();
+        // Put the sink back so the caller can write it out, keeping whatever
+        // earlier evals of this run already collected.
+        if sample_sink.len() > self.sample_log.len() {
+            self.sample_log = sample_sink;
+        }
+        records
     }
 
     pub fn save_checkpoint(&self, path: &Path) {
@@ -840,7 +881,7 @@ fn random_weight_control<B: AutodiffBackend>(
 ) -> (f64, f64) {
     // Distinct seed so the control is uncorrelated with the trained model.
     B::seed(device, run.train.seed ^ 0xA5A5_5A5A_DEAD_BEEF);
-    let control = Trainer::<B>::new(
+    let mut control = Trainer::<B>::new(
         &run.model, &run.optim, run.stop, &run.train, device,
         None, // no checkpoint: untrained weights, by construction
     );
@@ -1463,8 +1504,8 @@ pub fn run_stage<B: AutodiffBackend>(
     // the trained gap in excess of that control floor is evidence of learned
     // role specialization — see `harness::shuffle_control`.
     let n_stages = trainer.model.stages.len();
-    let mut trained_order: Option<(f64, f64)> = None;
-    let mut trained_shuffled: Option<(f64, f64)> = None;
+    let mut trained_order: Option<(f64, f64, (f64, f64))> = None;
+    let mut trained_shuffled: Option<(f64, f64, (f64, f64))> = None;
     for (label, order) in final_eval_passes(n_stages, run.train.shuffle_eval, "trained") {
         let records = trainer.evaluate_watched(
             &final_set,
@@ -1534,11 +1575,13 @@ pub fn run_stage<B: AutodiffBackend>(
                 ),
             };
             println!(
-                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} echo {:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
+                "  eval [{label}-pool]: acc {:.2} byte {:.3} copy {:.2} echo {:.2} len {:.2}/{:.2} halt {:.2} bh [{}] sh [{}] std [{}] cor [{}] (n={})",
                 s.accuracy,
                 s.byte_accuracy,
                 s.copy_rate,
                 s.query_echo_rate,
+                s.length_exact_rate,
+                s.mean_len_ratio,
                 s.mean_halt,
                 fmt2(&s.mean_block_halt),
                 fmt2(&s.share_block_halt),
@@ -1573,10 +1616,23 @@ pub fn run_stage<B: AutodiffBackend>(
             // consumes a run.jsonl after the fact needs this line to exist.
             log.push_str(&format!(
                 "{{\"eval\":\"{label}-pool\",\"accuracy\":{:.6},\"byte_accuracy\":{:.6},\
-                 \"copy_rate\":{:.6},\"query_echo_rate\":{:.6},\"mean_halt\":{:.6},\"n\":{}}}\n",
-                s.accuracy, pool_byte_acc, s.copy_rate, s.query_echo_rate, s.mean_halt, s.n,
+                 \"copy_rate\":{:.6},\"query_echo_rate\":{:.6},\
+                 \"length_exact_rate\":{:.6},\"mean_len_ratio\":{:.6},\
+                 \"mean_halt\":{:.6},\"n\":{}}}\n",
+                s.accuracy,
+                pool_byte_acc,
+                s.copy_rate,
+                s.query_echo_rate,
+                s.length_exact_rate,
+                s.mean_len_ratio,
+                s.mean_halt,
+                s.n,
             ));
-            (s.accuracy, pool_byte_acc)
+            (
+                s.accuracy,
+                pool_byte_acc,
+                (s.length_exact_rate, s.mean_len_ratio),
+            )
         };
         if order.is_none() {
             trained_order = Some(pool_acc);
@@ -1597,15 +1653,23 @@ pub fn run_stage<B: AutodiffBackend>(
             watchdog.ping_step(run.train.steps)
         });
         let ind = crate::harness::summarize(&records);
-        let (held_acc, held_byte) = trained_order.unwrap_or((0.0, 0.0));
+        let (held_acc, held_byte, held_len) = trained_order.unwrap_or((0.0, 0.0, (0.0, 0.0)));
         let gap = held_acc - ind.accuracy;
         let byte_gap = held_byte - ind.byte_accuracy;
+        // Termination is now carried on both halves of the memorization record
+        // too. Byte accuracy cannot see a length error, so a comparison that
+        // reports only bytes cannot tell "wrong symbols" from "right symbols,
+        // wrong count", and those have different causes.
+        let held_len_exact = held_len.0;
+        let held_len_ratio = held_len.1;
         println!(
-            "  memorization: train-pool acc {:.3} byte {:.3} | held-out acc {:.3} byte {:.3} | gap {:+.3} / {:+.3} (n_train={} n_held={})",
+            "  memorization: train-pool acc {:.3} byte {:.3} len {:.2} | held-out acc {:.3} byte {:.3} len {:.2} | gap {:+.3} / {:+.3} (n_train={} n_held={})",
             ind.accuracy,
             ind.byte_accuracy,
+            ind.mean_len_ratio,
             held_acc,
             held_byte,
+            held_len_ratio,
             gap,
             byte_gap,
             ind.n,
@@ -1614,21 +1678,46 @@ pub fn run_stage<B: AutodiffBackend>(
         log.push_str(&format!(
             "{{\"eval\":\"memorization\",\"indist_accuracy\":{:.6},\"heldout_accuracy\":{:.6},\
              \"gap\":{:.6},\"indist_byte_accuracy\":{:.6},\"heldout_byte_accuracy\":{:.6},\
-             \"byte_gap\":{:.6},\"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
+             \"byte_gap\":{:.6},\"indist_length_exact\":{:.6},\"heldout_length_exact\":{:.6},\
+             \"indist_len_ratio\":{:.6},\"heldout_len_ratio\":{:.6},\
+             \"n_indist\":{},\"n_heldout\":{},\"seed\":{}}}\n",
             ind.accuracy,
             held_acc,
             gap,
             ind.byte_accuracy,
             held_byte,
             byte_gap,
+            ind.length_exact_rate,
+            held_len_exact,
+            ind.mean_len_ratio,
+            held_len_ratio,
             ind.n,
             final_set.len(),
             run.train.seed
         ));
     }
 
+    // Write the decoded-sample diagnostic, if it was asked for. Done after the
+    // final eval and before anything that can panic, so a run that fails
+    // downstream still leaves the samples on disk.
+    if run.train.dump_samples > 0 && !trainer.sample_log.is_empty() {
+        let path = std::path::Path::new(&run.train.ckpt_dir).join("samples.txt");
+        let body = trainer.sample_log.join("\n");
+        match std::fs::write(&path, body) {
+            Ok(()) => println!(
+                "wrote {} decoded samples to {}",
+                trainer.sample_log.len(),
+                path.display()
+            ),
+            Err(e) => eprintln!(
+                "warning: could not write {}: {e} (metrics above are unaffected)",
+                path.display()
+            ),
+        }
+    }
+
     // The role diagnostic, read against its floor.
-    if let (Some((t, _)), Some((ts, _))) = (trained_order, trained_shuffled) {
+    if let (Some((t, _, _)), Some((ts, _, _))) = (trained_order, trained_shuffled) {
         let (c, cs) = random_weight_control::<B>(run, &final_set, device, &mut log, &|| {
             watchdog.ping_step(run.train.steps);
         });
@@ -1699,6 +1788,59 @@ fn int_vec(data: &TensorData) -> Vec<i64> {
             .map(|v| *v as i64)
             .collect(),
         d => panic!("unexpected int dtype {d:?}"),
+    }
+}
+
+/// Render one decoded eval instance as a readable triple, for the sample dump.
+///
+/// Shows the demos' own input→output pairs alongside the query, because the
+/// question a sample dump exists to answer is "did the model use the rule it
+/// was shown?", and that is only answerable with both sides of the prompt in
+/// view. The oracle header is included when present because it states the rule
+/// outright.
+pub fn format_sample(inst: &Instance, decoded: &str) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "--- {} track={:?} k={} ---\n",
+        inst.info.task, inst.info.track, inst.info.k
+    ));
+    // No rule header is stored on the instance, so the demos are the only
+    // statement of the rule in view -- which is precisely what makes this
+    // diagnostic able to answer "did the model use the rule it was shown?".
+    // (The oracle *tasks* do print a header, but that text lives in the
+    // rendered prompt, not on `InstanceInfo`.)
+    for d in &inst.info.demos {
+        s.push_str(&format!("demo   : {} -> {}\n", d.input, d.output));
+    }
+    s.push_str(&format!("query  : {}\n", inst.info.query_input));
+    s.push_str(&format!("expect : {}\n", inst.info.expected));
+    s.push_str(&format!("got    : {decoded}\n"));
+    s
+}
+
+/// Write up to `n` decoded eval samples to `<ckpt_dir>/samples.txt`.
+///
+/// Best-effort: a failed write is reported and swallowed, because a diagnostic
+/// that cannot be written must not take down a run whose metrics are already
+/// valid. No-op when `n` is 0.
+pub fn dump_eval_samples(instances: &[Instance], decoded: &[String], dir: &str, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let path = std::path::Path::new(dir).join("samples.txt");
+    let mut out = String::new();
+    for (inst, text) in instances.iter().zip(decoded.iter()).take(n) {
+        out.push_str(&format_sample(inst, text));
+        out.push('\n');
+    }
+    if let Err(e) = std::fs::write(&path, &out) {
+        eprintln!("warning: could not write {}: {e}", path.display());
+    } else {
+        println!(
+            "  wrote {} decoded samples to {}",
+            n.min(instances.len()),
+            path.display()
+        );
     }
 }
 
@@ -2241,7 +2383,7 @@ mod tests {
         };
         let pool = generate(&exp, &registry);
         let eval: Vec<Instance> = pool.iter().take(8).cloned().collect();
-        let trainer = tiny_trainer();
+        let mut trainer = tiny_trainer();
 
         // Chunk 1: each row decodes in its own forward.
         let one = trainer.evaluate_batched(&eval, 12, 1, None);
@@ -2276,7 +2418,7 @@ mod tests {
         // Sort by target length so the chunk spans a wide range of finish times.
         let mut eval: Vec<Instance> = pool.iter().take(8).cloned().collect();
         eval.sort_by_key(|i| i.target.len());
-        let trainer = tiny_trainer();
+        let mut trainer = tiny_trainer();
         let one = trainer.evaluate_batched(&eval, 6, 1, None);
         let all = trainer.evaluate_batched(&eval, 6, 8, None);
         for (a, b) in one.iter().zip(all.iter()) {

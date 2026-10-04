@@ -34,6 +34,16 @@ pub struct Record {
     /// precisely instead of leaving it to be guessed at from a chance-rate
     /// comparison.
     pub echoed_query: bool,
+    /// Decoded output length in characters, and the target's.
+    ///
+    /// Recorded separately because `byte_accuracy` cannot see length errors:
+    /// it zips output against target and truncates to the shorter, so an
+    /// output that is a correct prefix and then stops early scores as
+    /// proportionally right. On the varying-rule rung 11 of 12 sampled outputs
+    /// had the wrong length, which is a termination failure being reported as
+    /// a partial-credit rule-application failure.
+    pub len_out: usize,
+    pub len_target: usize,
     /// Model output appeared verbatim among demo outputs.
     pub copied: bool,
     pub steps_used: usize,
@@ -56,7 +66,7 @@ impl Record {
         };
         let bh: Vec<String> = self.block_halt.iter().map(|v| format!("{v:.3}")).collect();
         format!(
-            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"byte_hits\":{},\"byte_total\":{},\"copied\":{},\"echoed_query\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
+            "{{\"task\":\"{}\",\"track\":\"{track}\",\"k\":{},\"correct\":{},\"byte_hits\":{},\"byte_total\":{},\"copied\":{},\"echoed_query\":{},\"len_out\":{},\"len_target\":{},\"steps\":{},\"halt\":{:.3},\"bh\":[{}],\"seed\":{}}}",
             self.task,
             self.k,
             self.correct,
@@ -64,6 +74,8 @@ impl Record {
             self.byte_total,
             self.copied,
             self.echoed_query,
+            self.len_out,
+            self.len_target,
             self.steps_used,
             self.mean_halt,
             bh.join(","),
@@ -83,6 +95,21 @@ pub struct Summary {
     /// distinguishes a model that ignores the rule from one that never learned
     /// to read it.
     pub query_echo_rate: f64,
+    /// Fraction of instances whose decoded length matched the target's.
+    ///
+    /// The termination read, kept apart from accuracy for the reason
+    /// [`Record::len_out`] gives: a model can score partial byte credit while
+    /// emitting the wrong number of symbols, and those are different failures
+    /// with different fixes.
+    pub length_exact_rate: f64,
+    /// Mean of `len_out / len_target` over instances. 1.0 = right length on
+    /// average; below 1.0 means the model truncates, above that it overruns.
+    ///
+    /// Reported as a signed-mean quantity because the two failure directions
+    /// cancel in an absolute deviation: a model that emits half-length outputs
+    /// and one that emits double-length ones have the same mean absolute error
+    /// and opposite faults.
+    pub mean_len_ratio: f64,
     /// Micro-averaged over all target bytes: `sum(hits) / sum(total)`.
     ///
     /// Micro rather than per-instance mean because instance lengths vary, and
@@ -254,6 +281,23 @@ pub fn summarize(records: &[Record]) -> Summary {
         n: records.len(),
         accuracy: records.iter().filter(|r| r.correct).count() as f64 / n,
         query_echo_rate: records.iter().filter(|r| r.echoed_query).count() as f64 / n,
+        length_exact_rate: records
+            .iter()
+            .filter(|r| r.len_target > 0 && r.len_out == r.len_target)
+            .count() as f64
+            / n,
+        mean_len_ratio: {
+            let ratios: Vec<f64> = records
+                .iter()
+                .filter(|r| r.len_target > 0)
+                .map(|r| r.len_out as f64 / r.len_target as f64)
+                .collect();
+            if ratios.is_empty() {
+                0.0
+            } else {
+                ratios.iter().sum::<f64>() / ratios.len() as f64
+            }
+        },
         byte_accuracy: {
             let hits: usize = records.iter().map(|r| r.byte_hits).sum();
             let total: usize = records.iter().map(|r| r.byte_total).sum();
@@ -330,12 +374,59 @@ mod tests {
             byte_hits: usize::from(correct),
             byte_total: 1,
             echoed_query: false,
+            len_out: 1,
+            len_target: 1,
             copied,
             steps_used: 6,
             mean_halt: 4.5,
             block_halt: vec![1.0, 1.5, 1.0, 1.0],
             seed: 0,
         }
+    }
+
+    /// `byte_accuracy` cannot see a length error, and that trap has already cost
+    /// one wrong conclusion.
+    ///
+    /// It zips output against target and truncates to the shorter, so a correct
+    /// prefix followed by early stopping scores as proportionally right. On the
+    /// varying-rule rung 11 of 12 decoded outputs had the wrong length while
+    /// byte accuracy read ~0.30 — "systematically wrong at the rule", when the
+    /// actual fault was termination.
+    ///
+    /// `length_exact_rate` and `mean_len_ratio` exist so that failure is visible
+    /// as its own number. The ratio is signed-mean on purpose: truncating and
+    /// overrunning have opposite faults and cancel in an absolute deviation.
+    #[test]
+    fn byte_accuracy_hides_length_errors_and_the_length_metrics_do_not() {
+        // Perfect prefix, then stops 6 characters early.
+        let mut r = rec(false, false);
+        r.byte_hits = 8;
+        r.byte_total = 14;
+        r.len_out = 8;
+        r.len_target = 14;
+        let s = summarize(&[r]);
+        assert!(
+            s.byte_accuracy > 0.5,
+            "the trap: byte accuracy reads {} as a pass",
+            s.byte_accuracy
+        );
+        assert_eq!(s.length_exact_rate, 0.0, "but the length is plainly wrong");
+        assert!((s.mean_len_ratio - 8.0 / 14.0).abs() < 1e-9);
+        assert!(s.mean_len_ratio < 1.0, "truncation reads as under-length");
+
+        // The mirror case must read as over-length, not cancel out.
+        let mut over = rec(false, false);
+        over.byte_hits = 14;
+        over.byte_total = 14;
+        over.len_out = 20;
+        over.len_target = 14;
+        let o = summarize(&[over]);
+        assert_eq!(o.length_exact_rate, 0.0);
+        assert!(o.mean_len_ratio > 1.0, "overrun reads as over-length");
+        assert!(
+            (o.mean_len_ratio - 20.0 / 14.0).abs() < 1e-9,
+            "opposite faults must not cancel in the signed mean"
+        );
     }
 
     /// Byte accuracy is micro-averaged over bytes, and the two averaging

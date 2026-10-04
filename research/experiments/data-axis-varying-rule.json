@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "DATA AXIS, varying rule. The rung where the rule is genuinely unseen, and",
+    "therefore the closest thing in this repo to an in-context-learning test.",
+    "",
+    "subst-fst redraws the substitution map PER INSTANCE (pinned by a test in",
+    "src/tasks/fst.rs, so the two rungs cannot silently converge). k_set is",
+    "[1,2,3,5] with k0_rate 0, so the map is DEMONSTRATED in the prompt every",
+    "time and the model has to induce it rather than recall it.",
+    "",
+    "k_set matters enormously here and has already caused one wrong result: a",
+    "first pass inherited k_set [0] from the constant-rule base, measured the",
+    "same numbers, and was reported as 'at chance on unseen rules'. With no",
+    "demonstration there is nothing in the prompt to induce a map FROM, so that",
+    "configuration could not have supported the claim. Never report a rule-",
+    "induction result without checking k_set.",
+    "",
+    "Run:",
+    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "    research/experiments/data-axis-varying-rule.json data gpu \\",
+    "    16 48 128 288 --seeds=0,1,2"
+  ],
+  "extends": "base-492k.json",
+  "train": {
+    "ckpt_dir": "$curdir/checkpoints-varying-rule",
+    "shuffle_eval": true
+  },
+  "experiment": {
+    "tasks": ["subst-fst"],
+    "protocol": { "k_set": [1, 2, 3, 5], "k0_rate": 0.0 }
+  }
+}

@@ -206,6 +206,10 @@ pub(crate) fn resolve(
     if let Some(map) = doc.as_object_mut() {
         map.remove(COMMENT_KEY);
     }
+    // Path variables are expanded PER FILE, before the parent is read, so
+    // `$curdir` means the directory of the manifest that mentions it rather
+    // than the directory of whichever file happened to be resolved first.
+    expand_path_vars(&mut doc, &root)?;
     if stack.contains(&root) {
         let mut chain = stack.clone();
         chain.push(root.clone());
@@ -252,6 +256,143 @@ fn resolve_relative(from: &Path, spec: &str) -> PathBuf {
     } else {
         from.parent().unwrap_or(Path::new(".")).join(p)
     }
+}
+
+/// Directory holding the versioned experiment manifests.
+pub const EXPERIMENT_DIR: &str = "research/experiments";
+
+/// Path variables available in every manifest, as `$name` or `${name}`.
+///
+/// These exist so a manifest under `research/experiments/` can refer to its own
+/// location, to the shipped configs, and to the repo root without embedding an
+/// absolute path that breaks the moment the repo is cloned somewhere else.
+fn path_vars(file: &Path) -> Vec<(&'static str, PathBuf)> {
+    let curdir = file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        ("curdir", curdir.clone()),
+        (
+            "parent_dir",
+            curdir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(".")),
+        ),
+        ("repo_root", repo_root.clone()),
+        ("experiment_dir", repo_root.join(EXPERIMENT_DIR)),
+        ("configs_dir", repo_root.join("configs")),
+    ]
+}
+
+/// Replace `$name` / `${name}` in every string of `doc`.
+///
+/// An unknown variable is a **hard error**, not a passthrough. A typo'd
+/// `$experimnt_dir` would otherwise survive as a literal path, produce a
+/// confusing "no such file" much later, and — worse — could name a real
+/// directory by accident and load the wrong file.
+fn expand_path_vars(doc: &mut Value, file: &Path) -> Result<(), ConfigError> {
+    if !doc.to_string().contains('$') {
+        return Ok(());
+    }
+    let vars = path_vars(file);
+    let mut problems = Vec::new();
+    walk_strings(doc, &vars, &mut problems);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid {
+            path: file.to_path_buf(),
+            problems,
+        })
+    }
+}
+
+fn walk_strings(v: &mut Value, vars: &[(&'static str, PathBuf)], problems: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            if let Some(rep) = substitute(s, vars) {
+                match rep {
+                    Ok(text) => *s = text,
+                    Err(name) => problems.push(format!(
+                        "unknown path variable `${name}`; available: {}",
+                        vars.iter()
+                            .map(|(n, _)| format!("${n}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| walk_strings(x, vars, problems)),
+        Value::Object(m) => m.values_mut().for_each(|x| walk_strings(x, vars, problems)),
+        _ => {}
+    }
+}
+
+/// Substitute path variables in one string, or `None` when there is nothing to
+/// do.
+fn substitute(s: &str, vars: &[(&'static str, PathBuf)]) -> Option<Result<String, String>> {
+    // `$` that is not a variable reference is left alone, so a literal dollar
+    // in a prompt or a comment survives.
+    let mut out = String::with_capacity(s.len());
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut touched = false;
+    while i < bytes.len() {
+        if bytes[i] != '$' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let braced = bytes.get(j) == Some(&'{');
+        if braced {
+            j += 1;
+        }
+        let start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == '_') {
+            j += 1;
+        }
+        // A reference must START with a letter or underscore. Without this,
+        // a literal `$5` parses as a variable named "5" and is rejected as
+        // unknown -- which breaks any prompt or comment containing a price.
+        if start >= bytes.len() || !(bytes[start].is_ascii_alphabetic() || bytes[start] == '_') {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        let name: String = bytes[start..j].iter().collect();
+        if braced {
+            if bytes.get(j) != Some(&'}') {
+                // `${` with no closing brace: not a reference, emit literally.
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            j += 1;
+        }
+        if name.is_empty() {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        touched = true;
+        match vars.iter().find(|(n, _)| *n == name) {
+            Some((_, val)) => {
+                out.push_str(&val.to_string_lossy());
+                i = j;
+            }
+            // Unknown: report it and stop rewriting this string. The caller
+            // collects one error per offending string, so a manifest with the
+            // same typo in three places reports three identical lines rather
+            // than failing three times with different context.
+            None => return Some(Err(name)),
+        }
+    }
+    touched.then_some(Ok(out))
 }
 
 fn kind_of(v: &Value) -> &'static str {
@@ -571,5 +712,102 @@ mod tests {
         let a = json!({"extends": "base.json", "train": {"steps": 1}});
         let b = json!({"extends": "other.json", "train": {"steps": 1}});
         assert!(divergent_keys(&[a, b]).is_empty());
+    }
+    /// An unknown variable must be an error, not a passthrough.
+    ///
+    /// A typo'd `$experimnt_dir` that survived as a literal would produce a
+    /// confusing "no such file" much later, and could — worse — name a real
+    /// directory by accident and silently load the wrong file.
+    #[test]
+    fn unknown_path_variable_is_rejected_with_the_available_set() {
+        let dir = std::env::temp_dir().join("generalist-var-unknown");
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let f = dir.join("bad.json");
+        std::fs::write(&f, r#"{"train":{"ckpt_dir":"$experimnt_dir/run"}}"#).expect("write");
+        let err = resolve(&f, &mut Vec::new()).expect_err("must reject unknown var");
+        let text = format!("{err}");
+        assert!(text.contains("experimnt_dir"), "{text}");
+        // The message must list what IS available, or it is a guessing game.
+        for known in ["curdir", "parent_dir", "repo_root", "experiment_dir"] {
+            assert!(text.contains(known), "message omits ${known}: {text}");
+        }
+    }
+
+    /// `$name` and `${name}` both work, and both resolve to the same place.
+    #[test]
+    fn braced_and_bare_path_variables_resolve_identically() {
+        let dir = std::env::temp_dir().join("generalist-var-brace");
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let (doc_bare, root) = {
+            let f = dir.join("bare.json");
+            std::fs::write(&f, r#"{"a":"$repo_root/x"}"#).expect("write");
+            resolve(&f, &mut Vec::new()).expect("bare")
+        };
+        let (doc_braced, _) = {
+            let f = dir.join("braced.json");
+            std::fs::write(&f, r#"{"a":"${repo_root}/x"}"#).expect("write");
+            resolve(&f, &mut Vec::new()).expect("braced")
+        };
+        assert_eq!(doc_bare["a"], doc_braced["a"]);
+        let want = format!("{}/x", PathBuf::from(env!("CARGO_MANIFEST_DIR")).display());
+        assert_eq!(doc_bare["a"].as_str().unwrap(), want);
+        let _ = root;
+    }
+
+    /// `$curdir` is per-file, not per-run: a child extending a base in another
+    /// directory must see its OWN directory, while the base keeps its own.
+    #[test]
+    fn curdir_is_the_directory_of_the_file_that_mentions_it() {
+        let base_dir = std::env::temp_dir().join("generalist-var-cur-base");
+        let child_dir = std::env::temp_dir().join("generalist-var-cur-child");
+        std::fs::create_dir_all(&base_dir).expect("base dir");
+        std::fs::create_dir_all(&child_dir).expect("child dir");
+        let base = base_dir.join("base.json");
+        std::fs::write(&base, r#"{"train":{"ckpt_dir":"$curdir/from-base"}}"#).expect("base");
+        let child = child_dir.join("child.json");
+        let body = format!(
+            r#"{{"extends":{},"train":{{"eval_max_new":8,"ckpt_dir":"$curdir/from-child"}}}}"#,
+            serde_json::to_string(&base.to_string_lossy()).unwrap()
+        );
+        std::fs::write(&child, body).expect("child");
+        let (doc, _) = resolve(&child, &mut Vec::new()).expect("resolve");
+        // The child's own value wins, and it is the child's directory.
+        assert_eq!(
+            doc["train"]["ckpt_dir"].as_str().unwrap(),
+            format!("{}/from-child", child_dir.display())
+        );
+    }
+
+    /// A literal `$` that is not a variable reference must survive untouched, or
+    /// prompts and comments containing currency break.
+    #[test]
+    fn literal_dollars_that_are_not_variables_survive() {
+        let dir = std::env::temp_dir().join("generalist-var-literal");
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let f = dir.join("lit.json");
+        std::fs::write(
+            &f,
+            r#"{"a":"costs $5","b":"trailing $","c":"${","d":"$repo_root/x"}"#,
+        )
+        .expect("write");
+        let (doc, _) = resolve(&f, &mut Vec::new()).expect("resolve");
+        assert_eq!(doc["a"].as_str().unwrap(), "costs $5");
+        assert_eq!(doc["b"].as_str().unwrap(), "trailing $");
+        assert_eq!(doc["c"].as_str().unwrap(), "${");
+        assert_eq!(
+            doc["d"].as_str().unwrap(),
+            format!("{}/x", env!("CARGO_MANIFEST_DIR"))
+        );
+
+        // Deliberate trade-off, pinned so nobody "fixes" it by accident: a
+        // well-formed but unknown `$word` is REJECTED, not passed through. Prompts
+        // are generated by tasks rather than written in manifests, so the exposure
+        // is comments, and a loud error there beats a silently wrong path. Digits
+        // after the first character are fine, so `$x_1` is a reference while `$5`
+        // is currency.
+        let f2 = dir.join("unknown.json");
+        std::fs::write(&f2, r#"{"a":"$x_1"}"#).expect("write");
+        let err = resolve(&f2, &mut Vec::new()).expect_err("$x_1 is unknown");
+        assert!(format!("{err}").contains("x_1"), "{err}");
     }
 }

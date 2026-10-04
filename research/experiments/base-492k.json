@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Shared base for every 492K-parameter scaling experiment in this directory.",
+    "Small and fixed on purpose: the scaling axes need many runs, and the 3.5M",
+    "model does not fit that budget on a 4GB card.",
+    "",
+    "492,418 params: d_model 128, n_heads 2, head_dim 64, ffn_hidden 384,",
+    "n_stages 2, max_loops 4. The output head is UNTied.",
+    "",
+    "Every axis manifest extends this and overrides only what its axis varies.",
+    "Consequence worth knowing: these runs use a SMALLER model than the shipped",
+    "configs/stage0-base.json (984,065 at d_model 256), so numbers from here are",
+    "NOT comparable with the stage0 suite."
+  ],
+  "extends": "$configs_dir/smoke-tiny.json",
+  "model": {
+    "d_model": 128,
+    "n_heads": 2,
+    "head_dim": 64,
+    "ffn_hidden": 384,
+    "n_stages": 2,
+    "max_loops": 4
+  },
+  "optim": {
+    "kind": "muon",
+    "momentum": 0.95,
+    "dampening": 0.0,
+    "nesterov": true,
+    "ns_steps": 5,
+    "adjust_lr_fn": "Original",
+    "weight_decay": 0.0
+  },
+  "stop": { "kind": "act" },
+  "train": {
+    "steps": 600,
+    "log_every": 300,
+    "eval_every": 100000,
+    "eval_max_new": 16,
+    "eval_holdout": 0.1,
+    "indist_eval_per_cell": 16,
+    "batch_size": 4,
+    "auto_batch": true,
+    "auto_batch_max": 16384,
+    "ckpt_dir": "$curdir/checkpoints",
+    "lr_muon": { "kind": "linear", "lr": 0.0002, "max_lr": 0.002, "warmup_steps": 100 },
+    "lr_adamw": { "kind": "constant", "lr": 0.0003 },
+    "eval_in_distribution": true,
+    "shuffle_eval": false
+  },
+  "experiment": { "per_cell": 200, "seeds": [0] }
+}

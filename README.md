@@ -5,12 +5,64 @@ hybrid optimizer (`src/optim`), used to **construct a generalization scaling
 law**: how held-out generalization varies with model scale and with compute
 depth, and where memorization takes over.
 
-## Goal
+## Research goal
 
-The question is not "can a transformer do in-context learning". It is:
+> To systematically investigate the relationship between model capacity,
+> training-data scale, and generalization ability, with particular emphasis on
+> how parameter reuse through recurrent or looped architectures alters the
+> balance between memorization and generalization.
+>
+> The study aims to characterize how generalization changes as a function of
+> parameter count and dataset size, determine whether iterative reuse of a fixed
+> parameter set can improve generalization without a proportional increase in
+> trainable parameters, and identify the regimes in which models begin to
+> exhibit increasingly higher-order forms of generalization.
+>
+> A particular focus is placed on in-context learning as an observable
+> intermediate capability, in which a model infers a task, rule, or procedure
+> from contextual examples rather than relying solely on memorized
+> associations. Beyond this, the project seeks to investigate the emergence of
+> critical-thinking-like behavior as a still higher-order form of
+> generalization, characterized by the ability to infer, evaluate, and flexibly
+> apply underlying rules or strategies to novel situations rather than merely
+> reproducing learned patterns.
+>
+> Ultimately, the research seeks to determine how model size, data scale, and
+> parameter reuse jointly influence the transition from memorization to
+> generalization, from generalization to in-context learning, and from
+> in-context learning toward higher-order reasoning capabilities, including
+> whether parameter reuse shifts the capacity threshold at which these
+> behaviors emerge.
 
-> **How does generalization scale with parameters and with compute depth, and
-> where does memorization begin?**
+The organizing idea is a **ladder**, and every measurement in this repo is a
+position on it:
+
+```
+memorization  ->  generalization  ->  in-context learning  ->  higher-order
+  reproduce     apply to new        infer the rule from      infer, evaluate
+  what was      inputs              examples                and flexibly apply
+  trained       (same rule)          (rule not in weights)   a strategy
+```
+
+with **parameter reuse** (looping a fixed weight set) as the intervention that
+may shift where on that ladder a given size lands. The load-bearing question is
+not "does it do ICL" but **whether reuse moves the threshold** — the size and
+data at which each rung is reached.
+
+**Where this repo actually is on the ladder.** Stated up front because it
+determines what every number means:
+
+| rung | status | evidence |
+|---|---|---|
+| memorization | **measured, strong** | in-distribution exact-match 1.000 with the rule demonstrated in context |
+| generalization | **measured, absent on the varying-rule rung** | held-out byte accuracy 0.18–0.27, below the 0.333 chance rate, flat over an 18× data range |
+| in-context learning | **measured, absent** | the varying-rule rung *is* the ICL test — the rule is demonstrated per instance and never in the weights — and it fails |
+| higher-order | **not measured, not reachable** | no rung of the suite tests infer-evaluate-apply; this is a gap, not a null result |
+
+So the answer so far is that at 492K parameters the model is on rung 1 and does
+not reach rung 2 or 3. That is a statement about **this cell of (size × data ×
+reuse)**, not about the architecture in general, and it is exactly what the
+size axis — unmeasured — exists to test.
 
 **Independent variables** (all manifest-reachable today):
 
@@ -60,7 +112,10 @@ should be compared against (see "Measuring the gap").
 
 In-context learning is the **measure**, not the goal: accuracy-vs-k is one
 slice of the dependent variable, and the `subst-fst` family separates rule
-*execution* from rule *induction*.
+*execution* from rule *induction*. The distinction matters for the ladder above:
+`subst-fst-fixed` tests rung 2 with the rule already in the weights, while
+`subst-fst` at k ≥ 1 tests rung 3, because the rule exists nowhere in the model
+except the prompt.
 
 ## Setup
 
@@ -485,7 +540,8 @@ and the card fixed does not reproduce it. Anyone re-deriving the old numbers
 from commit `8bcffc6` should read this table instead.
 
 ```bash
-cargo run --release --example scaling_sweep -- configs/<base>.json data gpu 16 48 128 288 --seeds=0,1,2 --auto-batch
+cargo run --no-default-features --features cuda --example scaling_sweep -- \
+    research/experiments/data-axis-constant-rule.json data gpu 16 48 128 288 --seeds=0,1,2
 ```
 
 ### Data axis, varying rule: 18× more data and no transfer
@@ -597,7 +653,8 @@ chance-level reading is uniform across Track A and Track B is not established
 here either. Both are open; the induction and oracle rungs are queue item 1.
 
 ```bash
-cargo run --release --example scaling_sweep -- configs/<base-varyrule>.json data gpu 16 48 128 288 --seeds=0,1,2 --auto-batch
+cargo run --no-default-features --features cuda --example scaling_sweep -- \
+    research/experiments/data-axis-varying-rule.json data gpu 16 48 128 288 --seeds=0,1,2
 ```
 
 (a manifest identical to the constant-rung base except
@@ -636,7 +693,8 @@ stage roles — see "Reading the stages". It also says nothing about ACT: the ax
 is `fixed` only, so no point here is compute-matched to any other.
 
 ```bash
-cargo run --release --example scaling_sweep -- configs/<base>.json depth gpu 1 2 4 8 --seeds=0,1,2
+cargo run --no-default-features --features cuda --example scaling_sweep -- \
+    research/experiments/depth-axis.json depth gpu 1 2 4 8 --seeds=0,1,2
 ```
 
 ### Throughput, and why the batch tuner exists
@@ -698,7 +756,8 @@ central confound in the depth-scaling question and is called out again under
 Reproduce with:
 
 ```bash
-cargo run --release --example lr_sweep -- configs/stage0-fixed.json gpu 2e-3 1.5e-2 --seeds=0,1,2
+cargo run --no-default-features --features cuda --example lr_sweep -- \
+    configs/stage0-fixed.json gpu 2e-3 1.5e-2 --seeds=0,1,2
 ```
 
 Per-run logs land in gitignored `checkpoints*/run.jsonl`, so the table is not
@@ -775,7 +834,8 @@ What this does not establish, stated plainly:
   it, and the command below is the whole check.
 
 ```bash
-cargo run --release --example arm_compare -- configs/stage0-4block.json configs/stage0-orderaug.json gpu 0 1 2
+cargo run --no-default-features --features cuda --example arm_compare -- \
+    research/experiments/arm-ordered.json research/experiments/arm-orderaug.json gpu 0 1 2
 ```
 
 ## Known limitations
@@ -1042,7 +1102,13 @@ Natural language. Scale.
 - `examples/arm_compare.rs` — paired two-arm comparison (ordered vs
   order-augmented) over seeds, log-driven, refusing any pair whose arms differ
   by more than the intervention
+- `examples/verify_port.rs` — asserts a research manifest resolves to the same
+  config as a reference manifest, field by field
 - `configs/` — run manifests + chains (JSON, no recompile to tweak)
+- `research/` — the running experiment record: `findings.md` is the
+  consolidated read, `experiments/` holds a versioned manifest per reported
+  result. `AGENTS.md` files throughout the tree hold the local contracts;
+  `AGENTS.md` at the root is the index.
 
 ## Optimizer
 
@@ -1100,6 +1166,25 @@ cannot leak into a sibling extending the same base. `save_run` writes a
 standalone manifest with no `extends` — the way to turn a resolved config into
 an editable starting point.
 
+**Path variables.** Any string in any manifest may use `$name` or `${name}`:
+
+| variable | resolves to |
+|---|---|
+| `$curdir` | directory of the manifest that mentions it |
+| `$parent_dir` | its parent |
+| `$repo_root` | the crate root |
+| `$experiment_dir` | `research/experiments` |
+| `$configs_dir` | `configs` |
+
+Expansion is **per file**, before the parent is read, so `$curdir` means the
+directory of the file that writes it rather than whichever file resolved first.
+An unknown variable is a **load error** listing what is available, not a silent
+passthrough — a typo that survived as a literal path would either fail much
+later with a confusing message or, worse, name a real directory and load the
+wrong file. A `$` that does not start a valid reference is left alone, so `costs
+$5` survives. A reference must start with a letter or underscore, so `$5` is
+currency and `$x_1` is a (rejected, unknown) reference.
+
 Variations are internally tagged enums, so each is a manifest edit:
 
 | key | variants |
@@ -1112,6 +1197,7 @@ Variations are internally tagged enums, so each is a manifest edit:
 | `train.indist_eval_per_cell` | instances drawn from the training pool for that record |
 | `train.max_train_instances` | cap on the training pool, applied **after** the holdout; `0` = no cap |
 | `train.auto_batch` | bool, default **off** — see "Auto-batch" below |
+| `train.dump_samples` | decoded eval samples written to `<ckpt_dir>/samples.txt`; `0` = off |
 | `experiment.protocol.k_set` | array, **replaces** rather than unions |
 
 The `model`, `optim`, and `train` blocks are **not** serde-defaulted: a

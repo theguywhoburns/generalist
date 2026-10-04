@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "DEPTH DIAGNOSTIC. Same cell as data-axis-varying-rule, but dumps decoded",
+    "eval samples so a below-chance or otherwise inexplicable number can be",
+    "diagnosed instead of theorized about.",
+    "",
+    "Run:",
+    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "    research/experiments/varying-rule-dump.json data gpu 288 --seeds=0",
+    "  then read $curdir/checkpoints-dump/samples.txt",
+    "",
+    "Samples show the demos, the query, the target and what the model emitted, so",
+    "'did it use the rule it was shown?' is answerable by reading rather than by",
+    "inferring from an aggregate. Recovering each sample's map from its demos and",
+    "checking the output against it turned one wrong conclusion into a right one",
+    "here; see research/findings.md."
+  ],
+  "extends": "data-axis-varying-rule.json",
+  "train": {
+    "ckpt_dir": "$curdir/checkpoints-dump",
+    "shuffle_eval": true,
+    "dump_samples": 12
+  }
+}

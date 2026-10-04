@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "DEPTH AXIS. Fixed compute depth as the variable, for the compute-depth",
+    "scaling curve the research goal asks for.",
+    "",
+    "Settings match the run that produced the reported first pass: per_cell 160,",
+    "indistinguishable 12, 600 steps, and AUTO-BATCH OFF with batch 6.",
+    "",
+    "AUTO-BATCH IS DELIBERATELY OFF HERE. It is on for the data axes because it",
+    "gave 7.4x the throughput. The depth numbers were measured at fixed batch, so",
+    "switching it on would make this manifest no longer reproduce them — and a",
+    "depth comparison where the batch silently changed with the axis would confound",
+    "the axis.",
+    "",
+    "Run:",
+    "  cargo run --no-default-features --features cuda --example scaling_sweep --",
+    "    research/experiments/depth-axis.json depth gpu 1 2 4 8 --seeds=0,1,2",
+    "",
+    "The sweep tool sets stop.fixed{loops} per point, zeroes ponder_weight (no",
+    "learned step count means the ponder term is a constant loss offset), and",
+    "raises max_loops to match. ACT is NOT on this axis.",
+    "",
+    "READ WITH THE HALT PROFILE. Fixed depth and degenerate early halting look",
+    "identical in an accuracy table and are opposite claims. At high LR the stage",
+    "profile went to 5.2/1.6/1.0/1.0, which is degenerate early halting rather than",
+    "depth allocation. Report the per-stage profile next to any depth number.",
+    "",
+    "KNOWN LIMITATION of the existing pass: exact-match was 0.000 on both halves at",
+    "every depth, so it only became legible once byte accuracy was added, and",
+    "within-seed spread exceeds every between-depth difference at n=3.",
+    "",
+    "max_loops 8 here (not 4) so the axis can reach 8."
+  ],
+  "extends": "base-492k.json",
+  "model": { "max_loops": 8 },
+  "train": {
+    "ckpt_dir": "$curdir/checkpoints-depth",
+    "batch_size": 6,
+    "auto_batch": false,
+    "eval_every": 1000,
+    "indist_eval_per_cell": 12
+  },
+  "experiment": {
+    "per_cell": 160,
+    "tasks": ["subst-fst-fixed"],
+    "protocol": { "k_set": [0], "k0_rate": 1.0 }
+  }
+}
