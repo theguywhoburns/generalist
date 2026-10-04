@@ -62,6 +62,31 @@ held-out byte accuracy 0.181 / 0.241 / 0.218 / 0.265 at N = 16 / 48 / 128 / 288
 
 ---
 
+**Capacity does not move the new-rule number.** `measured`, n=3 except 256.
+d_model 128 / 192 / 256 / 384 on the new-rule rung, 600 steps, auto-batch:
+
+| d_model | params | held-out byte | held-out `off_pair` | in-dist byte |
+|---|---|---|---|---|
+| 128 | 492,418 | 0.269±0.03 | 0.318±0.02 | 0.926±0.01 |
+| 192 | ~1.1M | 0.263±0.02 | 0.331±0.02 | 0.763±0.12 |
+| 256 | ~1.8M | 0.340 (n=1) | 0.330 | 0.904 |
+| 384 | ~3.2M | 0.280±0.01 | 0.339±0.01 | 0.840±0.12 |
+
+Chance is 0.333. Every point sits at or below it, and `off_pair` is flat at
+0.32–0.34 across a **6.5× parameter range**. So this is not a threshold that
+capacity moves: a 6.5× increase in parameters buys nothing on the strong
+generalization rung.
+
+That is a real result and it narrows the question. It does **not** establish that
+capacity is irrelevant to generalization — only that it is irrelevant *to this
+task at this budget*, and the same-rule rung (where transfer exists) has not
+been swept across size at all, which is where a scaling law is actually
+measurable.
+
+In-distribution byte accuracy is non-monotone (0.926 → 0.763 → 0.904 → 0.840)
+with ±0.12 spread at two of the four sizes, so it is noise at n=3 rather than a
+size effect.
+
 ## Single-pass, unresolved against seed spread
 
 **Depth helps and appears to saturate by 4.** `single-pass`. Byte accuracy at
