@@ -1141,11 +1141,14 @@ Listed with what would change the conclusion, strongest first.
    rule-class holdout in item 1 before "memorization" can mean anything other
    than fitting a map the model was given.
 3. **The depth axis has one pass, at one operating point, and its earlier
-   conclusion is refuted.** 492,418 params, fixed batches, `fixed {1,2,4,8}`
-   only, 3 seeds (2 at depth 8). No ACT point and therefore no
-   compute-matched ACT-vs-fixed comparison, no `loops: 16`, one model size, one
-   rung. Within-seed spread exceeds every between-depth difference, so the
-   apparent saturation is not resolved. The axis also moved compute and reuse
+   conclusion is refuted.** 492,418 params, fixed batches, `max_loops` ∈
+   {1,2,4,8} only, 3 seeds (2 at depth 8). The manifests set `stop.act`, which
+   saturated at its cap on every run, so the points are equivalent to fixed depth
+   at the cap — but that means there is **no ACT point where the gate actually
+   chooses to stop early**, and therefore no compute-matched ACT-vs-fixed
+   comparison, no `loops: 16`, one model size, one rung. Within-seed spread
+   exceeds every between-depth difference, so the apparent saturation is not
+   resolved. The axis also moved compute and reuse
    together — see "Compute-depth axis" — so it measures arithmetic, not the
    reuse pattern, and the profile read "uniform" at every depth, so it says
    nothing about whether stages take on different roles with depth.
