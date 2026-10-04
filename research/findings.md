@@ -208,45 +208,38 @@ could show above it.---
 
 ## Open, in order of value
 
-0. **Size axis, to completion.** Running — `size-axis-varying-rule.json`. Held-out
-   byte is flat at ~0.27 with `off_pair` at chance for d_model 128, 192 and 256,
-   so capacity is not moving the new-rule number.
-
-   An earlier note here blamed a steps confound — "larger models are less-trained
-   per parameter". **That was wrong.** The auto-batch tuner holds the *effective*
-   batch fixed, so samples-per-optimizer-step, and therefore epochs over the
-   ~360-instance training pool, are constant across sizes. Memory pressure cannot
-   leak into the optimization. Corrected in the manifest too.
-
-   The confound that is live runs the other way: a fixed effective batch is what
-   makes the axis comparable, but it means every size gets the same batch, so a
-   size that wanted a larger one is handicapped rather than helped. If the axis
-   comes back flat, that is the first thing to revisit — not more steps.
-   **This is the single measurement that turns every claim here from a
-   single-cell statement into a scaling claim.**
+0. **The same-rule curve across model sizes.** Now the highest-value item.
+   The new-rule size axis came back flat over 6.5×, which rules out "a bigger
+   model would have induced the rule" but says nothing about the rung where
+   transfer *exists*. Sweeping `d_model` on `subst-fst-fixed`, where held-out byte
+   rises 0.329 → 0.850 with data, is the one measurement here that could produce
+   an actual scaling law rather than a null. Needs the data axis at 3+ sizes, not
+   a single size.
 1. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
-   in any form. Not implemented at all. This is what a generalization claim
-   needs and no amount of work on the two `subst-fst` rungs substitutes for it.
-2. **A rung whose output space beats chance.** Every measurement on the
-   new-rule rung sits on a 3-symbol alphabet where chance is 0.333, so a weak
-   partial competence cannot be distinguished from guessing. A larger alphabet
-   would make partial competence visible — the precondition for locating any
-   threshold.
+   in any form. Not implemented at all. This is what a generalization claim needs
+   and no amount of work on the two `subst-fst` rungs substitutes for it.
+2. **A rung whose output space beats chance.** Every measurement on the new-rule
+   rung sits on a 3-symbol alphabet where chance is 0.333, so a weak partial
+   competence cannot be distinguished from guessing at all — and a 6.5× capacity
+   increase not moving the number is equally consistent with "there is no weak
+   competence" and "the instrument cannot see one". A larger alphabet settles it.
 3. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth,
    and depth is the axis the goal cares about (does reuse buy generalization).
-4. **The same-rule generalization curve, characterized properly.** It is the one
-   place transfer exists (0.329 → 0.850), so it is where a scaling law is
-   actually measurable. Needs more than one model size and more seeds to be a
-   law rather than a curve.
-5. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
+4. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
    it cannot bracket onset. Onset needs the curve to rise then fall, and no rung
    tested so far does that.
+5. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
+   within-seed spread at or above its between-condition differences. The 256 point
+   of the size axis is n=1 only because a concurrent run starved the card and the
+   watchdog killed the sweep.
 6. **De-confound the oracle rung.** Add ~20 chars of inert filler to `subst-fst`
    so both arms share a length distribution, isolating the header's content from
    its length. Needs a task variant, not a manifest. Until then "execution vs
    induction" is untested rather than answered.
-7. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
-   within-seed spread at or above its between-condition differences.
-8. **`InstanceInfo` should carry the oracle header.** The sample dump shows demos,
-   query and target but not the header — the only part of the prompt that
-   differs between the oracle and induction arms.
+7. **`InstanceInfo` should carry the oracle header.** The sample dump shows demos,
+   query and target but not the header — the only part of the prompt that differs
+   between the oracle and induction arms.
+8. **Do not run two sweeps concurrently.** A 4GB card plus two auto-batch tuners
+   means each measures its baseline before the other has allocated, and the
+   watchdog kills the run at ~20 minutes with `CUDA_ERROR_DEINITIALIZED`. This is
+   what cost the 256 seeds on the size axis.
