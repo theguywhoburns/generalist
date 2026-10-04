@@ -13,9 +13,10 @@ halfway still has usable numbers.
 | `run` | dry run: resolve, validate, print cell counts. No GPU. Preflight everything with this. |
 | `train` | one manifest, one run, on GPU or CPU. |
 | `chain` | ordered experiments whose checkpoints feed later ones, with forgetting evals. |
-| `scaling_sweep` | one axis (`data` / `depth` / `params`) × seeds; reports both accuracies, the gap, length, halt and profile. |
+| `scaling_sweep` | one axis (`data` / `depth` / `params` / `k`) × seeds; reports both accuracies, the gap, length, halt and profile. |
 | `lr_sweep` | LR × seeds. Two-axis, reports spread, refuses to rank on one seed. |
 | `arm_compare` | two manifests that must differ **only** in the intervention, and which reports whether order-dependence is learned or structural. |
+| `param_match` | solve the parameter counts for a depth-vs-width pair. Searches `head_dim`, binary-searches `ffn_hidden`; optional third arg pins the target. |
 | `verify_port` | assert a research manifest resolves to the same config as a reference manifest. Field-by-field. |
 
 ## Local Contracts
@@ -38,6 +39,17 @@ halfway still has usable numbers.
 6. **`--seeds` defaults to one seed and the summary must say so** rather than
    presenting a single-seed point as a ranking. This bit us on the LR sweep.
 7. **Prefers byte accuracy to exact-match, and reports both.** Never one alone.
+8. **A parameter-matching tool takes an explicit target and never derives it from
+   the arm it is matching.** The derived target moves with `n_stages`, so it
+   cannot hold parameters fixed while the stages↔width split varies — which is
+   the only way to trace that frontier. `param_match`'s optional third argument
+   exists for this; do not remove it and do not make it the default.
+9. **Hand-matching `d_model` to hit a parameter target does not work.** Body
+   parameters scale roughly with `d²`, so stepping `d_model` overshoots the
+   target by a large margin, and the config validator's `d_model == n_heads *
+   head_dim` constraint can make a target *unreachable* rather than merely hard.
+   Hand-matching got this 50% wrong twice before the solver existed. Search
+   `head_dim`, then binary-search `ffn_hidden` as the gentle second knob.
 
 ## Work Guidance
 

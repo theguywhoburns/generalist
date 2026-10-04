@@ -15,11 +15,26 @@ Confidence key: **measured** = reproduced or n≥3 with per-seed recorded;
 | memorization | **measured, strong** | in-distribution byte 0.90–0.93, `off_pair` 0.04–0.05 vs a 0.333 chance rate |
 | generalization — same rule, new inputs | **measured, present** | held-out byte 0.329 → 0.850 as data grows 16 → 288 |
 | generalization — new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on three independent instruments, flat over 18× data and across every size run so far |
+| reuse vs width (the architecture question) | **measured, against the premise** | at matched params **and** compute, width wins 2:1 on held-out; at matched compute with params free, 7.07× params buys 2.2× held-out |
 
-All at 492,418 params. The gap between rows 2 and 3 is the headline: transfer
+Rows 2 and 3 are at 492,418 params. Row 4 is not a single cell and does not
+reduce to one: see the two sections below, which reach opposite-looking
+conclusions because they hold different things fixed.
+
+The gap between rows 2 and 3 is the headline for *what the model learns*: transfer
 to new inputs under a trained rule is real and scales with data; transfer to an
 unseen rule is nothing, and "nothing" here means three instruments agreeing with
 chance rather than one accuracy number.
+
+**Row 4 is the headline for the research goal, and it is a negative.** Reuse does
+not buy generalization without proportional parameters on this rung. But the
+reason is disqualifying rather than decisive: this rung rewards
+parameters-as-**storage** and is indifferent to parameters-as-**compute**, so it
+cannot test depth's advantage even in principle. Treat "depth loses" as
+untested and "depth was never tested by this task" as the finding. See
+`research/AGENTS.md` contract 8 for why the three available comparisons are not
+interchangeable — one of them was initially reported as the goal's answer and
+that was wrong.
 
 **Scope note.** In-context learning and higher-order inference were dropped as
 *goals*. The varying-rule rung is exactly the ICL test, it is at chance at every
@@ -386,30 +401,41 @@ could show above it.---
 
 ## Open, in order of value
 
-0. **The same-rule curve across model sizes.** Now the highest-value item.
-   The new-rule size axis came back flat over 6.5×, which rules out "a bigger
-   model would have induced the rule" but says nothing about the rung where
-   transfer *exists*. Sweeping `d_model` on `subst-fst-fixed`, where held-out byte
-   rises 0.329 → 0.850 with data, is the one measurement here that could produce
-   an actual scaling law rather than a null. Needs the data axis at 3+ sizes, not
-   a single size.
-1. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
+0. **The representational-capacity decisive point.** Designed, not yet run.
+   `4 stages × 4 loops` at `d_model = 256`, `ffn_hidden = 748` → 3,480,836
+   params, against `16 stages × 1 loop` at `d_model = 128`, `ffn_hidden = 384`
+   → 3,479,696. Matched parameters to 0.03%, matched block-steps to the step,
+   `head_dim` matched, and `ffn:d` preserved at 2.92 vs 3.00 so it is not the
+   degenerate-FFN corner the frontier's `16×1` endpoint falls into. The looped
+   arm gets 4× the width per stage at identical storage and arithmetic. If
+   **representational capacity** is its deficit it should climb well above
+   0.335 toward the wide arm's 0.739; if **storage** is the deficit it will not
+   move. This is the cheapest experiment that discriminates the two.
+1. **A rung whose answer requires dependent multi-step computation.** This is the
+   only thing that can test depth's advantage at all, and it is the reason the
+   whole depth thread is currently inconclusive rather than settled. Held-out
+   accuracy on `subst-fst-fixed` is "apply a map already in your weights"; the
+   k-axis says demos are unused; depth 1 sits *below* chance in-distribution.
+   Three independent measurements say the rung rewards storage and is
+   indifferent to computation. Until a task exists where the answer needs
+   several dependent steps and cannot be looked up, "reuse does not buy
+   generalization" rests on a task that never tested it.
+2. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
    in any form. Not implemented at all. This is what a generalization claim needs
    and no amount of work on the two `subst-fst` rungs substitutes for it.
-2. **A rung whose output space beats chance.** Every measurement on the new-rule
+3. **The same-rule curve across model sizes.** Sweeping `d_model` on
+   `subst-fst-fixed`, where held-out byte rises 0.329 → 0.850 with data, is the
+   one measurement here that could produce an actual scaling law rather than a
+   null. Needs the data axis at 3+ sizes, not a single size.
+4. **A rung whose output space beats chance.** Every measurement on the new-rule
    rung sits on a 3-symbol alphabet where chance is 0.333, so a weak partial
    competence cannot be distinguished from guessing at all — and a 6.5× capacity
    increase not moving the number is equally consistent with "there is no weak
    competence" and "the instrument cannot see one". A larger alphabet settles it.
-3. **Compute-matched ACT vs fixed depth.** The depth axis measures only depth,
-   and depth is the axis the goal cares about (does reuse buy generalization).
-4. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
-   it cannot bracket onset. Onset needs the curve to rise then fall, and no rung
-   tested so far does that.
 5. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
    within-seed spread at or above its between-condition differences. The 256 point
    of the size axis is n=1 only because a concurrent run starved the card and the
-   watchdog killed the sweep.
+   watchdog killed the sweep. Fill in `d_model` 256 seeds s1/s2 serially.
 6. **De-confound the oracle rung.** Add ~20 chars of inert filler to `subst-fst`
    so both arms share a length distribution, isolating the header's content from
    its length. Needs a task variant, not a manifest. Until then "execution vs
@@ -417,7 +443,11 @@ could show above it.---
 7. **`InstanceInfo` should carry the oracle header.** The sample dump shows demos,
    query and target but not the header — the only part of the prompt that differs
    between the oracle and induction arms.
-8. **Do not run two sweeps concurrently.** A 4GB card plus two auto-batch tuners
+8. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
+   it cannot bracket onset; the same-rule curve rises 0.329 → 0.850 across a 18×
+   data range and shows no sign of turning over. Onset needs a curve that rises
+   then falls, and no rung tested so far does that.
+9. **Do not run two sweeps concurrently.** A 4GB card plus two auto-batch tuners
    means each measures its baseline before the other has allocated, and the
    watchdog kills the run at ~20 minutes with `CUDA_ERROR_DEINITIALIZED`. This is
    what cost the 256 seeds on the size axis.

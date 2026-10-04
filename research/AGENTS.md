@@ -42,6 +42,25 @@ reproduce; those live here permanently.
    before stating the new one.
 7. **Cross-check `k_set` and the identity of the rule before writing anything
    about induction or generalization.** See root AGENTS.md contract 6.
+8. **State which quantities a comparison holds fixed, and check that it can
+   answer the question being asked of it.** Three depth-vs-width comparisons
+   exist in this repo and they are not interchangeable:
+   - **matched parameters *and* matched compute** answers *"does the reuse
+     pattern matter at equal storage?"* It **cannot** answer *"does reuse buy
+     generalization without proportional parameters"* — it has by construction
+     given both arms the same storage, so depth cannot win on the parameter
+     axis. Running this first and reporting it as the goal's answer was wrong.
+   - **matched compute, parameters free** is the goal's question.
+   - **matched parameters and compute with width as the traded variable**
+     separates *"is the looped arm's deficit representational or storage?"*
+
+   Writing "compute-matched" in a filename or a `_comment` does not say which of
+   the three it is. Say it in words.
+9. **A near-zero generalization gap is a signature, not a good result.** Gap ≈ 0
+   beside in-distribution accuracy at the chance rate means the model memorized
+   *nothing* — there was nothing to transfer. Read the two levels together. A
+   ratio of two chance-level numbers (in-dist ÷ held-out) carries no information
+   and must not be reported as a transfer-rate advantage.
 
 ## Work Guidance
 
