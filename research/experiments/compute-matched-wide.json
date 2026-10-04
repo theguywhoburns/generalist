@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "COMPUTE-MATCHED depth vs width, WIDE arm.",
+    "",
+    "Same block-steps per token and the same parameter count as",
+    "compute-matched.json, with the reuse pattern inverted: 32 stages applied",
+    "once each, instead of 4 stages applied 8 times.",
+    "",
+    "  looping : head_dim 16, n_heads 8, d_model 128, ffn 384, 4 stages x 8 loops",
+    "            32 block-steps/token, 919,172 params",
+    "  wide    : head_dim 16, n_heads 4, d_model  64, ffn  58, 32 stages x 1 loop",
+    "            32 block-steps/token, 919,648 params",
+    "",
+    "Both model blocks came from examples/param_match.rs. Hand-matching was 50%",
+    "wrong on the first attempt: parameters scale ~d^2, and the validator",
+    "requires d_model = n_heads * head_dim, so the reachable widths jump from",
+    "1.7M to 6.9M with nothing between. The tool searches head_dim, pins both",
+    "arms to the same one, then binary-searches ffn_hidden for the last 0.05%.",
+    "",
+    "KNOWN UNCONTROLLED DIFFERENCE: head count 4 vs 8. Not matchable at an 8x",
+    "stage ratio, and the tool says so rather than quietly matching on something",
+    "else. Rule it out before attributing a win to width.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/compute-matched-wide.json depth gpu 1 --seeds=0,1,2",
+    "",
+    "Compare against compute-matched.json at `depth gpu 8`. Same rung, same steps,",
+    "same eval split, same batch."
+  ],
+  "extends": "compute-matched.json",
+  "model": {
+    "d_model": 64,
+    "n_heads": 4,
+    "head_dim": 16,
+    "ffn_hidden": 58,
+    "n_stages": 32,
+    "max_loops": 1
+  },
+  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-compute-matched-wide" }
+}
