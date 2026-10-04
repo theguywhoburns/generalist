@@ -718,12 +718,18 @@ cargo run --example scaling_sweep -- \
 
 ### Compute-depth axis: a first pass, and a conclusion that was wrong
 
-Fixed batches (auto-batch **off**), batch 6, 600 steps, `stop.fixed` with
-`loops` as the axis, 492,418 parameters (`d_model` 128, `n_stages` **2**),
-`subst-fst-fixed`, `k_set: [0]`, ~29 held-out instances, 3 seeds per point.
-Instrument: byte accuracy. **These logs predate `off_pair_rate`,
-`length_exact_rate` and `mean_len_ratio`** — none of the three exists on this
-axis.
+Fixed batches (auto-batch **off**), batch 6, 600 steps, 492,418 parameters
+(`d_model` 128, `n_stages` **2**), `subst-fst-fixed`, `k_set: [0]`, ~29 held-out
+instances, 3 seeds per point (2 at depth 8). Instrument: byte accuracy. **These
+logs predate `off_pair_rate`, `length_exact_rate` and `mean_len_ratio`** — none of
+the three exists on this axis.
+
+The manifest sets `stop.act`, not `stop.fixed` — but ACT **saturated at its cap
+on every run**: halt takes exactly one distinct value per point and it equals
+`max_loops` (1.000 / 2.000 / 4.000 / 8.000) in every seed, verified from the
+per-instance `halt` field. So the axis is equivalent to fixed depth at the cap,
+and the block-steps column below is the realized arithmetic rather than a
+configured intention.
 
 | depth | block-steps/token | byte-in | byte-out | gap |
 |---|---|---|---|---|
@@ -776,10 +782,21 @@ cargo run --example scaling_sweep -- \
 ### Depth vs width: three comparisons, and what each can answer
 
 All cells below: `subst-fst-fixed`, `k_set: [0]` with `k0_rate` 1.0 (zero
-in-context demonstrations), 600 steps, `stop.fixed`, batch 6, ~29 held-out
-instances, **n = 3 seeds per arm**, RTX 3050 4 GB. Instruments: held-out
-**byte accuracy**, exact-match beside it, and the in-minus-out gap from the
-same run, against a **0.333 chance floor** on this 3-symbol alphabet.
+in-context demonstrations), 600 steps, ~29 held-out instances, **n = 3 seeds per
+arm**, RTX 3050 4 GB. Instruments: held-out **byte accuracy**, exact-match beside
+it, and the in-minus-out gap from the same run, against a **0.333 chance floor**
+on this 3-symbol alphabet.
+
+Two cell details differ between the comparisons and are stated per comparison
+rather than averaged over. **Stop mode is `act` on all of them**, inherited from
+`base-492k.json` — but ACT never halted early here: mean halt equals `max_loops`
+exactly at every point (16, 8, 4, 2, 1), so the realized arithmetic per token was
+exactly `n_stages × max_loops`. **The compute matching is therefore verified by
+the halt profile, not merely by configuration**, which is the stronger form.
+Batch differs too: (i) pins `auto_batch: false, batch_size: 6`; (ii) inherits
+`auto_batch: true` and both arms independently settled on an effective batch of
+128 — verified post hoc from the sweep log, so the arms match, but by luck
+rather than by construction.
 
 Three comparisons exist in this repo and **they are not interchangeable** —
 each holds different quantities fixed, and one of them was initially reported as
@@ -804,9 +821,9 @@ proportional parameters; it buys it worse than the same parameters spent on
 width would.
 
 *One number to correct before someone re-derives it: the per-seed held-out
-exact-match here is 0.000 / 0.219 / 0.067 (mean 0.095). The triple 0.083 / 0.792
-/ 0.625 that circulates in `research/findings.md` and commit `eeb9257` is this
-arm's **in-distribution** exact-match, mislabelled as held-out.*
+exact-match here is 0.000 / 0.219 / 0.067 (mean 0.095). The triple 0.083 / 0.792 /
+0.625 in commit `eeb9257` is this arm's **in-distribution** exact-match,
+mislabelled as held-out; it is corrected in place in `research/findings.md`.*
 
 **The mechanism is not mysterious.** Memorization is storage in weights, so at
 equal parameters the storage is equal and looping ought to be *neutral*. It is
