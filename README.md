@@ -44,16 +44,28 @@ The first is where a scaling curve exists to be measured. Both are in scope.
 |---|---|---|
 | memorization | **measured, strong** | in-distribution byte accuracy 0.90–0.93, `off_pair` 0.04–0.05 against a 0.333 chance rate |
 | generalization, same rule | **measured, present** | held-out byte accuracy 0.329 → 0.850 as data grows 16 → 288, at fixed model |
-| generalization, new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on all three instruments, flat over an 18× data range and across every model size run so far |
+| generalization, new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on all three instruments, flat over an 18× data range and across a 6.5× parameter range |
+| reuse vs width | **measured against the premise, on one rung** | at matched parameters *and* compute, width wins 2:1 on held-out byte; at matched compute with parameters free, 7.07× parameters buys 2.2× |
 
 The headline is the gap between rows 2 and 3. A 492K model transfers to new
 inputs under a trained rule, and transfers **nothing** to a rule it has not seen,
 where "nothing" is established on three independent measures rather than one
 accuracy number.
 
-**Every number here is at 492,418 parameters.** Statements about capacity are
-extrapolations from a single cell until the size axis lands, which is the
-largest open item.
+**Row 4 is the headline for the research goal, and it is negative — with a scope
+limit attached.** Reuse does not buy generalization without proportional
+parameters *on the rung every architecture experiment has run on*, and that rung
+rewards parameters-as-**storage** while being indifferent to
+parameters-as-**compute**. So the width side of the comparison is measured and
+real, while "depth loses" is **untested** and "depth was never tested by this
+task" is the finding. See "Depth vs width".
+
+**Cell coverage.** Rows 1–3 are at 492,418 parameters. Row 4 deliberately spans
+492,418 → 3,479,696, because a depth-vs-width comparison holding capacity fixed
+cannot answer the question — that constraint is the point of the params-free
+design. The size axis exists too (492K → ~3.2M) and is negative on the
+new-rule rung, so capacity is no longer a single-cell extrapolation there; it is
+still a single rung.
 
 **Independent variables** (all manifest-reachable today):
 
@@ -131,10 +143,12 @@ classic single-gate ACT.
 - The scaling runs in "Current results" use a deliberately smaller model —
   `d_model` 128, `n_stages` 2, `max_loops` 4, **492,418 parameters** — so that
   600 steps is enough to fit anything at all on a 4 GB laptop. It is the
-  smallest point on the size axis, which is not yet swept. The order-augmented
-  arm uses `d_model` 128 at the full `n_stages` 4, **919,172 parameters**, on
-  the full 6-task suite; at 576 held-out instances per eval pass that eval set
-  is an order of magnitude larger than the ~29 used by the two scaling axes.
+  smallest point on the size axis, which has since been swept upward on the
+  varying-rule rung (flat at chance from 492K to ~3.2M; see "Size axis"). The
+  order-augmented arm uses `d_model` 128 at the full `n_stages` 4, **919,172
+  parameters**, on the full 6-task suite; at 576 held-out instances per eval
+  pass that eval set is an order of magnitude larger than the ~29 used by the
+  two scaling axes.
 - Halt gates deep-start at `halt_bias_init = -3.0` (~4.7% halt probability),
   so training begins near max depth and ponder pressure shortens it — the
   shallow-halt trap is the failure mode this avoids.
@@ -333,6 +347,23 @@ first, and treat a gap trend as evidence only when that column moved with it.
   gap = heldout - indist                  (negative: the model is behind out of sample)
 ```
 
+**3. A floor is a property of the rung, not of the metric, and the rungs queued
+next move it a long way.** The 0.333 chance rate quoted throughout this README
+is a fact about a **3-symbol output alphabet**, not about byte accuracy as an
+instrument. `dyck1`, the first rung queued to test depth properly, has a
+**unary** output alphabet — `)` only, so a model emitting nothing but `)`
+scores byte accuracy **1.0** whenever the true depth is 1 and byte accuracy
+alone cannot separate a right answer from a right length by luck. The decisive
+readouts there are `length_exact_rate` and `mean_len_ratio` with byte accuracy
+beside them, and **the floor is not 0.333** — it is whatever a length-only
+guesser emitting the training-set modal depth scores, computed from the eval
+set before any arm is called above it. `scan-tiny` avoids the unary problem.
+
+A related limit on the tables below: **the depth-axis logs predate
+`off_pair_rate`**, `length_exact_rate` and `mean_len_ratio`, so those three
+instruments do not exist on that axis. Everything after it was logged with all
+of them.
+
 ## In-context demonstration protocol
 
 - Every instance ships k demonstrations of **that instance's** latent rule
@@ -427,8 +458,8 @@ number in this README depends on it.
 ## Comparison grid
 
 Intended axes: looped+ACT (headline) × looped `fixed {1,2,4,8,16}` ×
-param-matched non-looped × compute-matched non-looped (≈L × params, L =
-measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
+non-looped at matched params × non-looped at matched compute × blocks `{1,2,4}`,
+≥3 seeds per cell.
 
 **Implemented and manifest-reachable today:**
 
@@ -443,14 +474,24 @@ measured mean halt) × blocks `{1,2,4}`, ≥3 seeds per cell.
 - the data axis, by `train.max_train_instances` (cap the pool after the
   holdout, eval set held fixed). `experiment.per_cell` also varies the pool but
   moves the eval set with it, so it is not a sweep axis.
-- the size axis, by editing `model.d_model` / `ffn_hidden` / `n_stages`.
+- the size axis, by editing `model.d_model` / `ffn_hidden` / `n_stages`. Run.
+- the depth-vs-width columns, which are the `model` block again
+  (`n_stages`, `max_loops`, `d_model`, `ffn_hidden`) rather than a new knob:
+  `research/experiments/compute-matched{,-wide}.json` match parameters *and*
+  compute, `paramsfree-{looping,wide}.json` match compute with parameters
+  free, and `frontier-s*s*l*.json` traces the stages↔width split at matched
+  parameters and compute. All the parameter counts were solved with
+  `examples/param_match.rs`, never by hand. Results: "Depth vs width".
 - the context axis, by editing `protocol.k_set`.
 - the seed axis, by editing `train.seed` or `--seeds=` on the sweep tool.
 
 `examples/scaling_sweep.rs` drives the named axes (`data` | `depth` |
-`params`) over a base manifest, reads both accuracies and the gap out of each
-run's `run.jsonl`, and reports mean halt and the profile reading at every point
-so a fixed-depth win stays distinguishable from a degenerate-halting artifact.
+`params` | `k`) over a base manifest, reads both accuracies and the gap out of
+each run's `run.jsonl`, and reports mean halt and the profile reading at every
+point so a fixed-depth win stays distinguishable from a degenerate-halting
+artifact. The depth-vs-width arms run as two separate sweeps: `arm_compare`
+refuses to pair them, correctly, because the intervention is several model
+fields at once rather than one.
 
 `examples/arm_compare.rs` drives the order axis as a paired two-arm comparison
 (`<A.json> <B.json>`, N seeds), one seed per run, each run's checkpoint
@@ -468,29 +509,38 @@ also prints the random-weight control's informativeness next to the collapse,
 so a collapse is never printed as role evidence where the control could not
 have measured a floor.
 
-**Not implemented:** the non-looped columns (param-matched and
-compute-matched), and any manifest knob for them.
-
 ## Current results
 
-Five measurements exist, plus a throughput note. Four are on `subst-fst-fixed`,
-the weights-only rung; one is the same data axis on `subst-fst`, where the rule
-varies per instance; the fifth is the order-augmented comparison on the full
-6-task suite, where 576 held-out instances replace the ~29 (constant rule) and
-~46 (varying rule) held-out instances the two data-axis sweeps run on. All are
-reported here with the caveats that keep them honest rather than as findings.
-The LR sweep came first and is the weakest of them; the fixed-rung scaling axes
-are first passes, not curves; the varying-rule rung is the one measurement that
-contradicts a reading rather than extending one; the order-augmented arm is the
-one settled positive result here, and its caveats travel with it.
+Nine measurements exist, plus a throughput note; a tenth is in flight. They do
+not all support the same reading, so read them in this order:
+
+| # | measurement | rung | n | reading |
+|---|---|---|---|---|
+| 1 | data axis, constant rule | `subst-fst-fixed` | 3 / point | transfer rises with data — and is map application, not generalization |
+| 2 | data axis, varying rule | `subst-fst` | 3 / point | flat at chance over 18× data; refutes item 1 |
+| 3 | size axis | `subst-fst` | 3 / point (256 is n=1) | flat at chance over 6.5× parameters |
+| 4 | compute-depth axis | `subst-fst-fixed` | 3 / point (8 is n=2) | **superseded by 5–6** — it moved depth and compute together |
+| 5 | depth vs width, matched params *and* compute | `subst-fst-fixed` | 3 / arm | width wins 2:1 |
+| 6 | depth vs width, matched compute, params free | `subst-fst-fixed` | 3 / arm | 7.07× params buys 2.2× held-out |
+| 7 | context axis (`k`) | both `subst-fst` rungs | 3 / point | demos are not evidence; on the memorized rung one demo halves held-out. Cited under "Depth vs width", not given its own section |
+| 8 | Muon LR sweep | `subst-fst-fixed` | 2 × 3 | the two learning rates are not distinguishable |
+| 9 | order augmentation | 6-task suite | 3 / arm | the one settled positive result |
+| — | stages↔width frontier | `subst-fst-fixed` | in flight | **not for citation** |
+
+Everything below reports the cell, the instrument and its floor, and states the
+limits. The LR sweep came first and is the weakest. The size axis is a genuine
+negative that narrows the question without answering Goal question 1. The depth
+axis is a first pass whose earlier conclusion has since been **refuted** by 5
+and 6, and the correction is stated in place rather than by deletion.
 
 ### Data axis, constant rule: the memorization-onset curve
 
 The instrument is the train/held-out gap ("Measuring the gap"), and the axis is
 `train.max_train_instances`, so the eval set is the same ~29 held-out instances
 at every point. 492,418-parameter model (`d_model` 128, `n_stages` 2,
-`max_loops` 4), 600 steps, auto-batch on, 3 seeds per point, RTX 3050 4 GB. Task
-`subst-fst-fixed`: one constant substitution map for the whole pool.
+`max_loops` 4), 600 steps, auto-batch on, batch 6 × indistinguishable 12, 3
+seeds per point, RTX 3050 4 GB. Task `subst-fst-fixed`: one constant
+substitution map for the whole pool, `k_set: [0]`.
 
 | train N | byte-in | byte-out | gap | exact-in | exact-out |
 |---|---|---|---|---|---|
@@ -539,14 +589,13 @@ cargo run --example scaling_sweep -- \
 
 Same instrument, same model, same budget as the table above — 492,418
 parameters (`d_model` 128, `n_stages` 2, `max_loops` 4), 600 steps, auto-batch
-on, 46 held-out instances, 3 seeds per point, RTX 3050 4 GB. The **only**
+on, ~46 held-out instances, 3 seeds per point, RTX 3050 4 GB. The **only**
 change is the task: `subst-fst` instead of `subst-fst-fixed`. `subst-fst`
 redraws the substitution map per instance — now pinned by a test, so the two
 tasks cannot silently converge — which means every held-out instance carries a
-map the model never saw, where `subst-fst-fixed` holds one map constant by
-construction. **k ∈ {1, 2, 3, 5} with `k0_rate` 0, so the rule is always
-demonstrated in the prompt** — the model is shown the map before being asked to
-apply it.
+map the model never saw. **k ∈ {1, 2, 3, 5} with `k0_rate` 0, so the rule is
+always demonstrated in the prompt** — the model is shown the map before being
+asked to apply it.
 
 > **A confound that was in the first pass of this table, and what it cost.** The
 > first run of this sweep inherited `k_set: [0]` from the constant-rule base, so
@@ -555,9 +604,10 @@ apply it.
 > measured 0.249 / 0.315 / 0.297 / 0.311 and was read as "at chance on unseen
 > rules" — a conclusion that configuration could not support, since with no
 > demonstration there is nothing in the prompt to induce a map *from*. The
-> numbers above are the rerun at k ≥ 1. The headline conclusion happens to
+> numbers below are the rerun at k ≥ 1. The headline conclusion happens to
 > survive, but it survived a test it could not have passed, and the earlier
-> table should not be read as evidence about rule induction.
+> table should not be read as evidence about rule induction. The old numbers
+> are at commit `16079a8`.
 
 | train N | byte-in | byte-out | gap | exact-in | exact-out |
 |---|---|---|---|---|---|
@@ -591,102 +641,288 @@ eval [final-trained-pool]: acc 0.00 byte 0.273 copy 0.00 echo 0.00
 `copy` (output appeared among demo outputs) and `echo` (output equalled the
 query input verbatim) are **both 0.000**. The model is not replaying anything it
 was shown and is not echoing the question, yet it lands below the 0.333 chance
-rate. The failure is therefore neither of the two mechanisms that would have
-explained it, and **the mechanism is not identified**. `query_echo_rate` was
-added to `Record` and `Summary` specifically to test this, and it earned its
-place by failing to explain the result.
-
-The next step is an output-level diagnostic that does not exist yet: the
-per-track breakdown — Track A is `abc`, Track B is `xyz`, and a mean over both
-can hide one track at chance and the other near zero — and the emitted strings
-themselves. Until those exist the correct statement is "systematically wrong, by
-an unidentified mechanism", not a story about copying.
+rate. **The mechanism is therefore unidentified**, and the honest statement is
+"systematically wrong, by an unidentified mechanism", not a story about
+copying. `query_echo_rate` was added to `Record` and `Summary` specifically to
+test this and earned its place by failing to explain the result. The remaining
+diagnostic — the per-track breakdown, since a mean over Track A and Track B can
+hide one at chance and the other near zero, plus the emitted strings themselves
+— does not exist yet.
 
 **These are two rungs of one task family, not contradictory measurements.** The
-constant-rule table is a real measurement and is unchanged by this one; it
-measures map application. The two rungs differ only in whether the map is
-constant or induced, and that single difference is what separates "the model
-generalizes" from "the model applies a memorized map".
+two differ only in whether the map is constant or induced, and that single
+difference is what separates "the model generalizes" from "the model applies a
+memorized map". The constant-rule table is unchanged by this one.
 
-**The transfer the constant-rule curve showed was never generalization.** It was
-learning to apply one memorized constant map to new inputs. Require the map to
-be induced per instance and the transfer vanishes: 18× more data buys nothing
-above chance, even with the rule demonstrated in the prompt every time. This is
-the reading the constant-rung table should have been given from the start, and
-limitation 1 says so.
-
-**This is not undertraining.** In-distribution exact-match is 0.64–0.79 while
-held-out is at or below chance, so the model is fitting its training instances
-far better than it applies any rule it has just been shown. The confound behind
-the earlier refuted reading — more data means fewer epochs at a fixed step
-count — cannot produce this, because in-distribution accuracy *falls* as N grows
-(0.963 → 0.888) rather than rising: the model is memorizing less as the pool
-grows and still transferring nothing.
-
-**The gap drifted for a mechanical reason, and a gap is the wrong instrument
-here.** In-distribution was pinned near ceiling with no room to fall, so
--0.722 → -0.666 is the near-immutable side moving, not the held-out side
-improving. `scaling_sweep.rs` previously printed "gap narrowing … more of the
-train-pool advantage transfers" for exactly this data, because it read only the
-gap. It now checks whether the held-out curve actually moved **first**, and
-suppresses the gap reading when it did not; it also prints the chance rate
-explicitly when held-out lands at or below it. Reporting a gap trend in
-isolation invites reading the near-immutable term as a mechanism.
+**This is not undertraining, and it is not a gap artifact.** In-distribution
+exact-match is 0.64–0.79 while held-out is at or below chance, and
+in-distribution accuracy *falls* as N grows (0.963 → 0.888), so the
+undertraining confound that produced the refuted "onset below 16" reading cannot
+be the cause here. Nor can the gap drift mean transfer: in-distribution was
+pinned near ceiling with no room to fall, so -0.722 → -0.666 is the
+near-immutable side moving while the held-out side never left chance.
+`scaling_sweep.rs` now checks whether the held-out curve actually moved
+**first** and suppresses the gap reading when it did not.
 
 **What this rung does not separate.** There is no positive control here:
 nothing in this table shows the model can induce a *new* map from in-context
 demonstrations at this size and budget, so "at chance on unseen rules" is a
-statement about the rung, not a diagnosis of which sub-skill fails. The demo
-count this sweep ran at is not recorded in the table, and a rung that never
-demonstrates the rule in the prompt would sit at chance by construction rather
-than by limitation. The table also reports one number per point, so whether the
-chance-level reading is uniform across Track A and Track B is not established
-here either. Both are open; the induction and oracle rungs are queue item 1.
+statement about the rung, not a diagnosis of which sub-skill fails.
 
 ```bash
 cargo run --example scaling_sweep -- \
     research/experiments/data-axis-varying-rule.json data gpu 16 48 128 288 --seeds=0,1,2
 ```
 
-(a manifest identical to the constant-rung base except
-`experiment.tasks: ["subst-fst"]`)
+### Size axis: 6.5× the parameters, flat at chance
 
-### Compute-depth axis: a first pass, not a curve
+`d_model` swept by `scaling_sweep`'s `params` axis, which derives
+`n_heads = d_model / 64` and holds `head_dim` at 64, so the change is width and
+not head layout. Same rung as the varying-rule table above — `subst-fst`,
+`k ∈ {1, 2, 3, 5}`, `k0_rate` 0, 600 steps, auto-batch on (the tuner holds the
+*effective* batch fixed, so samples per optimizer step, and therefore epochs
+over the pool, are constant across sizes), ~44 held-out instances, 3 seeds per
+point. Instruments: held-out **byte accuracy** with `off_pair_rate` beside it —
+`off_pair` is the count of positions emitting a symbol that is neither the
+query's nor the target's, and it is the readout a positional bias cannot game.
 
-Fixed batches (no auto-batch), 600 steps, same model and task, `stop.fixed`
-with `loops` as the axis, 3 seeds per point.
+| `d_model` | params | held-out byte | held-out `off_pair` | in-dist byte |
+|---|---|---|---|---|
+| 128 | 492,418 | 0.269±0.03 | 0.318±0.02 | 0.926±0.01 |
+| 192 | ~1.1M | 0.263±0.02 | 0.331±0.02 | 0.763±0.12 |
+| 256 | ~1.8M | 0.340 (**n=1**) | 0.330 | 0.904 |
+| 384 | ~3.2M | 0.280±0.01 | 0.339±0.01 | 0.840±0.12 |
 
-| depth | byte-in | byte-out | gap |
-|---|---|---|---|
-| 1 | 0.201 | 0.134 | -0.067 |
-| 2 | 0.406 | 0.324 | -0.082 |
-| 4 | 0.444 | 0.403 | -0.041 |
-| 8 | 0.405 | 0.387 | -0.018 |
+Chance is 0.333. Every point sits at or below it, and `off_pair` is flat at
+0.32–0.34 across a **6.5× parameter range**. So "a bigger model would have
+induced the rule" is refuted: 6.5× the parameters buys nothing above chance on
+the strong generalization rung. `d_model` 256 is **n=1** — seeds 1 and 2 were
+lost to the concurrency mistake described under "Next experiments".
 
-Depth helps, and **the gap narrows with it** (-0.067 → -0.018): extra compute
-buys transfer rather than memorization. That is the direction Goal question 2
-asks for, and it is the first non-zero evidence on the axis. **The same
-caveat applies as on the constant-rule data axis**, because this is the same
-task: the rule is one constant map, so this is transfer on that rung, and the
-varying-rule sweep shows that transfer does not survive requiring a fresh map
-per instance. Depth effects and rule-transfer effects are not yet separated.
+**Two limits, and they matter more than the null.** First, this sweep ran on
+the **varying-rule** rung, so it is evidence about rule *induction*; it is
+**not** an answer to Goal question 1, which is about the same-rule rung where
+held-out byte rises 0.329 → 0.850 with data and where a scaling law is
+actually measurable. That rung has not been swept across size at all. Second, a
+flat result is equally consistent with "capacity does not help here" and "this
+instrument cannot see a weak competence", because every point sits on a
+3-symbol alphabet where chance is 0.333 — see "Measuring the gap", instrument
+3. In-distribution byte accuracy is non-monotone (0.926 → 0.763 → 0.904 →
+0.840) with ±0.12 spread at two of the four sizes, so it is noise at n=3 rather
+than a size effect.
 
-**Exact-match was 0.000 on both halves at every depth.** On exact-match alone
-this table reads "depth does nothing" — which is the metric failure described
-under "Measuring the gap", not a null result. Nothing else about the axis would
-have survived without byte accuracy.
+```bash
+cargo run --example scaling_sweep -- \
+    research/experiments/size-axis-varying-rule.json params gpu 128 192 256 384 --seeds=0,1,2
+```
 
-**"Saturates by 4" is not resolved.** Within-seed spread at every depth exceeds
-the between-depth differences (depth=8 seeds span 0.265–0.495 byte-out), so
-three seeds cannot separate depth 4 from depth 8 or speak to where the knee is.
-The profile reading was "uniform" at every depth, so this says nothing about
-stage roles — see "Reading the stages". It also says nothing about ACT: the axis
-is `fixed` only, so no point here is compute-matched to any other.
+### Compute-depth axis: a first pass, and a conclusion that was wrong
+
+Fixed batches (auto-batch **off**), batch 6, 600 steps, `stop.fixed` with
+`loops` as the axis, 492,418 parameters (`d_model` 128, `n_stages` **2**),
+`subst-fst-fixed`, `k_set: [0]`, ~29 held-out instances, 3 seeds per point.
+Instrument: byte accuracy. **These logs predate `off_pair_rate`,
+`length_exact_rate` and `mean_len_ratio`** — none of the three exists on this
+axis.
+
+| depth | block-steps/token | byte-in | byte-out | gap |
+|---|---|---|---|---|
+| 1 | 2 | 0.201 | 0.134 | -0.067 |
+| 2 | 4 | 0.406 | 0.324 | -0.082 |
+| 4 | 8 | 0.444 | 0.403 | -0.041 |
+| 8 | 16 | 0.474 (n=2) | 0.433 (n=2) | -0.041 (n=2) |
+
+Depth 8 is n=2: the third seed's log is not on disk, and the depth-8 row this
+README used to carry (0.405 / 0.387 / -0.018 at n=3) is not supported by the
+surviving `run.jsonl` records. The numbers above are read from those records, and
+seed 2 should be filled in before anything is claimed about the 4-vs-8
+difference.
+
+**The conclusion this section used to carry was wrong, and the reason was a
+confound.** It read: *"depth helps, the gap narrows with it, extra compute buys
+transfer rather than memorization."* That is a statement about **compute**, not
+about reuse. `n_stages` was pinned at 2 while `max_loops` varied, so depth 1 → 8
+was 2 → 16 block-steps per token: arithmetic and weight-reuse rose **together**,
+and this table cannot separate them. Holding compute fixed and spending the same
+parameters on width instead is ~2× better on held-out byte accuracy — 0.625
+against 0.323 at matched parameters *and* matched compute (comparison (i)
+below). So the honest reading of this axis is "**more compute helps**", and the
+reuse question is not touched by it. The old numbers are in commits `d8b7aa9`
+and `0e0d15a`; the confound and its correction are `eeb9257` and `ddddc9e`.
+
+Three things the table still supports, none of them about reuse:
+
+- depth 1 → 8 moves held-out byte 0.134 → 0.433, **+0.30 absolute, 3.2×
+  relative**, the largest single effect measured anywhere in this repo — but most
+  of it is "depth 1 does not learn this task" (in-dist 0.20). The 4 → 8
+  difference is **not** resolved: within-seed spread at depth 8 (0.380–0.485
+  held-out) exceeds it, at n=2 on top of that.
+- the gap does not widen with depth, so nothing here is the signature of
+  growing memorization. But a near-flat gap only carries information when the
+  in-distribution term is off the floor, and at depth 1 it is not.
+- **Exact-match was 0.000 on both halves at every depth.** On exact-match alone
+  this table reads "depth does nothing" — the metric failure described under
+  "Measuring the gap", not a null result. Nothing else about the axis would
+  have survived without byte accuracy.
+
+The profile read "uniform" at every depth, and the axis is `fixed` only, so no
+point here is compute-matched to any other and nothing here speaks to ACT.
 
 ```bash
 cargo run --example scaling_sweep -- \
     research/experiments/depth-axis.json depth gpu 1 2 4 8 --seeds=0,1,2
 ```
+
+### Depth vs width: three comparisons, and what each can answer
+
+All cells below: `subst-fst-fixed`, `k_set: [0]` with `k0_rate` 1.0 (zero
+in-context demonstrations), 600 steps, `stop.fixed`, batch 6, ~29 held-out
+instances, **n = 3 seeds per arm**, RTX 3050 4 GB. Instruments: held-out
+**byte accuracy**, exact-match beside it, and the in-minus-out gap from the
+same run, against a **0.333 chance floor** on this 3-symbol alphabet.
+
+Three comparisons exist in this repo and **they are not interchangeable** —
+each holds different quantities fixed, and one of them was initially reported as
+the research goal's answer, which was wrong. All parameter counts were solved
+with `examples/param_match.rs`, not by hand; hand-matching got the first attempt
+50% wrong twice.
+
+#### (i) Matched parameters *and* matched compute — reuse pattern at equal storage
+
+Both arms 32 block-steps/token and ~919K parameters, matched to 0.05%.
+
+| arm | params | byte-in | byte-out | exact-out, per seed |
+|---|---|---|---|---|
+| looping: 4 stages × 8 loops, `d_model` 128, 8 heads | 919,172 | 0.390 | **0.323** | 0.000 / 0.000 / 0.000 |
+| wide: 32 stages × 1 loop, `d_model` 64, 4 heads | 919,648 | **0.849** | **0.625** | 0.000 / 0.219 / 0.067 |
+
+Complete separation: wide's **worst** seed (0.567) beats looping's **best**
+(0.355), far outside the seed spread. At equal arithmetic and equal storage,
+distinct parameter sets beat 4 reused ones ~2× on held-out byte accuracy and by
+a factor of several on exact-match. Reuse does not buy generalization without
+proportional parameters; it buys it worse than the same parameters spent on
+width would.
+
+*One number to correct before someone re-derives it: the per-seed held-out
+exact-match here is 0.000 / 0.219 / 0.067 (mean 0.095). The triple 0.083 / 0.792
+/ 0.625 that circulates in `research/findings.md` and commit `eeb9257` is this
+arm's **in-distribution** exact-match, mislabelled as held-out.*
+
+**The mechanism is not mysterious.** Memorization is storage in weights, so at
+equal parameters the storage is equal and looping ought to be *neutral*. It is
+instead **worse at memorization** (0.390 against 0.849). The cause is the reuse
+itself: 4 weight sets are asked to serve 32 transformations' worth of function.
+
+**A nuance that cuts the other way, stated because it would be easy to omit.** In
+*relative* terms the looping arm retains more of what it learned — 0.323 / 0.390
+= 83% of its in-distribution accuracy transfers, against 0.625 / 0.849 = 74% for
+wide. Per unit of learning, reuse is slightly better at transfer. It simply
+learned far less, and absolute held-out accuracy is what a scaling law is about.
+
+**What this comparison cannot answer.** It hands both arms the same storage, so
+depth cannot win on the parameter axis by construction. It answers *"does the
+reuse pattern matter at equal capacity?"*, not the goal's question.
+
+**Uncontrolled difference.** Head **count** is 8 against 4 and cannot be
+matched — an 8× stage ratio forces an ~8× body-parameter ratio. `head_dim` (16)
+*is* matched. The effect is far too large for head count to explain it, and
+(ii) removes the confound entirely.
+
+#### (ii) Matched compute, parameters free — the goal's question
+
+Identical `d_model` (128), `n_heads` (2), `head_dim` (64), `ffn_hidden` (384)
+and identical compute (16 block-steps/token). Only `n_stages` / `max_loops`
+differ, so head geometry and activation memory are identical and the head-count
+confound above is gone.
+
+| arm | params | byte-in | byte-out | exact-in | exact-out |
+|---|---|---|---|---|---|
+| looping: 2 stages × 8 loops | 492,418 | 0.309 / 0.278 / 0.418 | **0.335** | 0.000 | **0.000** |
+| wide: 16 stages × 1 loop | 3,479,696 | 1.000 / 0.985 / 0.923 | **0.739** | 1.000 / 0.833 / 0.667 | **0.270** |
+
+**7.07× the parameters buys 2.2× the held-out byte accuracy** (0.739 against
+0.335) and takes exact-match from 0.000 to 0.270.
+
+**A trap in this table, stated because it is easy to report backwards.** The
+looping arm's gap is **zero** — per seed −0.004 / **+0.020** / −0.017, mean
+−0.000, one seed positive — while its in-distribution byte accuracy sits at the
+**0.333 chance rate**. Read together, that is not perfect transfer: the model
+memorized **nothing at all**, in-distribution or out. Its 100% relative transfer
+(0.335 ÷ 0.335) is transfer of nothing and is not a transfer advantage. The wide
+arm's gap is −0.144 / −0.314 / −0.231, mean −0.230: it memorized, then
+transferred 76% of it. The relative-retention nuance in (i) is the same trap at
+smaller scale, and this table is where it becomes dangerous: a ratio of two
+chance-level numbers carries no information at all.
+
+#### Why width wins here, and why that is a scope limit rather than a verdict
+
+Three independent measurements say this rung is **storage-limited, not
+compute-limited**:
+
+1. On `subst-fst-fixed` the held-out answer is *"apply a map already in your
+   weights"*. That needs **storage of the rule**, not arithmetic to apply it.
+2. The context axis says in-context demonstrations are **unused**. On the
+   same-rule rung, held-out byte falls **0.909** (k=0) → **0.519** (k=1) →
+   **0.448** (k=2) and held-out exact-match 0.59 → 0.01 → 0.00, n=3 per point,
+   same cell, while in-distribution byte barely moves (0.993 → 0.965). One
+   demonstration *halves* held-out accuracy: the model attends to demos and
+   does worse. Demos are not evidence, so there is no sequential inference for
+   extra loops to be spent on.
+3. Depth 1 sits at in-distribution byte **0.201 — below the 0.333 chance rate**
+   on data it trained on. A memorizing model cannot fail below chance on its
+   own training set; it is confidently applying a *wrong* map. A learning
+   failure, not a compute failure.
+
+**So "depth loses" is NOT established, and "depth was never tested by this task"
+IS.** Any claim that reuse cannot buy generalization has to survive a rung whose
+answer requires several dependent steps and cannot be looked up.
+
+#### The rung monoculture — a methodological result in its own right
+
+Every architecture experiment in this repo ran on `subst-fst-fixed` and nothing
+else. **All nine** architecture manifests — the compute-matched pair, the
+params-free pair and all five frontier points — resolve to `pool instances: 320`
+(= `per_cell` 160 × 2 tracks). Each was confirmed by preflighting it, because
+`jq '.experiment.tasks'` returns `null` for a manifest that inherits its
+`experiment` block, and that `null` reads like a missing setting when it is not
+one.
+
+**Config trap, recorded because it is silent: an absent or empty
+`experiment.tasks` key means ALL EIGHT builtin rungs, not none.** A manifest
+inheriting from a base with no `tasks` is a silent pooled mixture of the whole
+registry, and it produces a perfectly plausible number. See
+`research/experiments/AGENTS.md`, contract 7.
+
+**The missing measurement was a missing sweep, not a missing task.** Four of the
+eight registered rungs already require dependent multi-step computation —
+`dyck1`, `scan-tiny`, `parity`, `periodic` — and none has ever been swept for
+architecture. `dyck1` is the best depth probe of the four: its answer is
+`")".repeat(open_depth(input))`, a function of the input's stack state, so no
+memorized map shortcuts it; its held-out prefixes run 8–28 characters against
+demo prefixes of 2–10, so the computation required grows ~3–14× at test time;
+and Track B holds out nesting depths 4–6, which never appear in training. Read
+"Measuring the gap" instrument 3 before running it — the output alphabet is
+unary, and byte accuracy alone will mislead.
+
+#### Stages↔width frontier — in flight, not for citation
+
+Five points at matched parameters (within 0.10%) and matched 16
+block-steps/token, sweeping only the stages↔width split: 1×16, 2×8, 4×4, 8×2,
+16×1, all on `subst-fst-fixed`, n=3 planned per point.
+
+> Partial, in flight, not for citation: at identical parameters and identical
+> compute, the 1×16 point reads held-out byte ≈0.82 against 2×8's 0.32. If that
+> holds, reuse is not monotonically bad — the worst configuration is 2 stages,
+> not maximal reuse — which undercuts a simple "reuse is storage-inefficient"
+> account. It is confounded with width (d_model 128 → 176, ffn 384 → 526) and
+> untested on a compute-requiring rung.
+
+Two confounds are already recorded in those manifests, before running: the
+width sequence is **not** monotone (`d_model` 176 → 128 → 64 → 64 → 80) because
+the solver takes the smallest width that reaches the target and `ffn_hidden`
+collapses instead at high stage counts (512 → 213 → 10, which makes the 16×1
+endpoint a degenerate-FFN corner); and head count varies unavoidably, because
+trading stages for width at fixed parameters *is* trading heads for stages.
 
 ### Throughput, and why the batch tuner exists
 
@@ -887,14 +1123,15 @@ Listed with what would change the conclusion, strongest first.
    joint location and only one coordinate has been swept, and it needs the
    rule-class holdout in item 1 before "memorization" can mean anything other
    than fitting a map the model was given.
-3. **The depth axis has one pass, at one operating point.** 492,418 params,
-   fixed batches, `fixed {1,2,4,8}` only, 3 seeds. No ACT point and therefore
-   no compute-matched ACT-vs-fixed comparison, no `loops: 16`, one model size,
-   one task, one rung. Within-seed spread exceeds every between-depth
-   difference at n=3, so the apparent saturation is not resolved. And because
-   the profile read "uniform" at every depth, the axis as measured says nothing
-   about whether stages take on different roles with depth — which is the part
-   of Goal question 2 the LR sweep above flagged as the central confound.
+3. **The depth axis has one pass, at one operating point, and its earlier
+   conclusion is refuted.** 492,418 params, fixed batches, `fixed {1,2,4,8}`
+   only, 3 seeds (2 at depth 8). No ACT point and therefore no
+   compute-matched ACT-vs-fixed comparison, no `loops: 16`, one model size, one
+   rung. Within-seed spread exceeds every between-depth difference, so the
+   apparent saturation is not resolved. The axis also moved compute and reuse
+   together — see "Compute-depth axis" — so it measures arithmetic, not the
+   reuse pattern, and the profile read "uniform" at every depth, so it says
+   nothing about whether stages take on different roles with depth.
 4. **The stage-order shuffle diagnostic is weak, and the control behind it is
    degenerate at the current operating point.**
    Reversing stage order collapses accuracy *by construction* — stages are
@@ -922,7 +1159,7 @@ Listed with what would change the conclusion, strongest first.
    every run of this measurement too. The collapse is known to be real and
    learned; it is still **not certified to exceed a chance floor**, and the two
    facts do not substitute for each other. Closing that needs a rung where the
-   untrained model scores above chance — see item 1 under "Next experiments".
+   untrained model scores above chance — see item 7 under "Next experiments".
 5. **Single task, three seeds, and a smaller eval split than the LR sweep.**
    The scaling runs use ~29 held-out instances, so the binomial SE there is
    ~0.09 at p = 0.7 before seed variance, and the gap is a difference of two
@@ -932,19 +1169,30 @@ Listed with what would change the conclusion, strongest first.
    counts — full 6-task suite, 576 held-out instances per eval pass — but
    **not** on the third: it is also 3 seeds, with overlapping per-seed ranges,
    so its 3.6× is directional rather than resolved.
-6. **The non-looped columns of the comparison grid are not implemented.** Only
-   the stop-mode axis (and, by editing the model block, the size axis) is
-   reachable from manifests. Compute-matched non-looped baselines — the thing
-   that decides whether depth is doing anything at all — do not exist.
-7. **The size axis is unmeasured.** `scaling_sweep.rs` takes a `params` axis,
-   but no `d_model` sweep has been run. Goal questions 1 and 4 have no numbers
-   behind them at all.
-
-Also worth stating plainly: what "the depth axis has not been run" used to mean
-is now narrower. There is a first pass over `fixed {1,2,4,8}` with real
-numbers and a real gap, and it is legible only because of byte accuracy. There
-is still **no ACT-vs-fixed comparison at matched compute**, **no size sweep**,
-and no point in the depth sweep where the held-out curve turns over.
+6. **The non-looped baselines exist — and they are one rung deep.** The
+   compute-matched and params-free pairs under "Depth vs width" were built with
+   `examples/param_match.rs` and run at n=3 per arm. They are the control the
+   depth axis was missing, and they refute the reuse premise on `subst-fst-fixed`.
+   What they cannot do is test depth, and that is not a defect of the design —
+   it is a defect of the rung. **All nine architecture manifests resolve to
+   `pool instances: 320`**, i.e. `subst-fst-fixed` and nothing else, whose answer
+   is a lookup and therefore rewards parameters-as-storage while being
+   indifferent to parameters-as-compute. What would change this conclusion: one
+   architecture sweep on `dyck1`, `scan-tiny`, `parity` or `periodic`, where the
+   answer requires dependent multi-step computation. Full diagnosis, the
+   uncontrolled differences, and the config trap are under "Depth vs width".
+7. **The size axis is measured, on the new-rule rung only, and it is flat at
+   chance.** A **6.5× parameter range moves nothing**, so "a bigger model would
+   have induced the rule" is refuted; the table, the cell and the instruments are
+   under "Size axis", including the n=1 point at `d_model` 256. Two limits ride
+   on it. It ran on the **varying-rule** rung, so it is evidence about rule
+   induction and **not** an answer to Goal question 1: the same-rule curve,
+   where held-out byte rises 0.329 → 0.850 with data, has not been swept across
+   size at all, and that is where a scaling law is actually measurable. And a
+   flat result is equally consistent with "capacity does not help here" and
+   "the instrument cannot see a weak competence", because every point sits on a
+   3-symbol alphabet where chance is 0.333. Goal question 4 (weight scale
+   against compute depth) does have numbers now; see "Depth vs width".
 
 ## Next experiments
 
@@ -965,89 +1213,90 @@ kept here for the record, not as work.
    depth sweep is now known to be measuring learned order-dependence rather
    than a structural artifact of sequential stage execution: a collapse recorded
    at any depth is a fact about what the model learned at that depth, not a
-   property of the wiring. Item 2 no longer has to defend against "the depth
-   effect might be an order artifact". That was the reason this was sequenced
-   first, and it is discharged.
+   property of the wiring. That was the reason this was sequenced first, and it
+   is discharged.
 
    **What is still not discharged.** The random-weight control read 0.000 on
    both arms, so `control_informative: false` and `roles_supported: null` stand
    on every run, and the collapse is still uncertified against a chance floor.
-   That is what item 1 is for, and it is now the top open item. The closed test
-   itself does not need rerunning, but anything read off it inherits its n=3.
-1. **Extend the sweep to the k>0 and oracle rungs** (`stage0-oracle`,
-   `stage0-4block`, `subst-fst`) *(partly done: the `subst-fst` rung of the
-   data axis is now measured, and it inverted the reading instead of retiring
-   the item)*. The original intent had two halves and one has run.
+   That is what the oracle rung below is for. The closed test itself does not
+   need rerunning, but anything read off it inherits its n=3.
+1. **Run the architecture comparison on `dyck1`.** Every reuse conclusion so far
+   is scoped to the one rung that cannot test it (limitation 6), and this leaves
+   that scope. Designed and preflighted: `arch-dyck1-looping.json` (4 stages ×
+   8 loops, `d_model` 128, `ffn_hidden` 384, **919,172 params**) against
+   `arch-dyck1-wide.json` (32 stages × 1 loop, `d_model` 64, `ffn_hidden` 58,
+   **919,648**), both 32 block-steps/token, pool 400 → ~40 held-out,
+   `k_set [0]`, `k0_rate` 1.0, 600 steps, batch 6, auto-batch off, n=3 per arm.
+   The same compute-matched pair as on `subst-fst-fixed`, on the rung whose
+   answer is a function of the input's stack state and whose held-out prefixes
+   are ~3–14× longer than its demos.
 
-   **Done: the `subst-fst` rung.** The data axis with a per-instance map is
-   measured, and the result is negative for generalization — held-out byte
-   accuracy flat at chance across an 18× range while in-distribution
-   exact-match reaches 1.000. That answers part of limitation 1: the
-   constant-rule transfer was map application, and it does not survive a fresh
-   map. It also **raises the value of the remaining half instead of retiring
-   this item**, because the varying-rule rung did not produce a rung where the
-   random-weight control scores above chance, so limitation 4's degenerate
-   control is unchanged and the positive control limitation 1 asks for does not
-   exist yet.
+   Three outcomes count: the looped arm wins (reuse does work width cannot buy),
+   they tie (depth was arithmetic in disguise), or width wins again (the premise
+   is wrong on a rung that genuinely rewards computation). Read
+   `length_exact_rate` and `mean_len_ratio` **first** — the output alphabet is
+   unary, so byte accuracy alone cannot separate a right answer from a right
+   length by luck, and the floor is the training-set modal depth, not 0.333
+   ("Measuring the gap", instrument 3). The two arms differ in several model
+   fields at once, so `arm_compare` will correctly refuse to pair them; run them
+   as two sweeps.
 
-   **Still open, in order of value.** (a) The **oracle rung**
-   (`stage0-oracle`, `subst-fst-oracle`), where the map is handed over in the
-   prompt: that separates rule *execution* from rule *induction* and is the
-   rung where the untrained model should score above chance, which is what makes
-   the shuffle control non-degenerate (limitation 4). (b) The **k>0 rungs**
-   (`stage0-4block`, full suite at k ∈ {0,1,2,3,5,8}), which give the induction
-   delta the varying-rule rung has no positive control for. (c) A true
-   **rule-CLASS holdout across task families**, which is not implemented at all
-   and is the only version of this item that puts the headline number on a task
-   whose rule is genuinely held out (limitation 1). With item 0 closed and the
-   `subst-fst` rung reported, the oracle rung is now the highest-value item per
-   GPU-hour.
-2. **Finish the depth axis** *(partly done: a first pass over `fixed
-   {1,2,4,8}` exists)*. **One of the two confounds is gone.** The worry that
-   depth was moving learned order-dependence rather than capacity — a depth
-   effect that is really a change in how order-bound the model is — has been
-   settled by item 0: order-dependence is learned, so a collapse measured at a
-   deeper point reflects what that model learned, not the stage wiring. What
-   remains of the original ambiguity is the other confound, which item 0 does
-   not touch: the existing pass reads "uniform" at every depth and trains on
-   one rung, so nothing there separates a depth effect from a
-   wider-capacity effect, and that is the degenerate-early-halting confound the
-   LR sweep above already demonstrated.
-
-   Still open, in order of value: add **ACT** as a compute-matched point, which
-   is the comparison Goal question 2 actually asks; add `loops: 16` (raising
-   `max_loops` alongside it); and enough seeds to resolve the 4-vs-8 difference
-   the current n=3 pass cannot. Keep reporting byte accuracy, the gap, and the
-   per-stage profile at every point — and now also the reversal collapse, whose
-   per-depth size is a measurement of learned order-dependence rather than of
-   the architecture.
-3. **Run the size axis** *(unmeasured; the tool supports it)*: param-matched
-   models at several `d_model` (128 / 256 / 384 / 512, with `n_heads × head_dim`
-   kept consistent and `vocab_size ≥ 256` for byte level), fixed depth, fixed
-   data. Fit held-out accuracy against log-params and check whether the Track A
-   and Track B slopes differ. This is what "scaling with size" means as a
-   measurement rather than a plan. Note that the model already measured on the
-   other two axes (d_model 128, 492,418 params) is the *smallest* point on this
-   curve, which is worth knowing when the two results are compared.
-4. **Enough seeds to resolve ~0.1 effects** *(partly quantified)*. Three seeds
-   cannot: the within-arm spread is 0.177 on the LR sweep and 0.265–0.495 on
-   the depth sweep's depth=8 point. Either 8–10 seeds per cell or a larger eval
-   split (`indist_eval_per_cell` / `eval_split` take the first N per cell —
-   raising them trades eval time for resolution directly, and the gap needs
-   both halves raised, not one).
-5. **Bracket memorization onset** *(instrument done, location not)*. The
-   in-distribution path exists as its own deliberately named metric
-   (`train.eval_in_distribution` → `memorization` record) rather than a config
-   flip, exactly as intended; `eval_holdout: 0` remains loader-rejected. What
-   is missing is the range: the axis has to be pushed past 288 instances, and
-   to be swept at two or more model sizes and depths so the crossover can be
-   located in more than one coordinate. Pushing the constant-rule axis further
-   alone does not get there — limitation 2 says why: that rung measures map
-   application, and the varying-rule rung has no rise to fall from. Hold the instances-seen budget constant
-   along the axis — the earlier undertrained pass at a fixed step count is what
-   produced the refuted "onset below 16" reading.
-6. **Add the compute-matched non-looped baseline** so "depth" has something
-   to be better than. Without it the depth axis measures only depth.
+   ```bash
+   cargo run --example scaling_sweep -- \
+       research/experiments/arch-dyck1-looping.json depth gpu 8 --seeds=0,1,2
+   cargo run --example scaling_sweep -- \
+       research/experiments/arch-dyck1-wide.json depth gpu 1 --seeds=0,1,2
+   ```
+2. **The representational-capacity decisive point, next on the same rung.**
+   `4 stages × 4 loops` at `d_model = 256`, `ffn_hidden = 748` → **3,480,836**
+   params, against `16 stages × 1 loop` at `d_model = 128`, `ffn_hidden = 384`
+   → **3,479,696**. Matched parameters to 0.03%, matched block-steps to the
+   step, `head_dim` matched, and `ffn:d` preserved at 2.92 against 3.00 so it is
+   not the degenerate-FFN corner the frontier's `16×1` endpoint falls into. The
+   looped arm gets 4× the width per stage at identical storage and arithmetic.
+   If **representational capacity** is its deficit it should climb well above
+   the looped arm's number toward the wide arm's; if **storage** is the deficit
+   it will not move. Cheapest experiment that discriminates the two. Solve the
+   widths with `cargo run --example param_match -- 4 4 3479696`.
+3. **Rule-class holdout.** Train on some procedures, evaluate on one never seen
+   in any form. **Not implemented at all**, and it is what a generalization
+   claim needs; no amount of work on the two `subst-fst` rungs substitutes for
+   it (limitation 1).
+4. **The same-rule curve across model sizes.** Sweeping `d_model` on
+   `subst-fst-fixed`, where held-out byte rises 0.329 → 0.850 with data, is the
+   one measurement here that could produce an actual scaling law rather than a
+   null. Needs the data axis at 3+ sizes, not a single size, and
+   `same-rule-size.json` makes it reachable. This is also the only remaining
+   route to Goal question 1 (limitation 7).
+5. **A rung whose output space beats chance.** Every measurement on the
+   new-rule rung sits on a 3-symbol alphabet where chance is 0.333, so a weak
+   partial competence cannot be distinguished from guessing at all — and the
+   6.5× capacity increase not moving the number is equally consistent with
+   "there is no weak competence" and "the instrument cannot see one". A larger
+   alphabet settles it. `dyck1` has the opposite problem — a unary alphabet
+   where 0.333 is the wrong floor — so it is not the answer to this item.
+6. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
+   within-seed spread at or above its between-condition differences. Fill in
+   `d_model` 256 seeds s1/s2 and depth-8 seed 2 — item 9 below is why they are
+   missing.
+7. **De-confound the oracle rung.** Add ~20 chars of inert filler to
+   `subst-fst` so both arms share a length distribution, isolating the header's
+   content from its length. Needs a task variant, not a manifest. Until then
+   "execution vs induction" is untested rather than answered. The same rung is
+   also the one place an untrained model should score above chance — the map is
+   in the prompt — which is what limitation 4 needs to make the shuffle control
+   non-degenerate, and what limitation 1 needs as a positive control for
+   induction.
+8. **Bracket memorization onset.** The new-rule held-out curve never rises, so
+   it cannot bracket onset; the same-rule curve rises 0.329 → 0.850 across an
+   18× data range and shows no sign of turning over. Onset needs a curve that
+   rises then falls, and no rung tested so far does that (limitation 2).
+9. **Never run two sweeps at once on the 4 GB card.** Two auto-batch tuners
+   means each measures its baseline before the other has allocated, and the
+   watchdog kills the run at ~20 minutes with `CUDA_ERROR_DEINITIALIZED`. This
+   is what cost the `d_model` 256 seeds and, earlier, the k=4 and k=8 points
+   and depth-8 seed 2.
 
 ## Decisive read
 
@@ -1088,18 +1337,24 @@ Natural language. Scale.
 - `examples/chain.rs` — chained experiments with checkpoint dependencies +
   forgetting evals
 - `examples/lr_sweep.rs` — two-axis (LR × seed) sweep over held-out accuracy
-- `examples/scaling_sweep.rs` — named-axis (`data` | `depth` | `params`) sweep
-  reporting both accuracies and the gap, with `--auto-batch`
+- `examples/scaling_sweep.rs` — named-axis (`data` | `depth` | `params` | `k`)
+  sweep reporting both accuracies and the gap, with `--auto-batch`
 - `examples/arm_compare.rs` — paired two-arm comparison (ordered vs
   order-augmented) over seeds, log-driven, refusing any pair whose arms differ
   by more than the intervention
+- `examples/param_match.rs` — solve both arms of a depth-vs-width pair at
+  matched parameters (searches `head_dim`, binary-searches `ffn_hidden`; an
+  explicit third argument pins the target, which is what lets the
+  stages↔width frontier hold parameters fixed)
 - `examples/verify_port.rs` — asserts a research manifest resolves to the same
   config as a reference manifest, field by field
 - `configs/` — run manifests + chains (JSON, no recompile to tweak)
 - `research/` — the running experiment record: `findings.md` is the
-  consolidated read, `experiments/` holds a versioned manifest per reported
-  result. `AGENTS.md` files throughout the tree hold the local contracts;
-  `AGENTS.md` at the root is the index.
+  consolidated read of what we currently believe, `experiments/` holds one
+  versioned manifest per reported result with its run command in `_comment`,
+  and `runs/` holds the gitignored `run.jsonl` logs every reported number is
+  read back out of. `AGENTS.md` files throughout the tree hold the local
+  contracts; `AGENTS.md` at the root is the index.
 
 ## Optimizer
 
@@ -1175,6 +1430,15 @@ later with a confusing message or, worse, name a real directory and load the
 wrong file. A `$` that does not start a valid reference is left alone, so `costs
 $5` survives. A reference must start with a letter or underscore, so `$5` is
 currency and `$x_1` is a (rejected, unknown) reference.
+
+**An absent or empty `experiment.tasks` key means all eight builtin rungs, not
+none.** `harness/experiment.rs` resolves an empty list to the whole registry, so
+a manifest inheriting from a base with no `tasks` is a silent pooled mixture and
+produces a plausible number. Corollary for reading manifests back:
+`jq '.experiment.tasks'` returns `null` for a manifest that legitimately
+inherits its `experiment` block, because `jq` does not resolve `extends`. Never
+conclude a manifest's rung from `jq` — run
+`cargo run --example run -- <manifest>` and read the resolved pool count.
 
 Variations are internally tagged enums, so each is a manifest edit:
 

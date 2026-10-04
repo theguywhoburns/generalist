@@ -156,13 +156,24 @@ distract" rather than a point of interest.
 within 0.05%. This is the experiment the goal's central question turns on, and
 the only design in the repo that could have supported the premise.
 
-| arm | params | in-dist byte | held-out byte | held-out exact |
-|---|---|---|---|---|
-| looping: 4 stages × 8 loops | 919,172 | 0.390 | **0.323** | 0.000, 0.000, 0.000 |
-| wide: 32 stages × 1 loop | 919,648 | **0.849** | **0.625** | 0.083, 0.792, 0.625 |
+| arm | params | in-dist byte | held-out byte | in-dist exact | held-out exact |
+|---|---|---|---|---|---|
+| looping: 4 stages × 8 loops | 919,172 | 0.390 | **0.323** | 0.000, 0.000, 0.000 | 0.000, 0.000, 0.000 |
+| wide: 32 stages × 1 loop | 919,648 | **0.849** | **0.625** | 0.083, 0.792, 0.625 | 0.000, 0.219, 0.067 |
 
-Wide's *worst* seed (held-out 0.567) beats looping's *best* (0.355). Complete
+Wide's *worst* seed (held-out byte 0.567) beats looping's *best* (0.355). Complete
 separation, far outside the seed spread.
+
+**Correction, and it was mine.** Commit `eeb9257` and the first version of this
+section reported the wide arm's held-out exact-match as `0.083 / 0.792 / 0.625`.
+Those are its **in-distribution** exact-match. Read out of
+`checkpoints-compute-matched-wide/*/run.jsonl`, its held-out exact is
+`0.000 / 0.219 / 0.067`, mean **0.095** — not 0.500. The exact-match margin is
+therefore 0.095 against 0.000, not 0.500 against 0.000, and the earlier text
+overstated it by roughly 5×. The byte-accuracy numbers (0.625 vs 0.323) are
+unaffected, and byte accuracy is what a sweep ranks on (`src/AGENTS.md`
+contract 7), so the conclusion stands — but the claim was wrong and is corrected
+here rather than quietly edited, per `research/AGENTS.md` contract 3.
 
 **So reuse does not buy generalization without proportional parameters. It buys
 generalization worse than those parameters spent on width would.** At equal
@@ -326,6 +337,82 @@ training-set modal depth scores. That floor has to be computed from the eval set
 before any arm is called above it. `scan-tiny` avoids the unary-output problem
 and is the better second choice, because Track B holds out `thrice` and novel
 `and` pairings — a compositional holdout already built in.
+
+---
+
+## The stages↔width frontier is U-shaped, and it refutes the storage-inefficiency account
+
+`measured`, n=3 per point, all points at **492,418 params within 0.10%** and
+**16 block-steps/token**, same-rule rung, 600 steps. Only `n_stages`,
+`max_loops`, and the width that split forces differ.
+
+| point | stages × loops | d_model | ffn | in-dist byte | held-out byte | held-out exact | gap |
+|---|---|---|---|---|---|---|---|
+| `s01l16` | 1 × 16 | 176 | 526 | **0.942** | **0.821** | **0.475** | −0.121 |
+| `s02l08` | 2 × 8 | 128 | 384 | 0.394 | 0.393 | 0.000 | −0.001 |
+| `s04l04` | 4 × 4 | 64 | 512 | 0.331 | 0.268 | 0.000 | −0.063 |
+| `s08l02` | 8 × 2 | 64 | 213 | 0.481 | 0.477 | 0.000 | −0.004 |
+| `s16l01` | 16 × 1 | 80 | 10 | **0.988** | **0.746** | **0.263** | −0.242 |
+
+**Both endpoints beat every interior point by a wide margin** — held-out 0.821
+and 0.746 against 0.268–0.477. The curve is not monotone in reuse.
+
+**This refutes the storage-inefficiency account stated two sections above, and
+that account was mine.** It predicts maximal reuse should be the *worst*
+configuration, since one weight set serving 16 transformations is the most
+extreme compression of function into storage. The measurement puts `1×16` first
+and `2×8` near the bottom. Storage-inefficiency is monotone in reuse; this is
+not. The earlier claim survives only for the interior of the range, and the
+sentence "reuse is storage-inefficient" should be read as "reuse is
+storage-inefficient **in the 2-to-8-stage band**", not as a general law.
+
+**The discriminator is memorization, not transfer.** The two points that
+memorize (in-dist 0.942, 0.988) transfer. The three that do not (in-dist 0.331,
+0.394, 0.481 — at or near the 0.333 chance rate) sit at held-out ≈ in-dist ≈
+chance with **exact-match 0.000 at every one of their fifteen runs**. Same
+signature as the params-free looped arm: nothing memorized, so nothing to
+transfer.
+
+**A useful control falls out of this.** `frontier-s02l08` (n_heads 8, head_dim
+16) and `paramsfree-looping` (n_heads 2, head_dim 64) are the *same* parameters
+and the *same* compute with only head geometry differing. They read in-dist
+0.394 vs 0.335 and held-out 0.393 vs 0.335. Head geometry does not move this
+result, which retires the head-count worry for this configuration — the
+uncontrolled difference in the compute-matched pair is not what drives it.
+
+### The confound, stated before the result is used
+
+**This sweep is confounded with effective batch size and cannot isolate the
+stages↔width split.** The five manifests inherited `auto_batch: true` from
+`base-492k.json`, and the five points have different `d_model` and therefore
+different activation footprints. The tuner selected a different budget for
+each: realized effective batches were **64 / 128 / 128 / 128–256 / 256** — and
+within `s08l02` it gave different seeds different batches, so it is
+nondeterministic there. The manifests asked for batch 6 and the tuner could not
+subdivide a micro-batch, so every point trained at 64 or above, 10× the
+requested value.
+
+`src/AGENTS.md` contract 5 and root contract 5 both say a sweep arm must differ
+from its neighbour only in the intervention. This one varied batch too. The
+compute-matched pair got it right (`auto_batch: false`, documented in its
+`_comment`); the params-free pair got lucky — both arms independently landed on
+effective 128, verified post hoc from `.runs/paramsfree.log`, so that comparison
+is sound.
+
+The batch does **not** obviously explain the pattern, and that is worth stating
+precisely rather than as reassurance: the two points that memorize received the
+*smallest* (64) and the *largest* (256) batches, while the three that memorize
+nothing all received 128. "Does not obviously explain it" is not "does not
+explain it". The pattern is also confounded with the attention-versus-FFN
+allocation each split forces — `ffn_hidden` runs 526 → 384 → 512 → 213 → 10
+while `d_model` runs 176 → 128 → 64 → 64 → 80, so neither axis falls
+monotonically and `n_stages` is traded against both at once.
+
+**Re-running with `auto_batch: false, batch_size: 6` on all five points, so the
+only remaining differences are the split and the width it forces.** That run is
+the one to cite. Until it lands, this section's shape is a hypothesis that the
+first pass is consistent with and that the batch confound is sufficient to
+explain.
 
 ---
 

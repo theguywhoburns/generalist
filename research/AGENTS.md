@@ -61,6 +61,19 @@ reproduce; those live here permanently.
    *nothing* — there was nothing to transfer. Read the two levels together. A
    ratio of two chance-level numbers (in-dist ÷ held-out) carries no information
    and must not be reported as a transfer-rate advantage.
+10. **A sweep that varies model shape must pin `auto_batch: false`.** The batch
+    tuner picks its budget from measured activation memory, so **points with
+    different `d_model` get different batches** — which is a second variable
+    along an axis whose only intended variable is the shape. This has now
+    silently confounded one sweep: five frontier points came in at effective
+    batches of 64 / 128 / 128 / 128–256 / 256 against a requested 6, and within
+    one point the tuner was nondeterministic across seeds. It is easy to miss
+    because the tuner reports success and prints no warning about the axis.
+    Set `auto_batch: false` and an explicit `batch_size` on **every** manifest in
+    a multi-point sweep, and then **verify from the sweep log, do not assume** —
+    `grep 'short-band micro'` gives the realized micro-batch per run. Two other
+    arms happened to land on the same realized batch and were sound by luck
+    rather than by construction; check rather than reason about it.
 
 ## Work Guidance
 

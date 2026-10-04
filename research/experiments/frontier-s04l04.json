@@ -39,7 +39,8 @@
     "ckpt_dir": "$repo_root/research/runs/checkpoints-frontier-s04l04",
     "batch_size": 6,
     "eval_every": 1000,
-    "indist_eval_per_cell": 12
+    "indist_eval_per_cell": 12,
+    "auto_batch": false
   },
   "experiment": {
     "per_cell": 160,
