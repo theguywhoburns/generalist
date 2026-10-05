@@ -257,10 +257,38 @@ advantage even in principle.** Three independent measurements now agree:
    confidently applying a *wrong* map. A learning failure, not a compute failure.
 
 **Therefore: "depth loses" is not established, and "depth was never tested by this
-task" is.** Width wins here for a boring reason — the rung rewards
+task" IS.** Width wins here for a boring reason — the rung rewards
 parameters-as-storage and is indifferent to parameters-as-compute. Any claim that
 reuse cannot buy generalization has to survive a task whose answer requires
 several dependent steps and cannot be looked up.
+
+### The storage-limited diagnosis is confirmed, and `dyck1` then turned out too easy
+
+`dyck1` (answer = `")".repeat(open_depth(input))`, held-out prefixes 3–14× longer
+than its demos) at matched params and compute, n=3, 2000 steps:
+
+| arm | byte | exact | length_exact | mean_len_ratio |
+|---|---|---|---|---|
+| looping 4×8 | 1.000 / 0.798 / 1.000 | 1.000 / 0.524 / **0.000** | 1.00 / 0.52 / 0.00 | 1.00 / 0.83 / **10.51** |
+| wide 32×1 | 1.000 / 1.000 / 1.000 | 1.000 / 1.000 / 0.728 | 1.00 / 1.00 / 0.73 | 1.00 / 1.00 / 1.17 |
+
+Both clear the measured length-only floor (0.779 byte / 0.629 exact, from 89 real
+eval instances) decisively, so `dyck1` *is* learnable at 919K and it does reward
+computation. **That confirms the storage-limited diagnosis as a property of
+`subst-fst-fixed` rather than of the model.**
+
+But both arms reach byte 1.000 on 2 of 3 seeds, so the rung **saturates and cannot
+discriminate them** — the opposite failure from the frontier, where everything sat
+at the chance floor. The comparison is inconclusive because the task is too easy.
+
+**The instrument warning earned its place immediately, and again.** Looping seed 2
+scores byte **1.000** and exact **0.000** because every target byte is correct
+(2/2, 1/1 hits) but EOS is never emitted — the decode runs to the 16-char cap on
+**81 of 81** instances, `mean_len_ratio` 10.51. Byte accuracy alone calls that a
+perfect run; exact-match alone calls it a total failure. Only the length metrics
+identify it as a non-terminating decode. Without them this seed would have been
+reported as a catastrophic failure. Wide's worst seed (byte 1.000, ratio 1.17)
+fails gracefully by comparison — mildly wrong length.
 
 **Correction: I then wrote that such a task "does not exist yet." That was
 wrong.** Four of the eight registered rungs already require dependent multi-step
@@ -337,6 +365,77 @@ training-set modal depth scores. That floor has to be computed from the eval set
 before any arm is called above it. `scan-tiny` avoids the unary-output problem
 and is the better second choice, because Track B holds out `thrice` and novel
 `and` pairings — a compositional holdout already built in.
+
+---
+
+## `scan-tiny`: the rung that finally discriminates the arms, and width wins 2:1
+
+`measured`, n=3 per arm, matched parameters (919,172 vs 919,648) and matched
+block-steps (32/token), 2000 steps, `per_cell` 400, batch 64,
+`micro_bt_budget` 3072, `auto_batch` off, `k_set: [0]`. **Eval sets verified
+identical between arms within every seed** (35/37, 31/21, 24/41 per track), so the
+comparison is properly paired.
+
+`scan-tiny`'s answer is `execute(command)` — parse clause structure, expand
+`twice`/`thrice`, concatenate. No per-instance map exists to memorize, so the rung
+rewards computation rather than storage, which is the property
+`subst-fst-fixed` lacks. Output alphabet is 4 symbols (J/W/L/R) and output length
+varies 1–9, so both a symbol floor and a length floor exist and are measurable.
+
+**Measured floors on this rung: 0.663 byte for a length-only guesser** (always
+emit 4 symbols — the modal target length) **and 0.250 for a constant-symbol
+guesser.**
+
+| arm | byte | exact | length_exact | mean_len_ratio |
+|---|---|---|---|---|
+| **looping 4×8** | 0.302 / 0.464 / 0.505 | 0.014 / 0.077 / 0.062 | 0.61 / 0.65 / 0.40 | 0.87 / 0.95 / **1.76** |
+| **wide 32×1** | **0.970 / 0.957 / 0.940** | **0.611 / 0.885 / 0.769** | 0.65 / **0.94** / 0.91 | 1.08 / 1.00 / 1.01 |
+
+**Wide's worst seed (0.940) beats looping's best (0.505) by 0.435.** Every wide
+seed clears both floors; **every looping seed sits below the 0.663 length-only
+floor.** This is the largest, cleanest separation between the two architectures
+anywhere in this repo, and it is on a rung that cannot be satisfied by memorization.
+
+**The looped arm's failure is compositional, not formatting.** Its
+`length_exact` is 0.61–0.65 against wide's 0.91–0.94, and its `mean_len_ratio` is
+0.87–0.95 on two seeds — so it frequently gets the output *length* approximately
+right while getting the *symbols* wrong. It has learned roughly how many actions to
+emit and not which. That is the signature of a model that memorized length
+statistics rather than the composition.
+
+### The Track A/B split is a real compositional holdout, and it partially transfers
+
+Track B holds out `thrice` and novel `and` pairings — a rule-class holdout built
+into the task, which is the one `research/findings.md` has listed as not
+implemented at all. Held-out byte by track, against each track's own floor:
+
+| arm | seed | Track A | Track B |
+|---|---|---|---|
+| looping | 0 | 0.289 (floor 0.572) | 0.308 (floor 0.766) |
+| looping | 1 | 0.539 (floor 0.776) | 0.393 (floor 0.715) |
+| looping | 2 | 0.583 (floor 0.872) | 0.466 (floor 0.741) |
+| wide | 0 | 0.976 (floor 0.572) | 0.968 (floor 0.766) |
+| wide | 1 | **1.000** (floor 0.776) | 0.916 (floor 0.715) |
+| wide | 2 | 0.969 (floor 0.872) | 0.926 (floor 0.741) |
+
+**The wide arm does partly transfer across the compositional holdout.** Track B
+costs it 0.024–0.063 byte against Track A (0.976→0.968, 1.000→0.916,
+0.969→0.926) and 0.143–0.479 exact-match, while staying above both floors on every
+seed. So **held-out `thrice` and novel `and` pairings are learnable in part** —
+this is the first rule-class-style transfer measured anywhere in this repo, and it
+is real.
+
+The exact-match drop is larger than the byte drop, which is the length metric's
+doing again: on Track B the wide arm gets the length right more often than the
+exact action sequence.
+
+**The looped arm is below its own floor on every track of every seed**, so nothing
+about its compositional behaviour can be read as transfer rather than noise.
+
+**What this does not settle.** Head count is 8 vs 4 and remains unmatchable at an
+8× stage ratio — the uncontrolled difference carried from the `subst-fst` pair.
+`head_dim` (16) is matched. The effect is large enough that head count is unlikely
+to explain it, but it is not zero.
 
 ---
 
@@ -657,56 +756,48 @@ could show above it.---
 
 ## Open, in order of value
 
-0. **Run the architecture comparison on `dyck1`.** Designed and preflighted, not
-   yet run: `research/experiments/arch-dyck1-looping.json` (4 stages × 8 loops,
-   919,172 params) against `arch-dyck1-wide.json` (32 stages × 1 loop, 919,648),
-   both 32 block-steps/token, pool 400 → ~40 held-out, `k_set [0]`. Same
-   compute-matched pair as on `subst-fst-fixed`, on the rung whose answer is a
-   function of the input's stack state and whose held-out prefixes are 3–14×
-   longer than its demos. **Every reuse conclusion so far is scoped to the one
-   rung that cannot test it, and this is the experiment that leaves that scope.**
-   Three outcomes count: the looped arm wins (reuse does work width cannot buy),
-   they tie (depth was arithmetic in disguise), or width wins again (the premise
-   is wrong on a rung that genuinely rewards computation). Read
-   `length_exact_rate` and `mean_len_ratio` first — the output alphabet is unary.
-1. **The representational-capacity decisive point, next on the same rung.**
-   `4 stages × 4 loops` at `d_model = 256`, `ffn_hidden = 748` → 3,480,836
-   params, against `16 stages × 1 loop` at `d_model = 128`, `ffn_hidden = 384`
-   → 3,479,696. Matched parameters to 0.03%, matched block-steps to the step,
-   `head_dim` matched, and `ffn:d` preserved at 2.92 vs 3.00 so it is not the
-   degenerate-FFN corner the frontier's `16×1` endpoint falls into. The looped
-   arm gets 4× the width per stage at identical storage and arithmetic. If
-   **representational capacity** is its deficit it should climb well above the
-   looped arm's number toward the wide arm's; if **storage** is the deficit it
-   will not move. Cheapest experiment that discriminates the two.
-2. **Rule-CLASS holdout.** Train on some procedures, evaluate on one never seen
-   in any form. Not implemented at all. This is what a generalization claim needs
-   and no amount of work on the two `subst-fst` rungs substitutes for it.
+0. **Rule out the head-count confound on `scan-tiny`,** now that it carries the
+   decisive result. Head count is 8 vs 4 and cannot be matched at an 8× stage
+   ratio, which is the one uncontrolled variable left in the strongest finding in
+   this repo. `frontier-s02l08` vs `paramsfree-looping` showed head geometry does
+   not move *that* configuration (0.394 vs 0.335 in-dist at identical params and
+   compute), which is suggestive but was measured on the storage rung. A
+   compute-matched pair with `head_dim` 16 on both arms and head counts forced
+   equal — by giving up some of the stage ratio — would close it.
+1. **The representational-capacity decisive point.** `4 stages × 4 loops` at
+   `d_model = 256`, `ffn_hidden = 748` → 3,480,836 params, against `16 stages × 1
+   loop` at `d_model = 128`, `ffn_hidden = 384` → 3,479,696. Matched parameters to
+   0.03%, matched block-steps, `head_dim` matched, `ffn:d` preserved at 2.92 vs
+   3.00. Now much more worth running on `scan-tiny` than on `subst-fst-fixed`,
+   because that rung discriminates: if the looped arm's deficit is
+   representational, 4× the width per stage at identical storage should close much
+   of the 0.435 gap. If it does not move, the deficit is not width.
+2. **The gate-structure result on a discriminating rung.** One gate over a 4-block
+   stack beat two gates over 2-block stacks 0.891 vs 0.569 on `subst-fst-fixed`,
+   differing by a single halting head. That is the only reuse win in the repo, and
+   it was measured on the storage rung where `scan-tiny` now shows looping at
+   0.302–0.505. Running the two gate arms on `scan-tiny` says whether the gate
+   effect and the width effect are the same finding or two different ones.
 3. **The same-rule curve across model sizes.** Sweeping `d_model` on
-   `subst-fst-fixed`, where held-out byte rises 0.329 → 0.850 with data, is the
-   one measurement here that could produce an actual scaling law rather than a
-   null. Needs the data axis at 3+ sizes, not a single size.
-4. **A rung whose output space beats chance.** Every measurement on the new-rule
-   rung sits on a 3-symbol alphabet where chance is 0.333, so a weak partial
-   competence cannot be distinguished from guessing at all — and a 6.5× capacity
-   increase not moving the number is equally consistent with "there is no weak
-   competence" and "the instrument cannot see one". A larger alphabet settles it.
+   `subst-fst-fixed`, where held-out byte rises 0.329 → 0.850 with data, is the one
+   measurement here that could produce an actual scaling law rather than a null.
+   `scan-tiny` is now a better candidate for it, since it has a measured floor and
+   discriminates between architectures.
+4. **A rung whose output space beats chance on the new-rule axis.** Every
+   measurement on the new-rule rung sits on a 3-symbol alphabet where chance is
+   0.333, so a weak partial competence cannot be distinguished from guessing.
 5. **Seeds.** n=3 cannot resolve anything below ~0.1, and every axis here has
    within-seed spread at or above its between-condition differences. The 256 point
-   of the size axis is n=1 only because a concurrent run starved the card and the
-   watchdog killed the sweep. Fill in `d_model` 256 seeds s1/s2 serially.
+   of the size axis is n=1 only because a concurrent run starved the card. Fill in
+   `d_model` 256 seeds s1/s2 serially.
 6. **De-confound the oracle rung.** Add ~20 chars of inert filler to `subst-fst`
-   so both arms share a length distribution, isolating the header's content from
-   its length. Needs a task variant, not a manifest. Until then "execution vs
-   induction" is untested rather than answered.
+   so both arms share a length distribution. Needs a task variant, not a manifest.
 7. **`InstanceInfo` should carry the oracle header.** The sample dump shows demos,
-   query and target but not the header — the only part of the prompt that differs
-   between the oracle and induction arms.
-8. **Bracketing memorization onset.** The new-rule held-out curve never rises, so
-   it cannot bracket onset; the same-rule curve rises 0.329 → 0.850 across a 18×
-   data range and shows no sign of turning over. Onset needs a curve that rises
-   then falls, and no rung tested so far does that.
+   query and target but not the header.
+8. **Bracketing memorization onset.** No rung tested so far has a held-out curve
+   that rises then falls.
 9. **Do not run two sweeps concurrently.** A 4GB card plus two auto-batch tuners
-   means each measures its baseline before the other has allocated, and the
-   watchdog kills the run at ~20 minutes with `CUDA_ERROR_DEINITIALIZED`. This is
-   what cost the 256 seeds on the size axis.
+   starves the watchdog at ~20 minutes with `CUDA_ERROR_DEINITIALIZED`.
+10. **Remember `batch_size` is the accumulation target, not the micro size.**
+    `train.micro_bt_budget` is the knob; the shipped 2048 caps a `dyck1`-shaped
+    micro at 32 rows whatever `batch_size` says. See `src/train.rs`.

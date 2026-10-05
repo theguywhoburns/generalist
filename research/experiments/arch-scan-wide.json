@@ -1,0 +1,83 @@
+{
+  "_comment": [
+    "COMPUTE-MATCHED depth vs width on scan-tiny: wide: 32 stages x 1 loop, d_model 64.",
+    "",
+    "WHY THIS RUNG, after dyck1 turned out too easy. On dyck1 both arms reached",
+    "byte 1.000 on 2 of 3 seeds, so the comparison could not separate them -- the",
+    "opposite failure from the frontier, where everything sat at the chance floor.",
+    "scan-tiny is harder for a checkable reason rather than by hope:",
+    "",
+    "  - OUTPUT ALPHABET IS 4 SYMBOLS (J/W/L/R), not unary, so byte accuracy has a",
+    "    real floor and a constant-symbol guesser scores 0.25.",
+    "  - OUTPUT LENGTH VARIES 1..9 actions, set by the command: `twice` doubles one",
+    "    action, `thrice` triples it, `and` concatenates. The model must emit a",
+    "    specific LENGTH as well as specific symbols, so `mean_len_ratio` and",
+    "    `length_exact_rate` are load-bearing. On dyck1 they were the ONLY",
+    "    instruments that caught a seed scoring byte 1.000 / exact 0.000 because it",
+    "    never emitted EOS -- byte accuracy alone called that a perfect run.",
+    "  - THE ANSWER CANNOT BE LOOKED UP. It is `execute(command)`: parse clause",
+    "    structure, expand modifiers, concatenate. No per-instance map exists to",
+    "    memorize, so this rung rewards computation rather than storage. That is the",
+    "    property subst-fst-fixed lacks and dyck1 has.",
+    "",
+    "TRACK B IS A RULE-CLASS HOLDOUT, built into the task: Track A never emits",
+    "`thrice` and uses fewer `and` clauses; Track B does both. The per-track split is",
+    "therefore the compositional holdout that queue item 2 has been asking for and",
+    "that has never been run. Report the tracks separately -- a pooled number would",
+    "hide exactly the effect the split exists to expose.",
+    "",
+    "THE PAIR, from examples/param_match.rs:",
+    "  looping : n_stages 4,  max_loops 8, d_model 128, ffn 384, head_dim 16, 8 heads",
+    "            = 32 block-steps/token, 919,172 params",
+    "  wide    : n_stages 32, max_loops 1, d_model  64, ffn  58, head_dim 16, 4 heads",
+    "            = 32 block-steps/token, 919,648 params  (+0.05%)",
+    "",
+    "Uncontrolled difference, carried from the subst-fst pair: head COUNT is 8 vs 4",
+    "and cannot be matched at an 8x stage ratio. head_dim (16) IS matched. If the",
+    "wide arm wins, rule out head count before concluding anything about reuse.",
+    "",
+    "CELL, deliberately matched to the dyck1 pair so the two rungs are comparable:",
+    "2000 steps (600 was shown to be short), per_cell 400, batch_size 64,",
+    "micro_bt_budget 3072 (48 rows/micro; the measured shared ceiling on this card",
+    "-- batch_size is the ACCUMULATION target and does NOT control micro size),",
+    "auto_batch FALSE because the tuner sizes each arm independently and would hand",
+    "these two different batches.",
+    "",
+    "k_set [0] with k0_rate 1.0: the rule is the command language, universal and not",
+    "per-instance, so demos are not evidence for it. This isolates execution from",
+    "induction. Do not report a rule-INDUCTION result from this rung.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/arch-scan-wide.json depth gpu 1 \\",
+    "    --seeds=0,1,2"
+  ],
+  "extends": "compute-matched.json",
+  "model": {
+    "n_stages": 32,
+    "max_loops": 1,
+    "d_model": 64,
+    "n_heads": 4,
+    "head_dim": 16,
+    "ffn_hidden": 58
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-arch-scan-wide",
+    "steps": 2000,
+    "auto_batch": false,
+    "batch_size": 64,
+    "micro_bt_budget": 3072
+  },
+  "experiment": {
+    "tasks": [
+      "scan-tiny"
+    ],
+    "per_cell": 400,
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  }
+}
