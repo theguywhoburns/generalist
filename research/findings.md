@@ -15,26 +15,39 @@ Confidence key: **measured** = reproduced or n≥3 with per-seed recorded;
 | memorization | **measured, strong** | in-distribution byte 0.90–0.93, `off_pair` 0.04–0.05 vs a 0.333 chance rate |
 | generalization — same rule, new inputs | **measured, present** | held-out byte 0.329 → 0.850 as data grows 16 → 288 |
 | generalization — new rule | **measured, absent** | held-out byte 0.18–0.34, at or below the 0.333 chance rate on three independent instruments, flat over 18× data and across every size run so far |
-| reuse vs width (the architecture question) | **measured, against the premise** | at matched params **and** compute, width wins 2:1 on held-out; at matched compute with params free, 7.07× params buys 2.2× held-out |
+| reuse vs width, on a rung that rewards computation | **measured, against the premise** | `scan-tiny`, matched params and compute: wide 0.940–0.970 vs looping 0.302–0.505 held-out byte, against a measured 0.663 length-only floor |
+| rule-class transfer (compositional holdout) | **measured, partial** | `scan-tiny` Track B holds out `thrice` and novel `and` pairings; the wide arm stays above both floors on every seed |
+| gate structure | **measured, for reuse — once** | one gate over a 4-block stack 0.891 vs two gates over 2-block stacks 0.569, differing by a single halting head |
 
-Rows 2 and 3 are at 492,418 params. Row 4 is not a single cell and does not
-reduce to one: see the two sections below, which reach opposite-looking
-conclusions because they hold different things fixed.
+Rows 2 and 3 are at 492,418 params. Rows 4–6 are not a single cell each and do not
+reduce to one: see the sections below, which reach different conclusions because
+they hold different things fixed and run on different rungs.
 
 The gap between rows 2 and 3 is the headline for *what the model learns*: transfer
 to new inputs under a trained rule is real and scales with data; transfer to an
 unseen rule is nothing, and "nothing" here means three instruments agreeing with
 chance rather than one accuracy number.
 
-**Row 4 is the headline for the research goal, and it is a negative.** Reuse does
-not buy generalization without proportional parameters on this rung. But the
-reason is disqualifying rather than decisive: this rung rewards
-parameters-as-**storage** and is indifferent to parameters-as-**compute**, so it
-cannot test depth's advantage even in principle. Treat "depth loses" as
-untested and "depth was never tested by this task" as the finding. See
-`research/AGENTS.md` contract 8 for why the three available comparisons are not
-interchangeable — one of them was initially reported as the goal's answer and
-that was wrong.
+**Row 4 is the headline for the research goal, and it is a negative.** On a rung
+whose answer is `execute(command)` — which no memorized map can satisfy — reuse
+does not buy generalization without proportional parameters. Wide's *worst* seed
+beats looping's *best* by 0.435, every wide seed clears the length-only floor, and
+every looping seed sits below it. The looped arm's `length_exact` of 0.61–0.65
+against wide's 0.91–0.94 at similar `mean_len_ratio` says its failure is
+compositional (wrong symbols) rather than formatting (wrong length).
+
+**This took three attempts to measure honestly, and the earlier two were wrong in
+opposite directions.** `subst-fst-fixed` rewards parameters-as-**storage** and is
+indifferent to parameters-as-**compute**, so it could not test depth's advantage at
+all; `dyck1` does reward computation but saturated, both arms reaching byte 1.000.
+`scan-tiny` is the first rung that both rewards computation and is hard enough to
+separate the arms. See `research/AGENTS.md` contract 8 for why the three
+compute-matched comparisons are not interchangeable — one was initially reported
+as the goal's answer and that was wrong.
+
+**Row 6 is the one result that favours reuse**, and it was measured on the storage
+rung, so it does not yet contradict row 4. Whether the gate effect and the width
+effect are the same finding is open, and `scan-tiny` is where to settle it.
 
 **Scope note.** In-context learning and higher-order inference were dropped as
 *goals*. The varying-rule rung is exactly the ICL test, it is at chance at every

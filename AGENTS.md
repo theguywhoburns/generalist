@@ -108,6 +108,17 @@ already caused a wrong result, a broken build, or a wrong conclusion.
    so a wrong-length output scores as partially correct. `length_exact_rate`
    and `mean_len_ratio` exist because of that. When adding a metric, ask what it
    cannot see, and add the companion metric in the same change.
+   **This is not theoretical and the dyck1 rung proved it both ways.** A run that
+   scored byte **1.000** and exact **0.000** had every target byte correct but never
+   emitted EOS, running to the decode cap on 81 of 81 instances
+   (`mean_len_ratio` 10.51). Byte accuracy alone called it a perfect run;
+   exact-match alone called it a total failure; only the length metrics identified
+   it as a non-terminating decode. Without them that seed would have been reported
+   as a catastrophic learning failure. Symmetrically, on `scan-tiny` the looped arm
+   held `length_exact` 0.61–0.65 against wide's 0.91–0.94 at near-equal
+   `mean_len_ratio`, which is what identified its failure as *compositional*
+   (wrong symbols) rather than *formatting* (wrong length). Neither instrument
+   reads the other's failure.
 3. **Holdout identity hashes instance content, never pool position.** Any new
    partitioning key must be derived from the instance itself (task, track, k,
    prompt bytes) so it is stable under reordering and changes with seed.
@@ -117,6 +128,13 @@ already caused a wrong result, a broken build, or a wrong conclusion.
    after the holdout so the eval set is identical at every point.
 5. **A sweep arm must differ from its control only in the intervention.**
    `examples/arm_compare.rs` refuses to run otherwise. Do not relax that.
+   **Batch counts as an intervention.** `auto_batch: true` sizes each arm from its
+   own measured memory, so arms with different `d_model` get different realized
+   batches — measured as effective 64 for one arm against 128 for the other. That
+   confounded a five-point frontier sweep into an uninterpretable result. Pin
+   `auto_batch: false` plus an explicit `train.micro_bt_budget` shared by both arms
+   on any comparison, and verify the realized micro from the log rather than from
+   the manifest.
 6. **Verify `k_set` actually demonstrates the rule before reporting a result
    about rule induction.** A sweep that inherits `k_set: [0]` measures nothing —
    the rule is in no prompt and no weight. This happened once and produced a
@@ -124,6 +142,14 @@ already caused a wrong result, a broken build, or a wrong conclusion.
 7. **Compare a run's loss only against itself.** The order-augmented arm
    solves a permutation-robust function; its loss is not the ordered arm's
    loss at equal steps.
+8. **A rung must be able to answer the question before it is used to answer one.**
+   `subst-fst-fixed`'s held-out answer is "apply a map already in your weights",
+   which needs storage and no arithmetic — so the entire depth-vs-width thread was
+   measured on the one rung structurally incapable of separating
+   parameters-as-storage from parameters-as-compute. `dyck1` was the opposite
+   mistake: it turned out to saturate, both arms reaching byte 1.000, so it could
+   not discriminate them either. Check both directions — that the rung rewards what
+   the question is about, and that it is hard enough to separate the arms.
 
 ## User Preferences
 

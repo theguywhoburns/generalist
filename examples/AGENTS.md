@@ -36,6 +36,13 @@ halfway still has usable numbers.
 5. **A tool must state its instrument's floor next to its number.** Exact-match
    at 0.000 is unreadable without byte accuracy beside it; a gap is unreadable
    when one side is at chance. Say which, in the output.
+   **And a floor is not the same thing as a chance rate.** On `dyck1` a run scored
+   byte **1.000** with exact **0.000** because every target byte was correct but EOS
+   was never emitted — it ran to the decode cap on 81 of 81 instances
+   (`mean_len_ratio` 10.51). Byte accuracy alone called that perfect, exact-match
+   alone called it a failure, and only `length_exact_rate` / `mean_len_ratio` named
+   it. A tool that reports byte and exact without the length pair cannot tell a
+   model that learned nothing from one that learned everything and cannot stop.
 6. **`--seeds` defaults to one seed and the summary must say so** rather than
    presenting a single-seed point as a ranking. This bit us on the LR sweep.
 7. **Prefers byte accuracy to exact-match, and reports both.** Never one alone.
@@ -44,7 +51,15 @@ halfway still has usable numbers.
    cannot hold parameters fixed while the stages↔width split varies — which is
    the only way to trace that frontier. `param_match`'s optional third argument
    exists for this; do not remove it and do not make it the default.
-9. **Hand-matching `d_model` to hit a parameter target does not work.** Body
+9. **`param_match` must account for `blocks_per_stage`,** and the fourth argument
+   is what supplies it. `param_count` scales the encoder stack by
+   `n_stages × blocks_per_stage` but scales the halting gates by `n_stages`
+   **alone**, so one stage holding four blocks has **one** gate, not four. A tool
+   that omits the field silently counts a multi-block configuration as if it were
+   single-block, and reports a parameter total that is wrong in the direction that
+   makes the config look affordable. `param_match` predates this and its `count()`
+   defaulted the field to 1 until the fourth argument was added.
+10. **Hand-matching `d_model` to hit a parameter target does not work.** Body
    parameters scale roughly with `d²`, so stepping `d_model` overshoots the
    target by a large margin, and the config validator's `d_model == n_heads *
    head_dim` constraint can make a target *unreachable* rather than merely hard.

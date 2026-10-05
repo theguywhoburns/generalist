@@ -33,9 +33,29 @@ metrics, and the harness that makes a run reproducible from a manifest.
    two CUDA `DEINITIALIZED` aborts have already destroyed runs this way.
 5. **Never allocate on the host in the training loop** at a size proportional to
    batch × sequence. It was the original cause of the OOM deaths on this card.
-6. **Tests use `TestBackend` + `test_device()`**, never a backend named
+6. **`train.batch_size` is the accumulation target, NOT the micro-batch size.**
+   The loop trims each micro to `micro_bt_budget / padded_T` rows, so at the
+   shipped `MICRO_BT_BUDGET` of 2048 and the shortest bucket band (64) every
+   micro is **32 rows whatever `batch_size` says** — measured on `dyck1`, where
+   `batch_size` 64/128/256/512 all trained identical work and all read ~1405MB of
+   a 4096MB card. Raising `batch_size` past that cap changes gradient noise and
+   nothing else, which is the worst outcome: a manifest that appears to have
+   raised the batch when it did not. Use `train.micro_bt_budget` to change how many
+   rows reach the GPU. Measured ceiling on this card at 919K params: 3072 gives
+   48 rows and fits both arms, 4096 OOMs.
+7. **Never release the allocator between micro-batches.** `SlicedPool::cleanup`
+   coalesces each page and calls `storage.dealloc` *only* on pages that are
+   entirely free; partially-used pages go back on the pool with their positions
+   renumbered, i.e. retained for reuse. So `memory_cleanup` after each optimizer
+   step already preserves reuse across steps — it just bounds how many T-bucket
+   shape families are retained at once. A per-micro release was removed: it cost a
+   full re-alloc cycle on every micro-batch of every step and bought nothing.
+   Training now runs at a flat ~300MB where it previously churned. The per-step
+   release stays unconditional because band-hopping otherwise accumulates until a
+   fresh page no longer fits in 4GB, which killed runs mid-train at ~3.7GB.
+8. **Tests use `TestBackend` + `test_device()`**, never a backend named
    directly, so the suite can be pointed at CUDA by editing one file.
-7. **Checkpoint restore is pinned by a round-trip test and must stay pinned.**
+9. **Checkpoint restore is pinned by a round-trip test and must stay pinned.**
    `checkpoint_round_trip_restores_weights` saves a trained checkpoint, reloads it
    into a fresh `Trainer` through the same `init_from` argument
    `examples/chain.rs` uses, and asserts the loss on a fixed batch matches to
@@ -47,6 +67,13 @@ metrics, and the harness that makes a run reproducible from a manifest.
    exactly how a probe here came to load no weights at all and emit PAD while
    presenting as a checkpoint bug. If chaining ever needs to be reachable from a
    manifest, that is a loader change with its own test, not a manifest edit.
+10. **A test that writes fixtures must use a directory unique per invocation.**
+    Cargo runs tests in parallel threads, and this suite has had a test registered
+    twice in the binary — so two threads ran it concurrently inside one process
+    and shared a temp directory. One thread's `remove_dir_all` wiped fixtures the
+    other was still writing, presenting as files that existed and read back as
+    0 bytes, which sent the investigation after a non-existent filesystem bug.
+    Process id is not sufficient: both threads share it. Use the thread id.
 
 ## Work Guidance
 

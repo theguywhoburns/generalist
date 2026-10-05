@@ -40,8 +40,14 @@ every other `stage0-*.json` extends.
 1. **Every key must be present.** burn's `Config` derive emits no
    `#[serde(default)]`, so a nested block that omits a field fails to parse with
    a bare "missing field". Adding a `TrainConfig`/`LoopedConfig` field means
-   adding it to *both* `stage0-base.json` and `smoke-tiny.json` — the test suite
-   loads every manifest here and will say so.
+   adding it to **every manifest in this directory and in
+   `research/experiments/`** — all 35 of them, not just `stage0-base.json` and
+   `smoke-tiny.json`. `checked_in_manifests_use_only_known_keys` in
+   `src/harness/config.rs` reads the actual files and names every one that is
+   missing the key, so the suite will tell you the full list rather than the first
+   failure. It was worth widening: a new field added to only the two `configs/`
+   roots breaks all 33 research manifests, and those are the ones experiments are
+   launched from.
 2. **`extends` is relative and shallow.** `"extends": "stage0-base.json"`.
    `$` path variables (`$curdir`, `$configs_dir`, `$repo_root`, …) are available
    and preferred over absolute paths.

@@ -69,11 +69,28 @@ reproduce; those live here permanently.
     batches of 64 / 128 / 128 / 128–256 / 256 against a requested 6, and within
     one point the tuner was nondeterministic across seeds. It is easy to miss
     because the tuner reports success and prints no warning about the axis.
-    Set `auto_batch: false` and an explicit `batch_size` on **every** manifest in
-    a multi-point sweep, and then **verify from the sweep log, do not assume** —
+    Set `auto_batch: false` and an explicit `micro_bt_budget` on **every** manifest
+    in a multi-point sweep, and then **verify from the sweep log, do not assume** —
     `grep 'short-band micro'` gives the realized micro-batch per run. Two other
     arms happened to land on the same realized batch and were sound by luck
     rather than by construction; check rather than reason about it.
+    **`batch_size` is not the knob to reach for.** It is the accumulation target;
+    the per-micro trim is `micro_bt_budget / padded_T`, so `batch_size` above the
+    trim trains identical work and reads flat VRAM. See `src/AGENTS.md` contract 6.
+11. **Verify the two arms were scored on the same instances before comparing
+    them.** The content-hash holdout makes this true by construction, but only
+    within a run: seeds can land different per-track instance counts. Confirm by
+    comparing the `(task, track, k)` cell counts between the two arms' logs. The
+    `scan-tiny` pair was checked this way and matched exactly (35/37, 31/21,
+    24/41), which is what makes its 0.435 separation a paired result rather than
+    two runs that happened to be scored on different splits.
+12. **A rung has to be hard enough to separate the arms, not just different
+    enough from chance.** `dyck1` satisfied the second and failed the first —
+    both arms reached byte 1.000 on 2 of 3 seeds, so it could not discriminate
+    them at all, which is the mirror image of the frontier sweep where everything
+    sat at the chance floor. Check both directions before drawing a conclusion
+    from a rung: does it reward what the question is about, and is it hard enough
+    to separate the arms? `scan-tiny` passes both.
 
 ## Work Guidance
 
