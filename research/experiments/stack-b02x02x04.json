@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "LONGER BUDGET (2000 steps, was 600): 2 stages x 2 blocks x 4 loops: TWO gates over a 2-block stack each.",
+    "",
+    "Both arms of this pair get 2000 steps, so the comparison stays paired.",
+    "",
+    "WHY. At 600 steps the 2-gate arm was at in-distribution byte 0.603 against",
+    "the 1-gate arm's 0.854 -- it had not finished FITTING, let alone",
+    "transferring. Held-out 0.467 vs 0.748 therefore cannot be read as a",
+    "gate-structure effect yet, because underfitting masquerades as exactly",
+    "that. This repo has already retracted one conclusion built on an",
+    "undertrained pass (a 300-step fixed-batch run read as 'memorization onset",
+    "lies below 16 instances').",
+    "",
+    "If the gap survives at 2000 steps it is the gate structure. If it closes,",
+    "the 600-step number was underfitting and was never a gate result.",
+    "",
+    "Everything else is identical to the 600-step pair: d_model 96,",
+    "ffn_hidden 256, four distinct blocks, 16 block applications per token,",
+    "492,481 vs 492,578 parameters (the 97 being one extra gate head),",
+    "auto_batch FALSE, batch_size 6.",
+    "",
+    "Rung: same-rule (subst-fst-fixed, k_set [0], k0_rate 1.0).",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/stack-b02x02x04.json depth gpu 4 \\",
+    "    --seeds=0,1,2"
+  ],
+  "extends": "base-492k.json",
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-long-b02x02x04",
+    "batch_size": 6,
+    "eval_every": 1000,
+    "indist_eval_per_cell": 12,
+    "auto_batch": false,
+    "steps": 2000
+  },
+  "experiment": {
+    "per_cell": 160,
+    "tasks": [
+      "subst-fst-fixed"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  },
+  "model": {
+    "n_stages": 2,
+    "blocks_per_stage": 2,
+    "max_loops": 4,
+    "d_model": 96,
+    "n_heads": 6,
+    "head_dim": 16,
+    "ffn_hidden": 256
+  }
+}

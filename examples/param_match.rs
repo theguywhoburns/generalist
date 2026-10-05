@@ -45,13 +45,41 @@
 //! point. Unlike the two-arm pair, a frontier point unavoidably varies head
 //! count: trading stages for width at fixed parameters *is* trading heads for
 //! stages. That is the axis, not a confound in it.
+//!
+//! # blocks_per_stage, the fourth argument
+//!
+//! `param_match -- <loops> <stages> <target> <blocks_per_stage>`. Block
+//! applications per token is `n_stages * blocks_per_stage * max_loops`, and this
+//! is **not** interchangeable with `n_stages`:
+//!
+//! - `param_count` scales the encoder stack by `n_stages * blocks_per_stage`, so
+//!   it changes the parameter total;
+//! - the halting gates scale by `n_stages` **alone**, so one stage holding four
+//!   blocks has **one** gate, not four.
+//!
+//! It is therefore the knob that separates *how many distinct parameter sets* from
+//! *how many gates watch them*. At `n_stages = 1, blocks_per_stage = 4,
+//! max_loops = 4` the whole four-block stack is re-applied four times under a
+//! single gate — "global ACT over the stack", per the `LoopedConfig` doc — against
+//! `n_stages = 4, blocks_per_stage = 1` where each block carries its own gate.
+//! Same 16 block applications, different halting structure and different grouping
+//! of the repetition.
 
 use generalist::model::LoopedConfig;
 
-fn count(n_stages: usize, max_loops: usize, d: usize, nh: usize, hd: usize, ffn: usize) -> usize {
+fn count(
+    n_stages: usize,
+    max_loops: usize,
+    bps: usize,
+    d: usize,
+    nh: usize,
+    hd: usize,
+    ffn: usize,
+) -> usize {
     LoopedConfig {
         n_stages,
         max_loops,
+        blocks_per_stage: bps,
         d_model: d,
         n_heads: nh,
         head_dim: hd,
@@ -66,6 +94,7 @@ fn count(n_stages: usize, max_loops: usize, d: usize, nh: usize, hd: usize, ffn:
 fn solve(
     n_stages: usize,
     max_loops: usize,
+    bps: usize,
     target: usize,
     pinned_head_dim: Option<usize>,
 ) -> (usize, usize, usize, usize, i64) {
@@ -83,26 +112,27 @@ fn solve(
             let (mut lo, mut hi) = (8usize, d * 8);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                if count(n_stages, max_loops, d, nh, hd, mid) < target {
+                if count(n_stages, max_loops, bps, d, nh, hd, mid) < target {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
             }
             let mut ffn = lo;
-            let mut bd = (count(n_stages, max_loops, d, nh, hd, ffn) as i64 - target as i64).abs();
+            let mut bd =
+                (count(n_stages, max_loops, bps, d, nh, hd, ffn) as i64 - target as i64).abs();
             for cand in [ffn.saturating_sub(8), ffn, ffn + 8] {
                 if cand < 8 {
                     continue;
                 }
                 let delta =
-                    (count(n_stages, max_loops, d, nh, hd, cand) as i64 - target as i64).abs();
+                    (count(n_stages, max_loops, bps, d, nh, hd, cand) as i64 - target as i64).abs();
                 if delta < bd {
                     bd = delta;
                     ffn = cand;
                 }
             }
-            let delta = count(n_stages, max_loops, d, nh, hd, ffn) as i64 - target as i64;
+            let delta = count(n_stages, max_loops, bps, d, nh, hd, ffn) as i64 - target as i64;
             if best.is_none_or(|(_, _, _, _, b)| delta.abs() < b.abs()) {
                 best = Some((hd, nh, d, ffn, delta));
             }
@@ -111,12 +141,21 @@ fn solve(
     best.expect("grid is non-empty")
 }
 
-fn show(label: &str, hd: usize, nh: usize, d: usize, ffn: usize, stages: usize, loops: usize) {
+fn show(
+    label: &str,
+    hd: usize,
+    nh: usize,
+    d: usize,
+    ffn: usize,
+    stages: usize,
+    loops: usize,
+    bps: usize,
+) {
     println!(
         "  {label:<9} head_dim {hd:>3}  n_heads {nh:>2}  d_model {d:>4}  \
          ffn_hidden {ffn:>4}  n_stages {stages:>2}  max_loops {loops}  \
-         = {} block-steps/token",
-        stages * loops
+         blocks_per_stage {bps:>2}  = {} block-steps/token",
+        stages * bps * loops
     );
 }
 
@@ -130,40 +169,51 @@ fn main() {
     // needs: the derived target moves with `stages`, so it can never hold
     // parameters fixed while the split varies.
     let explicit: Option<usize> = a.get(2).and_then(|s| s.parse().ok());
-    let target = explicit.unwrap_or_else(|| count(stages, loops, 128, 2, 64, 384));
-    println!("compute-matched pair: {stages} stages x {loops} loops");
+    // Fourth argument: encoder layers per stage. Block applications per token is
+    // n_stages * blocks_per_stage * max_loops, and `param_count` scales the block
+    // stack by blocks_per_stage while the halting gates scale by n_stages ALONE --
+    // one stage holding four blocks has ONE gate, not four. So this argument
+    // changes both the parameter total and the arithmetic, and it is not
+    // interchangeable with n_stages.
+    let bps: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let target = explicit.unwrap_or_else(|| count(stages, loops, bps, 128, 2, 64, 384));
+    println!(
+        "compute-matched pair: {stages} stages x {loops} loops x {bps} blocks/stage \
+         = {} block-steps/token",
+        stages * bps * loops
+    );
     match explicit {
         Some(t) => println!("target parameter count, pinned on the command line: {t}\n"),
         None => println!("target parameter count from the looping arm's shape: {target}\n"),
     }
 
-    let (whd, wnh, wd, wffn, wdelta) = solve(stages * loops, 1, target, None);
-    let (lhd, lnh, ld, lffn, ldelta) = solve(stages, loops, target, Some(whd));
+    let (whd, wnh, wd, wffn, wdelta) = solve(stages * loops, 1, 1, target, None);
+    let (lhd, lnh, ld, lffn, ldelta) = solve(stages, loops, bps, target, Some(whd));
     if explicit.is_some() {
         // Free head_dim on the frontier point itself. Pinning it to the wide
         // arm's head_dim would reintroduce the head-count confound the pinned
         // mode exists to avoid.
-        let (fhd, fnh, fd, fffn, fdelta) = solve(stages, loops, target, None);
-        show("frontier", fhd, fnh, fd, fffn, stages, loops);
+        let (fhd, fnh, fd, fffn, fdelta) = solve(stages, loops, bps, target, None);
+        show("frontier", fhd, fnh, fd, fffn, stages, loops, bps);
         println!("\n  frontier point param total:");
         println!(
             "    {} ({fdelta:+}), target {target}, off by {:.2}%",
-            count(stages, loops, fd, fnh, fhd, fffn),
+            count(stages, loops, bps, fd, fnh, fhd, fffn),
             100.0 * (fdelta as f64 / target as f64)
         );
     }
     println!("ARMS (search head_dim for the wide arm, then pin the looping arm to it):");
-    show("looping", lhd, lnh, ld, lffn, stages, loops);
-    show("wide", whd, wnh, wd, wffn, stages * loops, 1);
+    show("looping", lhd, lnh, ld, lffn, stages, loops, bps);
+    show("wide", whd, wnh, wd, wffn, stages * loops, 1, 1);
 
     println!("\nparam totals:");
     println!(
         "  looping {} ({ldelta:+})",
-        count(stages, loops, ld, lnh, lhd, lffn)
+        count(stages, loops, bps, ld, lnh, lhd, lffn)
     );
     println!(
         "  wide    {} ({wdelta:+})",
-        count(stages * loops, 1, wd, wnh, whd, wffn)
+        count(stages * loops, 1, 1, wd, wnh, whd, wffn)
     );
     let worst = ldelta.abs().max(wdelta.abs());
     if worst > target as i64 / 50 {
@@ -181,7 +231,8 @@ fn main() {
     println!("\nSet in the two manifests:");
     println!(
         "  looping: \"model\": {{ \"d_model\": {ld}, \"n_heads\": {lnh}, \"head_dim\": {lhd}, \
-         \"ffn_hidden\": {lffn}, \"n_stages\": {stages}, \"max_loops\": {loops} }}"
+         \"ffn_hidden\": {lffn}, \"n_stages\": {stages}, \"max_loops\": {loops}, \
+         \"blocks_per_stage\": {bps} }}"
     );
     println!(
         "  wide:    \"model\": {{ \"d_model\": {wd}, \"n_heads\": {wnh}, \"head_dim\": {whd}, \

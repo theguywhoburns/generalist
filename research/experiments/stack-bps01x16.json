@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "BLOCKS-PER-STAGE point: n_stages 1, blocks_per_stage 1, max_loops 16 = 16 block applications/token.",
+    "",
+    "WHAT THIS AXIS IS. The stages<->width frontier varied n_stages with",
+    "blocks_per_stage pinned at 1, so two things moved together: how many",
+    "distinct parameter sets the model has, AND where in the sequence the",
+    "repetition happens. At n_stages=1 the loop is unambiguously over the whole",
+    "block stack -- the blocks pass, then the stack passes again -- so this",
+    "sweep varies only the grouping.",
+    "",
+    "  1 stage x 1 block(s) x 16 loop(s) = 16 block applications",
+    "  492,449 params (+0.01% of 492,418)",
+    "",
+    "GATE STRUCTURE IS THE PART THAT IS NOT INTERCHANGEABLE WITH n_stAGES.",
+    "param_count scales the encoder stack by n_stages * blocks_per_stage, but the",
+    "halting gates scale by n_stages ALONE. So this model has ONE gate watching",
+    "1 blocks, where frontier s01l16 had 16 gates watching 1 block each.",
+    "This is the 'global ACT over the stack' ablation named in LoopedConfig's",
+    "own doc comment. Roles will read UNREADABLE/UNKNOWN here by construction --",
+    "one stage means there are no stage roles to differentiate. That is expected",
+    "and is not a failure of the run.",
+    "",
+    "Also note d_model FALLS as blocks_per_stage rises, because a fixed parameter",
+    "budget split across more distinct blocks leaves each one narrower. That is",
+    "the same width/reuse trade the frontier had, running the other way, and it",
+    "is not removable at fixed parameters. Read this axis as 'grouping at fixed",
+    "budget', not as 'reuse with width held constant' -- for the latter, see the",
+    "fixed-width points.",
+    "",
+    "Config from examples/param_match.rs (fourth argument = blocks_per_stage):",
+    "  cargo run --example param_match -- 16 1 492418 1",
+    "",
+    "Rung: same-rule (subst-fst-fixed, k_set [0], k0_rate 1.0).",
+    "auto_batch FALSE, batch_size 6, matching the clean frontier pass.",
+    "",
+    "Run:",
+    "  cargo run --example scaling_sweep -- \\",
+    "    research/experiments/stack-bps01x16.json depth gpu 16 \\",
+    "    --seeds=0,1,2"
+  ],
+  "extends": "base-492k.json",
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-stack-bps01x16",
+    "batch_size": 6,
+    "eval_every": 1000,
+    "indist_eval_per_cell": 12,
+    "auto_batch": false
+  },
+  "experiment": {
+    "per_cell": 160,
+    "tasks": [
+      "subst-fst-fixed"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
+  },
+  "model": {
+    "n_stages": 1,
+    "blocks_per_stage": 1,
+    "max_loops": 16,
+    "d_model": 176,
+    "n_heads": 11,
+    "head_dim": 16,
+    "ffn_hidden": 526
+  }
+}

@@ -416,6 +416,97 @@ explain.
 
 ---
 
+## Gate structure decides whether the memorized solution is executable
+
+`measured`, n=3 per arm, same-rule rung, `auto_batch: false`, batch 6 pinned.
+This is the first result in the repo where **reuse wins**, and it is also the
+cleanest comparison available, because the two arms differ by *one halting head*.
+
+`param_count` scales the encoder stack by `n_stages × blocks_per_stage` but scales
+the halting gates by `n_stages` **alone**. So both arms below hold four distinct
+blocks at `d_model` 96 / `ffn_hidden` 256, and differ only in how those four
+blocks are grouped and watched:
+
+| arm | config | blocks | gates | block-apps/token | params |
+|---|---|---|---|---|---|
+| A | 1 stage × 4 blocks × 4 loops | 4 | **1** | 16 | 492,481 |
+| B | 2 stages × 2 blocks × 4 loops | 4 | **2** | 16 | 492,578 |
+
+The 97-parameter difference is exactly one gate head (`d_model + 1 = 97`). Block
+applications are matched, verified from the per-stage halt vector `bh`: A reads
+`[4.000]` → 4 × 4 = 16, B reads `[4.000, 4.000]` → (4+4) × 2 = 16.
+
+| budget | arm | in-dist byte | held-out byte | exact-in | exact-out | gap |
+|---|---|---|---|---|---|---|
+| 600 steps | A: 1 gate | 0.854 | 0.748 | 0.541 | 0.231 | −0.107 |
+| 600 steps | B: 2 gates | 0.603 | 0.467 | 0.028 | 0.000 | −0.136 |
+| **2000 steps** | **A: 1 gate** | **0.908** | **0.891** | **0.805** | **0.517** | −0.017 |
+| **2000 steps** | **B: 2 gates** | 0.710 | 0.569 | 0.042 | 0.022 | −0.141 |
+
+Per-seed held-out at 2000 steps: A **0.952 / 0.862 / 0.860**, B **0.589 / 0.567 /
+0.552**. Complete separation — A's *worst* seed beats B's *best* by 0.27.
+
+**The 600-step pass was not underfitting, and that was worth checking.** Arm B sat
+at in-dist 0.603, which reads as "hasn't finished fitting", and this repo has
+already retracted one conclusion built on an undertrained pass. At 3.3× the
+budget on *both* arms the gap **widened** (0.281 → 0.322), so it is not a budget
+artifact.
+
+**Both arms memorize under teacher forcing, and this is the crux.** Training
+loss at step 1800 is **0.0058** for A and **0.0142** for B — both essentially
+zero. Both models learned the map. Yet A reaches in-dist byte 1.000 / exact 0.958
+and B reaches 0.624 / 0.000.
+
+**So the gate structure does not decide whether the solution is learned. It
+decides whether it can be executed free-running.** Training CE is teacher-forced;
+eval is greedy autoregressive decode. A model can memorize a transducer under
+teacher forcing and still fail to run it, and B does exactly that.
+
+**This contradicts the reuse story this repo has been telling, in the opposite
+direction from every earlier measurement.** The earlier looped-arm failures
+(`paramsfree-looping`, and the interior frontier points) were *storage*-limited:
+they memorized nothing, in-distribution or out. Arm B is a different failure. It
+memorizes under teacher forcing and cannot execute. Those are two distinct
+failure modes that both read as "low held-out accuracy" on the instruments used
+so far, and this repo has been treating them as one.
+
+**Corroborating context, weaker.** At 600 steps arm A (`1 gate, 4 blocks`, held-out
+0.748) tied `s01l16` (`16 gates, 1 block`, 0.766) inside a ±0.011 spread, and beat
+`s16l01` (`16 gates, 16 blocks`, 0.625) by 0.12. So at matched parameters and
+matched block applications, **fewer gates over more reuse beats more gates over
+less reuse** — the first reuse win in the repo. That comparison is *not* clean
+the way A-vs-B is: `s16l01` is 91% attention / 9% FFN (`ffn_hidden = 10`) against
+A's 40/60, so width allocation moves with it.
+
+**Unresolved, and the probe that would have answered it failed.** The obvious
+mechanism question is *why* B cannot execute. I tried to read the emitted
+strings by reloading the 2000-step checkpoint with `train.init_from` and
+`lr = 1e-12`. That does not work: both arms then emit `0x00` PAD bytes and score
+byte 0.000, and **two architecturally different models produced byte-identical
+output**, so neither loaded its weights. See the `init_from` note below — this is
+a suspected bug in checkpoint loading, not a property of either model. **The
+mechanism is therefore unidentified, and no claim is made about it.**
+
+### Suspected bug: `init_from` appears not to restore weights
+
+`Trainer::load_checkpoint` reads the record with
+`NamedMpkFileRecorder::load(...).expect("checkpoint load")` and hands it to
+`LoopedTransformer::load_record`. Neither step raised, yet the resulting model
+emits PAD and scores 0.000. Two different architectures returning identical
+degenerate output is the tell: the model is freshly initialized, so
+`load_record` is filling defaults instead of restoring tensors.
+
+**Not verified, and not yet a test.** This matters beyond the probe: `train.init_from`
+is the mechanism behind `examples/chain.rs` and `configs/chain.json`, i.e. the
+whole curriculum-chaining story ("re-run all earlier stages after each new stage;
+the chain runner re-evaluates every earlier split"). If checkpoint restore is
+silently a no-op, every chained run trains from scratch and every forgetting
+eval compares against a random baseline. **This needs a round-trip test —
+save, reload into a fresh model, assert the outputs match — before any chained
+number in this repo is trusted.**
+
+---
+
 ## Depth buys compute, not reuse (superseded by the compute-matched result above)
 
 **This section is kept because its error is instructive.** Read the section above
