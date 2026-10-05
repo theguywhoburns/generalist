@@ -35,6 +35,18 @@ metrics, and the harness that makes a run reproducible from a manifest.
    batch × sequence. It was the original cause of the OOM deaths on this card.
 6. **Tests use `TestBackend` + `test_device()`**, never a backend named
    directly, so the suite can be pointed at CUDA by editing one file.
+7. **Checkpoint restore is pinned by a round-trip test and must stay pinned.**
+   `checkpoint_round_trip_restores_weights` saves a trained checkpoint, reloads it
+   into a fresh `Trainer` through the same `init_from` argument
+   `examples/chain.rs` uses, and asserts the loss on a fixed batch matches to
+   1e-6. It asserts on a **continuous** quantity rather than greedy decode,
+   because a freshly-initialized model can coincidentally emit the same decoded
+   string but cannot match a float.
+   `init_from` is a **parameter to `run_stage`, not a manifest key** — writing
+   `train.init_from` into a manifest is accepted and silently ignored, which is
+   exactly how a probe here came to load no weights at all and emit PAD while
+   presenting as a checkpoint bug. If chaining ever needs to be reachable from a
+   manifest, that is a loader change with its own test, not a manifest edit.
 
 ## Work Guidance
 

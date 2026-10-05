@@ -67,23 +67,32 @@
 
 use generalist::model::LoopedConfig;
 
-fn count(
+/// A model shape, kept as a struct rather than eight positional arguments.
+///
+/// Two reasons. Clippy caps this at seven, and — more usefully — `n_stages` and
+/// `blocks_per_stage` are the two knobs this file exists to keep distinct (they
+/// scale the block stack and the halting gates differently), so naming them at
+/// every call site is cheaper than remembering which is which.
+#[derive(Clone, Copy)]
+struct Shape {
     n_stages: usize,
     max_loops: usize,
-    bps: usize,
-    d: usize,
-    nh: usize,
-    hd: usize,
-    ffn: usize,
-) -> usize {
+    blocks_per_stage: usize,
+    d_model: usize,
+    n_heads: usize,
+    head_dim: usize,
+    ffn_hidden: usize,
+}
+
+fn count(s: Shape) -> usize {
     LoopedConfig {
-        n_stages,
-        max_loops,
-        blocks_per_stage: bps,
-        d_model: d,
-        n_heads: nh,
-        head_dim: hd,
-        ffn_hidden: ffn,
+        n_stages: s.n_stages,
+        max_loops: s.max_loops,
+        blocks_per_stage: s.blocks_per_stage,
+        d_model: s.d_model,
+        n_heads: s.n_heads,
+        head_dim: s.head_dim,
+        ffn_hidden: s.ffn_hidden,
         ..LoopedConfig::new()
     }
     .param_count()
@@ -109,30 +118,39 @@ fn solve(
             if !(64..=1024).contains(&d) {
                 continue;
             }
+            let at = |ffn: usize| {
+                count(Shape {
+                    n_stages,
+                    max_loops,
+                    blocks_per_stage: bps,
+                    d_model: d,
+                    n_heads: nh,
+                    head_dim: hd,
+                    ffn_hidden: ffn,
+                })
+            };
             let (mut lo, mut hi) = (8usize, d * 8);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                if count(n_stages, max_loops, bps, d, nh, hd, mid) < target {
+                if at(mid) < target {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
             }
             let mut ffn = lo;
-            let mut bd =
-                (count(n_stages, max_loops, bps, d, nh, hd, ffn) as i64 - target as i64).abs();
+            let mut bd = (at(ffn) as i64 - target as i64).abs();
             for cand in [ffn.saturating_sub(8), ffn, ffn + 8] {
                 if cand < 8 {
                     continue;
                 }
-                let delta =
-                    (count(n_stages, max_loops, bps, d, nh, hd, cand) as i64 - target as i64).abs();
+                let delta = (at(cand) as i64 - target as i64).abs();
                 if delta < bd {
                     bd = delta;
                     ffn = cand;
                 }
             }
-            let delta = count(n_stages, max_loops, bps, d, nh, hd, ffn) as i64 - target as i64;
+            let delta = at(ffn) as i64 - target as i64;
             if best.is_none_or(|(_, _, _, _, b)| delta.abs() < b.abs()) {
                 best = Some((hd, nh, d, ffn, delta));
             }
@@ -141,22 +159,41 @@ fn solve(
     best.expect("grid is non-empty")
 }
 
-fn show(
-    label: &str,
+fn show(label: &str, s: Shape) {
+    println!(
+        "  {label:<9} head_dim {:>3}  n_heads {:>2}  d_model {:>4}  \
+         ffn_hidden {:>4}  n_stages {:>2}  max_loops {}  \
+         blocks_per_stage {:>2}  = {} block-steps/token",
+        s.head_dim,
+        s.n_heads,
+        s.d_model,
+        s.ffn_hidden,
+        s.n_stages,
+        s.max_loops,
+        s.blocks_per_stage,
+        s.n_stages * s.blocks_per_stage * s.max_loops
+    );
+}
+
+/// Build the shape the solver settled on, for printing and for recounting.
+fn shape_of(
+    n_stages: usize,
+    max_loops: usize,
+    bps: usize,
     hd: usize,
     nh: usize,
     d: usize,
     ffn: usize,
-    stages: usize,
-    loops: usize,
-    bps: usize,
-) {
-    println!(
-        "  {label:<9} head_dim {hd:>3}  n_heads {nh:>2}  d_model {d:>4}  \
-         ffn_hidden {ffn:>4}  n_stages {stages:>2}  max_loops {loops}  \
-         blocks_per_stage {bps:>2}  = {} block-steps/token",
-        stages * bps * loops
-    );
+) -> Shape {
+    Shape {
+        n_stages,
+        max_loops,
+        blocks_per_stage: bps,
+        d_model: d,
+        n_heads: nh,
+        head_dim: hd,
+        ffn_hidden: ffn,
+    }
 }
 
 fn main() {
@@ -176,7 +213,17 @@ fn main() {
     // changes both the parameter total and the arithmetic, and it is not
     // interchangeable with n_stages.
     let bps: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let target = explicit.unwrap_or_else(|| count(stages, loops, bps, 128, 2, 64, 384));
+    let target = explicit.unwrap_or_else(|| {
+        count(Shape {
+            n_stages: stages,
+            max_loops: loops,
+            blocks_per_stage: bps,
+            d_model: 128,
+            n_heads: 2,
+            head_dim: 64,
+            ffn_hidden: 384,
+        })
+    });
     println!(
         "compute-matched pair: {stages} stages x {loops} loops x {bps} blocks/stage \
          = {} block-steps/token",
@@ -194,26 +241,50 @@ fn main() {
         // arm's head_dim would reintroduce the head-count confound the pinned
         // mode exists to avoid.
         let (fhd, fnh, fd, fffn, fdelta) = solve(stages, loops, bps, target, None);
-        show("frontier", fhd, fnh, fd, fffn, stages, loops, bps);
+        show("frontier", shape_of(stages, loops, bps, fhd, fnh, fd, fffn));
         println!("\n  frontier point param total:");
         println!(
             "    {} ({fdelta:+}), target {target}, off by {:.2}%",
-            count(stages, loops, bps, fd, fnh, fhd, fffn),
+            count(Shape {
+                n_stages: stages,
+                max_loops: loops,
+                blocks_per_stage: bps,
+                d_model: fd,
+                n_heads: fnh,
+                head_dim: fhd,
+                ffn_hidden: fffn,
+            }),
             100.0 * (fdelta as f64 / target as f64)
         );
     }
     println!("ARMS (search head_dim for the wide arm, then pin the looping arm to it):");
-    show("looping", lhd, lnh, ld, lffn, stages, loops, bps);
-    show("wide", whd, wnh, wd, wffn, stages * loops, 1, 1);
+    show("looping", shape_of(stages, loops, bps, lhd, lnh, ld, lffn));
+    show("wide", shape_of(stages * loops, 1, 1, whd, wnh, wd, wffn));
 
     println!("\nparam totals:");
     println!(
         "  looping {} ({ldelta:+})",
-        count(stages, loops, bps, ld, lnh, lhd, lffn)
+        count(Shape {
+            n_stages: stages,
+            max_loops: loops,
+            blocks_per_stage: bps,
+            d_model: ld,
+            n_heads: lnh,
+            head_dim: lhd,
+            ffn_hidden: lffn,
+        })
     );
     println!(
         "  wide    {} ({wdelta:+})",
-        count(stages * loops, 1, 1, wd, wnh, whd, wffn)
+        count(Shape {
+            n_stages: stages * loops,
+            max_loops: 1,
+            blocks_per_stage: 1,
+            d_model: wd,
+            n_heads: wnh,
+            head_dim: whd,
+            ffn_hidden: wffn,
+        })
     );
     let worst = ldelta.abs().max(wdelta.abs());
     if worst > target as i64 / 50 {

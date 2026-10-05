@@ -1909,6 +1909,13 @@ mod tests {
     type IB = <TestBackend as AutodiffBackend>::InnerBackend;
 
     fn tiny_trainer() -> Trainer<TestBackend> {
+        tiny_trainer_from(None)
+    }
+
+    /// `init_from` is threaded through rather than hard-coded `None` so the
+    /// checkpoint round-trip test exercises the same construction path the
+    /// curriculum chain uses, instead of a parallel one that could drift.
+    fn tiny_trainer_from(init_from: Option<&std::path::Path>) -> Trainer<TestBackend> {
         let optim = OptimConfig::Muon(MuonTuning::new());
         let model_cfg = LoopedConfig::new()
             .with_vocab_size(256)
@@ -1925,7 +1932,7 @@ mod tests {
             crate::model::StopConfig::default(),
             &train_cfg,
             &test_device(),
-            None,
+            init_from,
         )
     }
 
@@ -2497,6 +2504,64 @@ mod tests {
         // The in-loop saves before it still happened.
         assert!(std::path::Path::new(&format!("{}/step000000.mpk", dir.display())).exists());
         assert!(std::path::Path::new(&format!("{}/step000002.mpk", dir.display())).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A saved checkpoint must restore the weights it saved.
+    ///
+    /// `train.init_from` is the mechanism behind `examples/chain.rs` and
+    /// `configs/chain.json` -- the whole curriculum-chaining story, including
+    /// the forgetting evals that re-run earlier stages after each new one. If
+    /// restore is silently a no-op then every chained run trains from scratch
+    /// and every forgetting eval compares a real model against a random one,
+    /// which reads as catastrophic forgetting and is really just noise.
+    ///
+    /// The assertion is on a CONTINUOUS quantity, the loss on a fixed batch,
+    /// not on greedy decode: a fresh model can coincidentally emit the same
+    /// decoded string, but it cannot match a float to 1e-6 by accident. Loss is
+    /// also the right thing to compare because it is what a chained run's first
+    /// forward pass actually depends on.
+    #[test]
+    fn checkpoint_round_trip_restores_weights() {
+        let dir = std::env::temp_dir().join("generalist-ckpt-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("step000003.mpk");
+
+        let registry = TaskRegistry::builtin();
+        let exp = Experiment {
+            tasks: vec!["subst-fst-fixed".to_string()],
+            per_cell: 8,
+            seeds: vec![0],
+            ..Default::default()
+        };
+        let pool = generate(&exp, &registry);
+        let mut rng = HarnessRng::new(7);
+        let batch = Trainer::<TestBackend>::sample_batch(&mut rng, &pool, 4);
+
+        // Train a little, so the weights are no longer their initialization.
+        let mut trainer = tiny_trainer();
+        for _ in 0..3 {
+            let b = Trainer::<TestBackend>::sample_batch(&mut rng, &pool, 4);
+            trainer.train_step(&b);
+        }
+        let (before_info, _) = trainer.forward_backward(&batch, 1.0, 0);
+        let before_loss = before_info.loss;
+        trainer.save_checkpoint(&path);
+        drop(trainer);
+
+        // A FRESH trainer that loads the checkpoint. If restore works this is
+        // the same model; if it silently does nothing this is a random one.
+        let mut reloaded = tiny_trainer_from(Some(&path));
+        let (after_info, _) = reloaded.forward_backward(&batch, 1.0, 0);
+        let after_loss = after_info.loss;
+
+        assert!(
+            (before_loss - after_loss).abs() < 1e-6,
+            "checkpoint did not restore the weights: loss before save {before_loss}, \
+             after reload {after_loss}. `train.init_from` is silently a no-op, so \
+             every chained run trains from scratch."
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

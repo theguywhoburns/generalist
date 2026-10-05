@@ -478,32 +478,34 @@ less reuse** — the first reuse win in the repo. That comparison is *not* clean
 the way A-vs-B is: `s16l01` is 91% attention / 9% FFN (`ffn_hidden = 10`) against
 A's 40/60, so width allocation moves with it.
 
-**Unresolved, and the probe that would have answered it failed.** The obvious
-mechanism question is *why* B cannot execute. I tried to read the emitted
-strings by reloading the 2000-step checkpoint with `train.init_from` and
-`lr = 1e-12`. That does not work: both arms then emit `0x00` PAD bytes and score
-byte 0.000, and **two architecturally different models produced byte-identical
-output**, so neither loaded its weights. See the `init_from` note below — this is
-a suspected bug in checkpoint loading, not a property of either model. **The
-mechanism is therefore unidentified, and no claim is made about it.**
+**Unresolved, and the probe that would have answered it was invalid — my
+diagnosis of *why* was wrong.** The obvious mechanism question is *why* B cannot
+execute. I tried to read the emitted strings by reloading the 2000-step
+checkpoint, and got `0x00` PAD out of both arms, with two architecturally
+different models producing byte-identical output. I wrote that up as a suspected
+checkpoint-restore bug. **It is not one, and the claim is retracted.**
 
-### Suspected bug: `init_from` appears not to restore weights
+`checkpoint_round_trip_restores_weights` in `src/train.rs` saves a trained
+checkpoint, reloads it into a fresh `Trainer` through the same `init_from`
+argument the chain uses, and asserts the loss on a fixed batch matches to 1e-6.
+**It passes.** `load_checkpoint` restores weights correctly.
 
-`Trainer::load_checkpoint` reads the record with
-`NamedMpkFileRecorder::load(...).expect("checkpoint load")` and hands it to
-`LoopedTransformer::load_record`. Neither step raised, yet the resulting model
-emits PAD and scores 0.000. Two different architectures returning identical
-degenerate output is the tell: the model is freshly initialized, so
-`load_record` is filling defaults instead of restoring tensors.
+The probe failed because `init_from` **is not a manifest key.** It is a parameter
+to `run_stage`, and `examples/train.rs` passes `None` unconditionally. So
+`train.init_from` in my probe manifest was accepted and ignored, the model was
+freshly initialized, and it emitted PAD. Chaining works — through
+`examples/chain.rs`, which resolves `$prev` and passes the path programmatically.
 
-**Not verified, and not yet a test.** This matters beyond the probe: `train.init_from`
-is the mechanism behind `examples/chain.rs` and `configs/chain.json`, i.e. the
-whole curriculum-chaining story ("re-run all earlier stages after each new stage;
-the chain runner re-evaluates every earlier split"). If checkpoint restore is
-silently a no-op, every chained run trains from scratch and every forgetting
-eval compares against a random baseline. **This needs a round-trip test —
-save, reload into a fresh model, assert the outputs match — before any chained
-number in this repo is trusted.**
+**The real hazard is the one that misled me: the config schema silently ignores
+unknown keys.** Verified by putting `train.totally_made_up_knob = 123` in a
+manifest — it loads clean and runs. A manifest can therefore say something that
+has no effect and produce a perfectly plausible run, which is the same failure
+shape as a metric that cannot see the error it is not named for. `deny_unknown_fields`
+would close it, and `_comment` is safe because it is stripped per-file during
+resolution, before parsing. Not done here: it would reject any checked-in
+manifest carrying a stale key, and that needs a sweep rather than a drive-by.
+
+**The mechanism is therefore still unidentified, and no claim is made about it.**
 
 ---
 

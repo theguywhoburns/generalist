@@ -14,6 +14,17 @@ every other `stage0-*.json` extends.
 
 ## Local Contracts
 
+0. **Unknown keys are silently ignored.** A manifest carrying
+   `train.totally_made_up_knob` loads clean and runs. So a typo, or a key that
+   names a `run_stage` *parameter* rather than a config field (`init_from` is the
+   one that has bitten us), produces a perfectly plausible run in which the
+   manifest's intent had no effect. `deny_unknown_fields` would close it and
+   `_comment` is safe, since it is stripped per-file during resolution before
+   parsing — but it would reject any checked-in manifest carrying a stale key, so
+   it needs a sweep of `configs/` and `research/experiments/` first. Until then,
+   **verify a knob took effect from the run log, not from the manifest loading
+   without error.**
+
 1. **Every key must be present.** burn's `Config` derive emits no
    `#[serde(default)]`, so a nested block that omits a field fails to parse with
    a bare "missing field". Adding a `TrainConfig`/`LoopedConfig` field means
