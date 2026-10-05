@@ -4,6 +4,7 @@
 use crate::tasks::{DemoProtocol, HarnessRng, Instance, TaskRegistry, Track};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Experiment {
     /// Task names (registry keys). Empty = all builtin.
     pub tasks: Vec<String>,

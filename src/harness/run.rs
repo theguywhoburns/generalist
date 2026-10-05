@@ -29,6 +29,7 @@ use super::experiment::Experiment;
 ///   block — the loader merges before parsing, so partial *layers* work even
 ///   though partial *documents* do not.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub model: LoopedConfig,
     /// Optimizer stack. Internally tagged: pick the variant with `"kind"`.
