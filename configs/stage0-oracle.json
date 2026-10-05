@@ -5,6 +5,13 @@
     "oracle-vs-normal delta isolates rule EXECUTION from rule INDUCTION."
   ],
   "extends": "stage0-base.json",
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-oracle" },
-  "experiment": { "tasks": ["subst-fst-oracle"] }
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-oracle",
+    "micro_bt_budget": 0
+  },
+  "experiment": {
+    "tasks": [
+      "subst-fst-oracle"
+    ]
+  }
 }

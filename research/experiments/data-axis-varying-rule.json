@@ -23,10 +23,21 @@
   "extends": "base-492k.json",
   "train": {
     "ckpt_dir": "$repo_root/research/runs/checkpoints-varying-rule",
-    "shuffle_eval": true
+    "shuffle_eval": true,
+    "micro_bt_budget": 0
   },
   "experiment": {
-    "tasks": ["subst-fst"],
-    "protocol": { "k_set": [1, 2, 3, 5], "k0_rate": 0.0 }
+    "tasks": [
+      "subst-fst"
+    ],
+    "protocol": {
+      "k_set": [
+        1,
+        2,
+        3,
+        5
+      ],
+      "k0_rate": 0.0
+    }
   }
 }

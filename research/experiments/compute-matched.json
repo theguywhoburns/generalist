@@ -58,6 +58,7 @@
   "train": {
     "ckpt_dir": "$repo_root/research/runs/checkpoints-compute-matched-looping",
     "auto_batch": false,
-    "batch_size": 6
+    "batch_size": 6,
+    "micro_bt_budget": 0
   }
 }

@@ -19,6 +19,7 @@
   "train": {
     "ckpt_dir": "$repo_root/research/runs/checkpoints-dump",
     "shuffle_eval": true,
-    "dump_samples": 12
+    "dump_samples": 12,
+    "micro_bt_budget": 0
   }
 }

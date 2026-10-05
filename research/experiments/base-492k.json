@@ -30,7 +30,9 @@
     "adjust_lr_fn": "Original",
     "weight_decay": 0.0
   },
-  "stop": { "kind": "act" },
+  "stop": {
+    "kind": "act"
+  },
   "train": {
     "steps": 600,
     "log_every": 300,
@@ -42,10 +44,24 @@
     "auto_batch": true,
     "auto_batch_max": 16384,
     "ckpt_dir": "$repo_root/research/runs/checkpoints",
-    "lr_muon": { "kind": "linear", "lr": 0.0002, "max_lr": 0.002, "warmup_steps": 100 },
-    "lr_adamw": { "kind": "constant", "lr": 0.0003 },
+    "lr_muon": {
+      "kind": "linear",
+      "lr": 0.0002,
+      "max_lr": 0.002,
+      "warmup_steps": 100
+    },
+    "lr_adamw": {
+      "kind": "constant",
+      "lr": 0.0003
+    },
     "eval_in_distribution": true,
-    "shuffle_eval": false
+    "shuffle_eval": false,
+    "micro_bt_budget": 0
   },
-  "experiment": { "per_cell": 200, "seeds": [0] }
+  "experiment": {
+    "per_cell": 200,
+    "seeds": [
+      0
+    ]
+  }
 }

@@ -8,7 +8,7 @@
     "",
     "AUTO-BATCH IS DELIBERATELY OFF HERE. It is on for the data axes because it",
     "gave 7.4x the throughput. The depth numbers were measured at fixed batch, so",
-    "switching it on would make this manifest no longer reproduce them — and a",
+    "switching it on would make this manifest no longer reproduce them \u2014 and a",
     "depth comparison where the batch silently changed with the axis would confound",
     "the axis.",
     "",
@@ -32,17 +32,27 @@
     "max_loops 8 here (not 4) so the axis can reach 8."
   ],
   "extends": "base-492k.json",
-  "model": { "max_loops": 8 },
+  "model": {
+    "max_loops": 8
+  },
   "train": {
     "ckpt_dir": "$repo_root/research/runs/checkpoints-depth",
     "batch_size": 6,
     "auto_batch": false,
     "eval_every": 1000,
-    "indist_eval_per_cell": 12
+    "indist_eval_per_cell": 12,
+    "micro_bt_budget": 0
   },
   "experiment": {
     "per_cell": 160,
-    "tasks": ["subst-fst-fixed"],
-    "protocol": { "k_set": [0], "k0_rate": 1.0 }
+    "tasks": [
+      "subst-fst-fixed"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ],
+      "k0_rate": 1.0
+    }
   }
 }

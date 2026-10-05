@@ -5,7 +5,14 @@
     "the halting head as the failure rather than recurrence."
   ],
   "extends": "stage0-base.json",
-  "stop": { "kind": "converge" },
-  "model": { "ponder_weight": 0.0 },
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-converge" }
+  "stop": {
+    "kind": "converge"
+  },
+  "model": {
+    "ponder_weight": 0.0
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-converge",
+    "micro_bt_budget": 0
+  }
 }

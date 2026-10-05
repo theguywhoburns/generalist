@@ -42,5 +42,8 @@
     "length. Same reasoning as data-axis-constant-rule.json, which this extends."
   ],
   "extends": "data-axis-constant-rule.json",
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-same-rule-size" }
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-same-rule-size",
+    "micro_bt_budget": 0
+  }
 }

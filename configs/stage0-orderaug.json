@@ -22,6 +22,12 @@
     "the weights-only rungs where the random-weight control sits at chance."
   ],
   "extends": "stage0-base.json",
-  "stop": { "kind": "act", "shuffle_train": true },
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-orderaug" }
+  "stop": {
+    "kind": "act",
+    "shuffle_train": true
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-orderaug",
+    "micro_bt_budget": 0
+  }
 }

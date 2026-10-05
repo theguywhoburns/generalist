@@ -45,7 +45,8 @@
     "batch_size": 6,
     "eval_every": 1000,
     "indist_eval_per_cell": 12,
-    "auto_batch": false
+    "auto_batch": false,
+    "micro_bt_budget": 0
   },
   "experiment": {
     "per_cell": 160,

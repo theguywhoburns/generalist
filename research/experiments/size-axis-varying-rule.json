@@ -42,5 +42,8 @@
     "    research/experiments/size-axis-varying-rule.json params gpu 128 192 256 384 --seeds=0,1,2"
   ],
   "extends": "data-axis-varying-rule.json",
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-size" }
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-size",
+    "micro_bt_budget": 0
+  }
 }

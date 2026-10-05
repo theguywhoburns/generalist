@@ -5,9 +5,18 @@
     "lower bound the oracle cell must clear before any ICL claim is meaningful."
   ],
   "extends": "stage0-base.json",
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-maponly" },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-maponly",
+    "micro_bt_budget": 0
+  },
   "experiment": {
-    "tasks": ["subst-fst-oracle"],
-    "protocol": { "k_set": [0] }
+    "tasks": [
+      "subst-fst-oracle"
+    ],
+    "protocol": {
+      "k_set": [
+        0
+      ]
+    }
   }
 }

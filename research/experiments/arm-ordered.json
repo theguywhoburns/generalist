@@ -24,7 +24,12 @@
     "neither is comparable with a fixed-batch run."
   ],
   "extends": "$configs_dir/stage0-4block.json",
-  "model": { "d_model": 128, "n_heads": 2, "ffn_hidden": 384, "n_stages": 4 },
+  "model": {
+    "d_model": 128,
+    "n_heads": 2,
+    "ffn_hidden": 384,
+    "n_stages": 4
+  },
   "train": {
     "steps": 500,
     "log_every": 250,
@@ -34,7 +39,10 @@
     "indist_eval_per_cell": 12,
     "batch_size": 4,
     "auto_batch": true,
-    "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-ordered"
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-ordered",
+    "micro_bt_budget": 0
   },
-  "experiment": { "per_cell": 200 }
+  "experiment": {
+    "per_cell": 200
+  }
 }

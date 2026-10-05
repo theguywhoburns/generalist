@@ -25,5 +25,8 @@
     "    research/experiments/difficulty-axis-constant-rule.json k gpu 0 1 2 4 8 --seeds=0,1,2"
   ],
   "extends": "data-axis-constant-rule.json",
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-k-constant-rule" }
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-k-constant-rule",
+    "micro_bt_budget": 0
+  }
 }

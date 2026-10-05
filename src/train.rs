@@ -143,6 +143,32 @@ pub struct TrainConfig {
     /// the model actually emits.
     #[config(default = 0)]
     pub dump_samples: usize,
+    /// Per-micro-batch activation budget, as max `batch_rows × padded_T`.
+    /// `None` = the shipped `MICRO_BT_BUDGET` (2048).
+    ///
+    /// This is the knob that actually decides how many rows reach the GPU in one
+    /// micro-batch, and `batch_size` is not. The training loop trims each micro to
+    /// `budget / padded_T` rows, so at the shipped 2048 and the shortest band (64)
+    /// every micro is **32 rows regardless of `batch_size`** — measured on
+    /// `dyck1`, where `batch_size` 64/128/256/512 all trained identical work and
+    /// all read ~1405MB of a 4096MB card. `batch_size` is the accumulation
+    /// target; this is the micro size.
+    ///
+    /// Set it explicitly when a controlled arm comparison needs a bigger micro
+    /// than the constant allows. The alternative, `auto_batch: true`, tunes this
+    /// per arm from measured memory, so arms with different `d_model` land on
+    /// different realized batches — which is the confound that invalidated the
+    /// first frontier pass, and is why this knob exists alongside it.
+    ///
+    /// Raising it raises peak memory roughly linearly in rows at a fixed band.
+    /// Leave it 0 outside a sweep that needs it. 0 = use the shipped
+    /// `MICRO_BT_BUDGET`.
+    ///
+    /// Held as a `usize` rather than an `Option` because burn's `Config` derive
+    /// only accepts a literal in `#[config(default = ...)]`, so there is no way to
+    /// spell "absent". 0 is unambiguous and needs no special case in the loader.
+    #[config(default = 0)]
+    pub micro_bt_budget: usize,
     #[config(default = 48)]
     pub indist_eval_per_cell: usize,
     /// Cap on training instances, applied AFTER the holdout split. `0` = no
@@ -188,6 +214,22 @@ pub fn top_bucket_rows(t_pad: usize, rows: usize) -> usize {
 /// (RTX 3050 4GB) on the first full-depth T=512 micro.
 /// Long-band windows are trimmed so the tape size stays band-independent.
 /// Mean-reduced CE keeps merged micro-grads a mean of micro-means either way.
+///
+/// **This is the constraint `train.batch_size` does NOT control, and it has cost
+/// real time.** The training loop trims each micro to `budget / padded_T` rows,
+/// and dyck1 pads to the shortest band (64), so at the shipped 2048 every micro
+/// is capped at **32 rows whatever `batch_size` says**: 64, 128, 256 and 512 all
+/// trained identical work and all read ~1405MB. `batch_size` is the
+/// *accumulation* target, not the micro size. Raising it past the cap changes
+/// gradient noise and nothing else, which is the worst outcome — a manifest that
+/// looks like it raised the batch when it did not.
+///
+/// Reach the GPU with a bigger micro by raising this budget, or by turning
+/// `auto_batch` on, which tunes it. The cost of the tuner is that it sizes each
+/// arm independently, so arms with different `d_model` get different realized
+/// batches — measured here as 64 for the looping arm against 128 for the wide
+/// arm, which is exactly the confound that invalidated the first frontier pass.
+/// A controlled arm comparison therefore wants an explicit budget, not the tuner.
 const MICRO_BT_BUDGET: usize = 2048;
 
 /// Rows the banded window may hold before trimming, derived from a B×T budget
@@ -1332,8 +1374,18 @@ pub fn run_stage<B: AutodiffBackend>(
     // Resolved once, before the loop, and logged: the B×T budget is a function
     // of the card it ran on, so a run whose realized budget is not recorded is
     // not reproducible. Un-tuned runs keep the shipped constant.
+    // An explicit `micro_bt_budget` overrides the shipped constant for BOTH arms,
+    // which is what makes a controlled comparison possible on this card: the
+    // per-micro trim is the real cap, and it is otherwise unreachable from a
+    // manifest. Setting it explicitly keeps `batch_size` honest -- the two are
+    // separate knobs and the log line below reports both, so a run whose micro was
+    // trimmed below `batch_size` is visible rather than silent.
     let (bt_budget, batch_size, accum_steps) = tuned.unwrap_or((
-        MICRO_BT_BUDGET,
+        if run.train.micro_bt_budget > 0 {
+            run.train.micro_bt_budget
+        } else {
+            MICRO_BT_BUDGET
+        },
         run.train.batch_size,
         run.train.accum_steps.max(1),
     ));

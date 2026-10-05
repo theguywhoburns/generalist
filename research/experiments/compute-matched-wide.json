@@ -37,5 +37,8 @@
     "n_stages": 32,
     "max_loops": 1
   },
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-compute-matched-wide" }
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-compute-matched-wide",
+    "micro_bt_budget": 0
+  }
 }

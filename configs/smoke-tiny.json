@@ -34,16 +34,21 @@
     "adjust_lr_fn": "Original",
     "weight_decay": 0.0
   },
-  "stop": { "kind": "act" },
+  "stop": {
+    "kind": "act"
+  },
   "train": {
-    "lr_muon": { "kind": "constant", "lr": 0.005 },
-    "lr_adamw": { "kind": "constant", "lr": 0.001 },
+    "lr_muon": {
+      "kind": "constant",
+      "lr": 0.005
+    },
+    "lr_adamw": {
+      "kind": "constant",
+      "lr": 0.001
+    },
     "batch_size": 8,
-
     "auto_batch": false,
-
     "auto_batch_max": 16384,
-
     "auto_batch_headroom": 0.75,
     "steps": 60,
     "log_every": 10,
@@ -56,25 +61,48 @@
     "eval_in_distribution": true,
     "indist_eval_per_cell": 24,
     "max_train_instances": 0,
-
     "dump_samples": 0,
     "stuck_timeout_secs": 900,
     "eval_start_step": 0,
     "accum_steps": 1,
-    "free_schedule": [1.0, 0.5, 0.2],
+    "free_schedule": [
+      1.0,
+      0.5,
+      0.2
+    ],
     "ponder_warmup_steps": 0,
-    "shuffle_eval": true
+    "shuffle_eval": true,
+    "micro_bt_budget": 0
   },
   "experiment": {
-    "tasks": ["parity"],
-    "tracks": ["A", "B"],
+    "tasks": [
+      "parity"
+    ],
+    "tracks": [
+      "A",
+      "B"
+    ],
     "per_cell": 32,
-    "seeds": [0],
+    "seeds": [
+      0
+    ],
     "protocol": {
-      "k_set": [0, 1, 2, 3, 5, 8],
+      "k_set": [
+        0,
+        1,
+        2,
+        3,
+        5,
+        8
+      ],
       "k0_rate": 0.15,
       "corrupt_rate": 0.05,
-      "seps": ["->", ":", "=", "|"]
+      "seps": [
+        "->",
+        ":",
+        "=",
+        "|"
+      ]
     }
   }
 }

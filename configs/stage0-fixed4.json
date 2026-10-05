@@ -6,7 +6,15 @@
     "ponder_weight is 0: without a learned stop there is no step count to penalize."
   ],
   "extends": "stage0-base.json",
-  "stop": { "kind": "fixed", "loops": 4 },
-  "model": { "ponder_weight": 0.0 },
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-fixed4" }
+  "stop": {
+    "kind": "fixed",
+    "loops": 4
+  },
+  "model": {
+    "ponder_weight": 0.0
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-fixed4",
+    "micro_bt_budget": 0
+  }
 }

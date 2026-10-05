@@ -29,6 +29,12 @@
     "other."
   ],
   "extends": "arm-ordered.json",
-  "stop": { "kind": "act", "shuffle_train": true },
-  "train": { "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-orderaug" }
+  "stop": {
+    "kind": "act",
+    "shuffle_train": true
+  },
+  "train": {
+    "ckpt_dir": "$repo_root/research/runs/checkpoints-arm-orderaug",
+    "micro_bt_budget": 0
+  }
 }
