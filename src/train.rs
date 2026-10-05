@@ -146,8 +146,7 @@ pub struct TrainConfig {
     #[config(default = 48)]
     pub indist_eval_per_cell: usize,
     /// Cap on training instances, applied AFTER the holdout split. `0` = no
-    /// cap.
-    ///
+    /// cap.    ///
     /// This is the data-scaling knob, deliberately separate from
     /// `experiment.per_cell`. Varying `per_cell` moves the training pool AND
     /// the eval set together, so held-out accuracy at each point is measured
@@ -1395,14 +1394,28 @@ pub fn run_stage<B: AutodiffBackend>(
                 None => grads,
                 Some(a) => merge_grads::<B>(&specs, a, grads),
             });
-            // Per-micro pool release. Each micro visits an independently
-            // sampled band (up to 8 different T-bucket shape families per
-            // optimizer step); the pool otherwise retains every family's
-            // pages plus autotune scratch until the step ends, and the
-            // within-step peak crosses 4GB (~3.75GB sustained, death on a
-            // 15MB page). Allocator-only: same windows, same grads, no
-            // math/dynamics change.
-            B::memory_cleanup(device);
+            // NOTE: there is deliberately NO allocator release here, between
+            // micro-batches. There used to be one, and it was removed after
+            // reading cubecl's pool rather than guessing.
+            //
+            // `MemoryManage::cleanup(explicit = true)` does not hand every page
+            // back to the driver. SlicedPool::cleanup coalesces each page and
+            // calls `storage.dealloc` ONLY on pages that are entirely free;
+            // partially-used pages are pushed back onto the pool with their
+            // positions renumbered, i.e. kept for reuse. So the release below
+            // already preserves reuse across steps — it bounds retention to one
+            // step's shape families plus persistent state, without discarding the
+            // pages those families need.
+            //
+            // Releasing per micro-batch therefore bought almost nothing and cost
+            // a full re-alloc cycle on every micro-batch of every step. The
+            // original comment justified it by an OOM death (crossing 4GB
+            // mid-step on a 15MB page), which is real; but that peak came from
+            // up to 8 distinct T-bucket shape families inside one step, and it is
+            // bounded by `batch_size`, not by how often we release. A pinned
+            // batch is what holds the peak down. If a future run OOMs mid-step
+            // with a pinned batch, the fix is the bucket spread or the batch, not
+            // the release cadence.
         }
         trainer.optimizer_step(acc_grads.expect("at least one micro-batch"));
         // Per-step pool release. The cubecl pool never hands pages back to

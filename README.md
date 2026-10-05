@@ -1516,7 +1516,30 @@ at the default budget delivers no more rows and measures as a flat memory line.
 A knob that has stopped being connected to the thing it names is worse than no
 knob, because the tuner believes it is still growing something.
 
-**Why it is off by default.** The tuner compensates the effective batch by
+**One allocator release, per optimizer step.** It runs unconditionally, because
+band-hopping across T buckets otherwise accumulates until a fresh page no longer
+fits in 4GB — this killed runs mid-train at ~3.7GB with a 61.77MB page, before
+any eval. Bounding retention to one step's shape families plus persistent state
+(params and optimizer, ~100MB) is what keeps a long run alive.
+
+**There is deliberately no release between micro-batches**, and reading cubecl's
+pool is why. `MemoryManage::cleanup(explicit = true)` is not a "give everything
+back" call: `SlicedPool::cleanup` coalesces each page and calls `storage.dealloc`
+*only* on pages that are entirely free, pushing partially-used pages back onto the
+pool with their positions renumbered — **kept for reuse**. So the per-step release
+already preserves reuse; it just bounds how many shape families are retained at
+once. A per-micro release therefore cost a full re-alloc cycle on every
+micro-batch of every step and bought almost nothing.
+
+The original justification for the per-micro release was a real OOM — the
+within-step peak crossing 4GB on a 15MB page — but that peak is a function of
+`batch_size` and the T-bucket spread inside one step, not of release cadence. A
+pinned batch is what holds it down. If a run ever OOMs mid-step *with* a pinned
+batch, the fix is the bucket spread or the batch size, not putting the release
+back. Allocator-only either way: same windows, same gradients, no change to any
+math or to batch composition.
+
+**Why auto-batch itself is off by default.** The tuner compensates the effective batch by
 adjusting `accum_steps`, which cannot subdivide below one micro-batch: when the
 selected budget does not divide the target, the effective batch ends up
 *slightly* different from the manifest's. On a controlled sweep where the whole
